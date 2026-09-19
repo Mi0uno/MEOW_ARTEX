@@ -1,13 +1,12 @@
 "use client";
 
 import * as React from "react";
+
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
-import { ChevronRight, MailIcon, PlusCircleIcon } from "lucide-react";
-import { api } from "@/lib/api";
+import { ChevronRight } from "lucide-react";
 
-import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import {
   DropdownMenu,
@@ -21,7 +20,6 @@ import {
   SidebarGroupContent,
   SidebarGroupLabel,
   SidebarMenu,
-  SidebarMenuBadge,
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarMenuSub,
@@ -29,6 +27,7 @@ import {
   SidebarMenuSubItem,
   useSidebar,
 } from "@/components/ui/sidebar";
+import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import type {
   NavBadge,
@@ -162,7 +161,9 @@ function NavItem({ item, isItemActive, isSubItemActive, isSubmenuOpen }: NavItem
 }
 
 // InterceptPendingBadge polls /api/intercept/pending every 5 s and shows a red
-// count badge when there are unresolved approval requests.
+// count badge when there are unresolved approval requests. 行内元素（ml-auto
+// 靠右），放在 Link 内容末尾——不用 SidebarMenuBadge 的绝对定位，避免与
+// 折叠箭头/右缘内容重叠。
 function InterceptPendingBadge() {
   const [count, setCount] = React.useState(0);
   React.useEffect(() => {
@@ -175,7 +176,7 @@ function InterceptPendingBadge() {
         /* ignore */
       }
     }
-    poll();
+    void poll();
     const t = setInterval(poll, 5000);
     return () => {
       live = false;
@@ -184,9 +185,9 @@ function InterceptPendingBadge() {
   }, []);
   if (count === 0) return null;
   return (
-    <SidebarMenuBadge className="flex h-4.5 min-w-[18px] items-center justify-center rounded-full bg-amber-500 px-1 text-[10px] font-semibold leading-none text-white shadow-sm ring-1 ring-amber-400/40">
+    <span className="ml-auto flex h-4.5 min-w-[18px] shrink-0 items-center justify-center rounded-full bg-amber-500 px-1 font-semibold text-[10px] text-white leading-none shadow-sm ring-1 ring-amber-400/40">
       {count > 99 ? "99+" : count}
-    </SidebarMenuBadge>
+    </span>
   );
 }
 
@@ -201,10 +202,10 @@ function NavLinkItem({ item, isActive, showIconFallback }: NavLinkItemProps) {
           rel={item.newTab ? "noreferrer" : undefined}
         >
           <NavLinkIcon item={item} showFallback={showIconFallback} />
-          <span>{item.title}</span>
+          <span className="min-w-0 truncate">{item.title}</span>
+          {item.id === "approvals" ? <InterceptPendingBadge /> : <NavItemBadge badge={item.badge} />}
         </Link>
       </SidebarMenuButton>
-      {item.id === "approvals" ? <InterceptPendingBadge /> : <NavItemBadge badge={item.badge} />}
     </SidebarMenuItem>
   );
 }
@@ -295,11 +296,14 @@ function NavCollapsibleItem({ item, isActive, defaultOpen, isSubItemActive }: Na
         <CollapsibleTrigger asChild>
           <SidebarMenuButton tooltip={item.title} isActive={isActive} disabled={item.disabled}>
             {Icon && <Icon />}
-            <span>{item.title}</span>
-            <ChevronRight className="ml-auto transition-transform duration-200 group-data-[state=open]/collapsible:rotate-90" />
+            <span className="min-w-0 truncate">{item.title}</span>
+            {/* 徽标与箭头同组靠右：徽标行内化后不再与 ml-auto 的箭头重叠 */}
+            <span className="ml-auto flex shrink-0 items-center gap-1">
+              <NavItemBadge badge={item.badge} />
+              <ChevronRight className="size-4 transition-transform duration-200 group-data-[state=open]/collapsible:rotate-90" />
+            </span>
           </SidebarMenuButton>
         </CollapsibleTrigger>
-        <NavItemBadge badge={item.badge} />
 
         <CollapsibleContent>
           <SidebarMenuSub>
@@ -320,7 +324,8 @@ function NavCollapsibleItem({ item, isActive, defaultOpen, isSubItemActive }: Na
                       rel={subItem.newTab ? "noreferrer" : undefined}
                     >
                       {SubIcon && <SubIcon />}
-                      <span>{subItem.title}</span>
+                      <span className="min-w-0 truncate">{subItem.title}</span>
+                      {subItem.id === "approvals" && <InterceptPendingBadge />}
                     </Link>
                   </SidebarMenuSubButton>
                 </SidebarMenuSubItem>
@@ -333,21 +338,22 @@ function NavCollapsibleItem({ item, isActive, defaultOpen, isSubItemActive }: Na
   );
 }
 
+// NavItemBadge 行内徽标：由父级 flex 排版（ml-auto 由外层控制），不再使用
+// SidebarMenuBadge 的绝对定位——那会与折叠箭头/右缘内容重叠。
 function NavItemBadge({ badge }: { badge?: NavBadge }) {
   if (!badge) {
     return null;
   }
 
   return (
-    <SidebarMenuBadge
+    <span
       className={cn(
-        "rounded-sm border capitalize",
-        badge === "new" &&
-          "border-green-600 text-green-600 peer-hover/menu-button:text-green-600 peer-data-active/menu-button:text-green-600",
+        "flex h-4.5 shrink-0 items-center justify-center rounded-sm border px-1 font-medium text-[10px] capitalize leading-none",
+        badge === "new" && "border-green-600 text-green-600",
         badge === "soon" && "border-muted-foreground text-muted-foreground",
       )}
     >
       {badge}
-    </SidebarMenuBadge>
+    </span>
   );
 }
