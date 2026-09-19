@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS llm_usage (
 CREATE INDEX IF NOT EXISTS idx_llm_usage_task  ON llm_usage(task_id);
 CREATE INDEX IF NOT EXISTS idx_llm_usage_model ON llm_usage(task_id, model);
 CREATE INDEX IF NOT EXISTS idx_llm_usage_exp   ON llm_usage(exploration_id);
+-- 查询侧用 COALESCE(task_id,'')=$1，普通索引帮不上忙，补表达式索引。
+CREATE INDEX IF NOT EXISTS idx_llm_usage_task_coalesce ON llm_usage ((COALESCE(task_id,'')));
 `
 
 // EnsureLLMUsageTable creates the llm_usage metering table if it does not exist.

@@ -176,6 +176,9 @@ CREATE TABLE IF NOT EXISTS llm_records (
 );
 CREATE INDEX IF NOT EXISTS idx_llm_records_ts ON llm_records(ts);
 CREATE INDEX IF NOT EXISTS idx_llm_records_session ON llm_records(session_id);
+-- 任务级访问全部走 COALESCE(task_id,'')=$1（兼容 NULL），普通 task_id 索引
+-- 对该谓词失效；表达式索引让任务删除/归档/过滤不必全表扫这张最重的表。
+CREATE INDEX IF NOT EXISTS idx_llm_records_task_coalesce ON llm_records ((COALESCE(task_id,'')));
 `
 
 // llmRecordsMigrate adds new columns to existing tables.
