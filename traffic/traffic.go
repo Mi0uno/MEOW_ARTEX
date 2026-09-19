@@ -7,6 +7,7 @@ package traffic
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -327,7 +328,10 @@ func (t *Traffic) record(f *mproxy.Flow) {
 	tmpl := db.TemplatePath(f.Request.URL.EscapedPath())
 	n := t.seq.Add(1)
 	now := time.Now()
-	id := fmt.Sprintf("%d-%04d", now.Unix(), n%10000)
+	// 尾部追加随机段：同秒序号 mod 10000 回绕（目录爆破/高并发扫描可达）或
+	// 进程重启后 seq 归零时，纯"秒-序号"ID 会撞车，INSERT OR REPLACE 会静默
+	// 覆盖旧记录——取证数据无声丢失。随机段让撞车概率降到可忽略。
+	id := fmt.Sprintf("%d-%04d-%s", now.Unix(), n%10000, randHex(2))
 
 	ct := f.Response.Header.Get("Content-Type")
 	url := f.Request.URL.String()
@@ -433,7 +437,7 @@ func (t *Traffic) spill(body []byte, contentType string) storedBody {
 	}
 	blobPath := filepath.Join(blobDir, h+".bin")
 	if _, err := os.Stat(blobPath); os.IsNotExist(err) {
-		if err := os.WriteFile(blobPath, body, 0o644); err != nil {
+		if err := writeBlobAtomic(blobPath, body); err != nil {
 			log.Printf("[traffic] 写 blob %s 失败：%v", h, err)
 			return storedBody{inline: clipBytes(body, blobPreview), index: indexText()}
 		}
@@ -445,6 +449,33 @@ func (t *Traffic) spill(body []byte, contentType string) storedBody {
 		sb.inline = []byte(binaryTag(contentType, body))
 	}
 	return sb
+}
+
+// writeBlobAtomic 先写临时文件再改名落位。内容寻址存储里同哈希截断文件一旦
+// 在正式路径存在就永远不会被重写，读取也不校验哈希——进程在写大 body 中途
+// 被杀必须留下的是可重写的临时文件，而不是永久损坏的"证据"。
+// 同哈希并发写由调用方串行化（record/ImportArchive 都持有 t.wmu），
+// 临时名加纳秒后缀只是兜底防撞。
+func writeBlobAtomic(path string, body []byte) error {
+	tmp := fmt.Sprintf("%s.tmp%d", path, time.Now().UnixNano())
+	if err := os.WriteFile(tmp, body, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// randHex 返回 n 字节的十六进制随机串（exchange ID 的防回绕后缀）。
+func randHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		// 熵源失败（概率≈0）：退化为时间后缀，仍优于纯序号回绕。
+		return fmt.Sprintf("%016x", time.Now().UnixNano())[:n*2]
+	}
+	return hex.EncodeToString(b)
 }
 
 // binaryTypes are content-type prefixes whose bodies are never worth indexing or

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -107,11 +108,28 @@ FROM exchange_bodies WHERE id=?`, item.ID).Scan(&item.ReqHead, &item.ReqBody, &r
 		if err != nil {
 			return 0, err
 		}
-		data, err := os.ReadFile(source)
+		// 流式拷贝：blob 可达数十 MB，整块 ReadFile 进内存会让导出峰值
+		// 等于"快照 + 最大 blob"的若干倍。
+		in, err := os.Open(source)
 		if err != nil {
 			return 0, err
 		}
-		if err := os.WriteFile(filepath.Join(dir, "blobs", hash+".bin"), data, 0o600); err != nil {
+		out, err := os.Create(filepath.Join(dir, "blobs", hash+".bin"))
+		if err != nil {
+			in.Close()
+			return 0, err
+		}
+		_, err = io.Copy(out, in)
+		closeErr := in.Close()
+		if err == nil {
+			err = closeErr
+		}
+		if err == nil {
+			err = out.Close()
+		} else {
+			out.Close()
+		}
+		if err != nil {
 			return 0, err
 		}
 		snapshot.Blobs = append(snapshot.Blobs, hash)
@@ -147,6 +165,22 @@ func (t *Traffic) ImportArchive(dir string) (int64, error) {
 	if snapshot.Version != 1 {
 		return 0, fmt.Errorf("unsupported traffic archive version %d", snapshot.Version)
 	}
+	// exchange 引用的 blob 必须都在本归档的清单里，否则恢复出的记录会带上
+	// 指向不存在文件的悬空引用（前端读取时 404）。先整体校验再动手写。
+	blobSet := make(map[string]struct{}, len(snapshot.Blobs))
+	for _, hash := range snapshot.Blobs {
+		blobSet[hash] = struct{}{}
+	}
+	for _, item := range snapshot.Exchanges {
+		for _, hash := range []string{item.ReqBlob, item.RespBlob} {
+			if hash == "" {
+				continue
+			}
+			if _, ok := blobSet[hash]; !ok {
+				return 0, fmt.Errorf("归档中的 exchange %s 引用了清单外的 blob %s", item.ID, hash)
+			}
+		}
+	}
 	t.wmu.Lock()
 	defer t.wmu.Unlock()
 	for _, hash := range snapshot.Blobs {
@@ -166,7 +200,7 @@ func (t *Traffic) ImportArchive(dir string) (int64, error) {
 			if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
 				return 0, err
 			}
-			if err := os.WriteFile(destination, data, 0o644); err != nil {
+			if err := writeBlobAtomic(destination, data); err != nil {
 				return 0, err
 			}
 		}
