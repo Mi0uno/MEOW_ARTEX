@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -92,6 +93,10 @@ func DSN() (dsn, source string, err error) {
 // (MVCC), so unlike the old SQLite store there is no process-wide write mutex.
 type DB struct{ *sql.DB }
 
+// dbNameRe 限定可自动创建的数据库名：标识符消毒，含引号等字符的名字无法
+// 逃逸 CREATE DATABASE 的带引号标识符。
+var dbNameRe = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
+
 // ensureDatabase connects to the postgres system database and creates the target
 // database if it does not exist. dsn must be a postgres:// URL.
 func ensureDatabase(dsn string) error {
@@ -102,6 +107,9 @@ func ensureDatabase(dsn string) error {
 	dbName := strings.TrimPrefix(u.Path, "/")
 	if dbName == "" || dbName == "postgres" {
 		return nil
+	}
+	if !dbNameRe.MatchString(dbName) {
+		return fmt.Errorf("非法数据库名 %q（仅允许字母、数字、下划线）", dbName)
 	}
 	// connect to the postgres maintenance database instead
 	adminDSN := *u

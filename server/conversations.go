@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"runtime/debug"
 	"math"
 	"net/http"
 	"path/filepath"
@@ -386,6 +387,7 @@ func (s *Server) pgStopConversation(w http.ResponseWriter, r *http.Request) {
 // background (steps stream to conversation_activities, polled by the client). One
 // in-flight turn per conversation.
 func (s *Server) pgSendConversationMessage(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxConversationRequestBytes)
 	pg, c, ok := s.convByID(w, r)
 	if !ok {
 		return
@@ -469,7 +471,15 @@ func (s *Server) runConversation(c *db.Conversation, msg, busyKey string, userMe
 	if len(userMessage) == 1 {
 		ctx = intercept.WithReviewContext(ctx, "", intercept.ReviewBackground{Source: intercept.BackgroundUserMessage, Text: userMessage[0]})
 	}
-	go s.runConversationTurn(ctx, cancel, c, msg, busyKey)
+	go func() {
+		// 与 runTriggeredRun/main chat 同样的防线：会话回合 panic 不能带崩进程。
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[conversation] 会话回合 panic（%d）: %v\n%s", c.ID, r, debug.Stack())
+			}
+		}()
+		s.runConversationTurn(ctx, cancel, c, msg, busyKey)
+	}()
 }
 
 // runConversationSync runs ONE agent turn on a conversation and BLOCKS until the

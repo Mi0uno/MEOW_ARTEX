@@ -25,6 +25,23 @@ ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`, key
 	return err
 }
 
+// ClaimSetting 只在 key 尚不存在时写入，返回是否抢占成功（原子 check-and-set）。
+// 用于"仅首次可执行"的操作（如密码初始化）：并发调用只有一个赢家，杜绝
+// 先读后写竞态导致的覆盖。
+func (d *DB) ClaimSetting(key, value string) (bool, error) {
+	res, err := d.Exec(`
+INSERT INTO settings(key, value) VALUES ($1, $2)
+ON CONFLICT (key) DO NOTHING`, key, value)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // GetBool returns the boolean setting, or def when unset/unparseable.
 func (d *DB) GetBool(key string, def bool) bool {
 	v, ok, err := d.GetSetting(key)

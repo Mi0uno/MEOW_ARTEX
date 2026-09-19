@@ -312,8 +312,11 @@ const (
 
 // Judge default values.
 const (
-	defaultJudgeTimeoutSecs      = 15
-	defaultJudgeFailAction       = "allow"
+	defaultJudgeTimeoutSecs = 15
+	// 失效方向必须是"拒"而不是"放"：这道闸门拦的是危险工具调用，LLM 审批
+	// 挂掉时默认放行等于安全控制静默失效（与 AskTimeoutAction 默认 deny
+	// 保持一致）。确实依赖 LLM 放行的用户可在设置里显式改回 allow。
+	defaultJudgeFailAction       = "deny"
 	defaultJudgeAskTimeoutSecs   = 300
 	defaultJudgeAskTimeoutAction = "deny"
 )

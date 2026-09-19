@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"runtime/debug"
 	"net"
 	"net/http"
 	"net/url"
@@ -3515,7 +3516,12 @@ func (s *Server) newMainSession(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"seq": m.Seq, "created_at": rfc3339(m.CreatedAt), "current": m.Seq})
 }
 
+// maxChatRequestBytes bounds the main-agent chat body (message + attachment
+// paths). 消息全文会原样持久化再拼进 prompt，必须有上限防止一次性大 body。
+const maxChatRequestBytes = 1 << 20
+
 func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxChatRequestBytes)
 	t := s.m.ResolveTask(r.URL.Query().Get("task"))
 	if t == nil {
 		writeErr(w, 404, "no active task")
@@ -3592,6 +3598,11 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		// handler returns immediately and the browser never needs to hold the request.
 		go func() {
 			defer func() {
+				// 与 runTriggeredRun 同样的防线：agent 执行链一旦 panic 不能带崩
+				// 进程，busy/cancel 状态也必须在 recover 分支里照常收尾。
+				if r := recover(); r != nil {
+					log.Printf("[chat] 主 Agent 回合 panic（task %s）: %v\n%s", t.ID, r, debug.Stack())
+				}
 				s.finishTaskChat(t.ID, cancel)
 			}()
 			// emit every step (thinking/tool_use/tool_result/text/result) so the main
@@ -3736,11 +3747,33 @@ func (s *Server) gc(w http.ResponseWriter, r *http.Request) {
 
 // --- utils ---
 
+// corsOriginAllowed 放行两类跨源：同 host（反代/本机多端口）与 localhost 系
+// 开发源。其余一律不回 ACAO 头——浏览器侧跨站 JS 读不到响应，配合 auth API
+// 不校验 Content-Type 的"简单请求"风险面一并收掉；curl 等非浏览器客户端不受
+// CORS 约束，管理脚本不受影响。
+func corsOriginAllowed(origin, host string) bool {
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	if u.Host == host {
+		return true
+	}
+	switch u.Hostname() {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
+}
+
 func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if origin := r.Header.Get("Origin"); origin != "" && corsOriginAllowed(origin, r.Host) {
+			w.Header().Add("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		}
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(204)
 			return
