@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -206,6 +207,24 @@ func swap(p Paths) error {
 	if err := os.Remove(p.Old); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("清理旧备份 %s: %w", p.Old, err)
 	}
+	if runtime.GOOS != "windows" {
+		// Unix：先硬链接备份，再原子覆盖换装。rename(New→Current) 是原子替换
+		// （运行中的进程继续用旧 inode），硬链接保证任何瞬间断电，Current 与
+		// Old 两个路径里至少有一个可用——两段 rename 方案在两段之间断电会留下
+		// "目录里没有可执行文件"且无法自愈的状态。
+		if err := os.Link(p.Current, p.Old); err != nil {
+			return fmt.Errorf("备份当前版本(硬链接): %w", err)
+		}
+		if err := os.Rename(p.New, p.Current); err != nil {
+			// 换装失败但当前版本原封未动，清掉硬链接备份即可。
+			_ = os.Remove(p.Old)
+			return fmt.Errorf("装入新版本: %w", err)
+		}
+		_ = os.Remove(p.Sum)
+		return nil
+	}
+	// Windows：正在运行的映像禁止覆盖，硬链接方案走不通，保持两段 rename。
+	// 两段之间的窗口由 start.bat 的"备份自愈"兜底（见 BIN 不存在时恢复 .old）。
 	if err := os.Rename(p.Current, p.Old); err != nil {
 		return fmt.Errorf("备份当前版本: %w", err)
 	}

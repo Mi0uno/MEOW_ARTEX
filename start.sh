@@ -21,6 +21,13 @@ set -u
 cd "$(dirname "$0")" || exit 1
 
 BIN=./artex
+# 换装中断自愈：两段 rename 之间断电会留下"没有当前版本、只剩 artex.old"的
+# 目录，二进制里的 Bootstrap 没机会运行，只能在这里恢复（Unix 走硬链接备份
+# 后此窗口已消除，保留兜底以防手工操作）。
+if [ ! -x "$BIN" ] && [ -f ./artex.old ]; then
+	echo "[artex] 检测到中断的升级，恢复备份版本…" >&2
+	mv ./artex.old "$BIN" || { echo "[artex] 恢复备份失败" >&2; exit 1; }
+fi
 [ -x "$BIN" ] || { echo "[artex] 找不到可执行文件 $BIN" >&2; exit 1; }
 
 RESTART_CODE=75

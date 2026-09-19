@@ -20,6 +20,12 @@ setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
 set "BIN=artex.exe"
+rem 换装中断自愈：Windows 上两段 rename 之间断电会留下"没有当前版本、只剩
+rem artex.old.exe"的目录，二进制里的 Bootstrap 没机会运行，只能在这里恢复。
+if not exist "%BIN%" if exist "artex.old.exe" (
+	echo [artex] 检测到中断的升级，恢复备份版本… 1>&2
+	move /y "artex.old.exe" "%BIN%" >nul
+)
 if not exist "%BIN%" (
 	echo [artex] 找不到可执行文件 %BIN% 1>&2
 	exit /b 1
