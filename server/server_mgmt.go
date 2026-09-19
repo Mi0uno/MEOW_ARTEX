@@ -1536,7 +1536,10 @@ func skillRelPath(file string) (string, string) {
 	if clean == "." || filepath.IsAbs(clean) || strings.HasPrefix(clean, "..") {
 		return "", "invalid path"
 	}
-	return clean, ""
+	// 统一以 "/" 作为返回形态：filepath.Clean 在 Windows 上会把分隔符换成
+	// "\\"，而该返回值要回传给前端再进 API（PathValue）——skillPathRune
+	// 的字符白名单拒绝反斜杠，会导致 Windows 上子目录文件无法访问。
+	return filepath.ToSlash(clean), ""
 }
 
 // walkSkillFiles returns all files under root (relative to root), sorted,
@@ -1554,6 +1557,7 @@ func walkSkillFiles(root string) ([]string, error) {
 		if relErr != nil || rel == "." {
 			return nil
 		}
+		rel = filepath.ToSlash(rel) // 清单统一 "/" 形态，Windows 下才与前端/PathValue 兼容
 		if d.IsDir() {
 			entries = append(entries, rel+"/")
 		} else {

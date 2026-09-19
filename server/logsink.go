@@ -136,26 +136,21 @@ func (s *logSinkT) add(l LogLine) {
 		s.ring = s.ring[len(s.ring)-s.cap:]
 	}
 	ch := s.dbCh
-	subs := make([]chan LogLine, 0, len(s.subs))
+	// 发送必须在锁内完成：unsub 在同一把锁的保护下 close 订阅 channel，
+	// 若解锁后再发送就会与 close 竞态出 "send on closed channel" panic
+	// （panic 点在任意 log.Printf 调用方，HTTP 层 recover 救不了）。
+	// 订阅 channel 带缓冲且这里非阻塞发送，锁内循环是有界开销。
+	select {
+	case ch <- dbWriteReq{seq: l.Seq, ll: l}:
+	default:
+	}
 	for sub := range s.subs {
-		subs = append(subs, sub)
-	}
-	s.mu.Unlock()
-
-	// Async DB write (non-blocking; drops if channel is full under extreme load).
-	if ch != nil {
-		select {
-		case ch <- dbWriteReq{seq: l.Seq, ll: l}:
-		default:
-		}
-	}
-
-	for _, sub := range subs {
 		select {
 		case sub <- l:
 		default:
 		}
 	}
+	s.mu.Unlock()
 }
 
 // recent returns ring lines with Seq > since (capped to limit), and the latest seq.
