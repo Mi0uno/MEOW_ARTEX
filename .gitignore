@@ -58,3 +58,10 @@ Thumbs.db
 /bench/
 /Dockerfile.bench
 /Dockerfile.bench.v2
+
+# 本地工具状态与产物（不提交）
+# .mimosa/ 同时覆盖 web/.mimosa/（插件审计/钩子状态与报告）
+.mimosa/
+.v2c/
+.video_agent/
+/out/
