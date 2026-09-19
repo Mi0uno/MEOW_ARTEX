@@ -15,6 +15,7 @@ import {
   ScrollText,
   Settings2,
   ShieldAlert,
+  SlidersHorizontal,
   Sparkles,
   Target,
   Terminal,
@@ -87,8 +88,9 @@ export const sidebarItems: NavGroup[] = [
       { id: "tools", title: "工具", url: "/system/tools", icon: Wrench },
       { id: "intercept", title: "拦截规则", url: "/system/intercept", icon: ShieldAlert },
       { id: "approvals", title: "审批记录", url: "/system/intercept/approvals", icon: ClipboardList },
+      { id: "functions", title: "系统功能", url: "/system/functions", icon: SlidersHorizontal },
       { id: "logs", title: "日志", url: "/system/logs", icon: ScrollText },
-      { id: "settings", title: "系统配置", url: "/system/settings", icon: Settings2 },
+      { id: "settings", title: "系统设置", url: "/system/settings", icon: Settings2 },
     ],
   },
 ];
