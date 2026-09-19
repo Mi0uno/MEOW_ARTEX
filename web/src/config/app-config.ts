@@ -3,11 +3,11 @@ import packageJson from "../../package.json";
 const currentYear = new Date().getFullYear();
 
 export const APP_CONFIG = {
-  name: "ARTEX",
+  name: "MEOWFUCK",
   version: packageJson.version,
-  copyright: `© ${currentYear}, ARTEX.`,
+  copyright: `© ${currentYear}, MEOWFUCK.`,
   meta: {
-    title: "ARTEX — 自主渗透测试控制台",
+    title: "MEOWFUCK — 自主渗透测试控制台",
     description: "LLM 驱动的自主渗透测试系统控制台",
   },
 };
