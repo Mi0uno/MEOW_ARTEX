@@ -69,6 +69,16 @@ export function UpdateCard() {
     check(true);
   }, [check]);
 
+  // 组件卸载时关掉还挂着的更新进度流：用户在下载中途离开设置页，否则该
+  // EventSource 会一直活到进程重启。
+  const streamRef = React.useRef<EventSource | null>(null);
+  React.useEffect(() => {
+    return () => {
+      streamRef.current?.close();
+      streamRef.current = null;
+    };
+  }, []);
+
   // 轮询 /api/health 直到版本号变化。
   //
   // 判据必须是"版本变了"而不是"能连上了"：换装过程中旧版本会短暂地重新起来一次
@@ -146,6 +156,7 @@ export function UpdateCard() {
     setBusy(true);
     setProgress({ phase: "downloading", percent: 0, message: "准备中…" });
     const es = openStream(from);
+    streamRef.current = es;
     api.applyUpdate().catch((e) => {
       es.close();
       setBusy(false);

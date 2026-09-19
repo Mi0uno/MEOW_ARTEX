@@ -104,11 +104,18 @@ function getToken(): string | null {
   return localStorage.getItem("artex_token");
 }
 
+// HTTP_TIMEOUT 是单次 API 请求的默认上限：后端挂起（锁等待、代理阻塞）时
+// 相关页面表现为报错而不是永远 pending。调用方可用 init.signal 自行控制
+// （此时不再叠加默认超时）；SSE/上传等长任务请显式传 signal。
+const HTTP_TIMEOUT = 60_000;
+
 export async function http<T>(path: string, init?: RequestInit): Promise<T> {
   if (MOCK) return mockHandle<T>(init?.method ?? "GET", path, init?.body ?? null);
   const token = getToken();
+  const signal = init?.signal ?? AbortSignal.timeout(HTTP_TIMEOUT);
   const r = await fetch(`/api${path}`, {
     ...init,
+    signal,
     headers: {
       ...(init?.body ? { "Content-Type": "application/json" } : {}),
       ...(token ? { Authorization: `Bearer ${token}` } : {}),

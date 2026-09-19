@@ -111,6 +111,9 @@ export default function LogsPage() {
         });
       }
       setHasMore(data.has_more ?? false);
+    } catch {
+      // 网络层失败（后端重启窗口等）：按钮已恢复，不再抛 unhandled rejection，
+      // 用户可重试；直播流恢复后新日志照常进入。
     } finally {
       setLoadingHistory(false);
     }
