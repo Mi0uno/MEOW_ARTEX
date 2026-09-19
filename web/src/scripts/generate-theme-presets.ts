@@ -36,7 +36,13 @@ if (files.length === 0) {
 
 const presets = files.map((file) => {
   const filePath = path.join(presetDir, file);
-  const content = fs.readFileSync(filePath, "utf8");
+  // 根目录边界断言：文件名只能来自 presetDir 的自列目录，拼接结果绝不允许
+  // 越出该目录（../、绝对路径注入等一律拒绝），读取前显式校验。
+  const resolved = path.resolve(filePath);
+  if (resolved !== presetDir && !resolved.startsWith(presetDir + path.sep)) {
+    throw new Error(`❌ Preset file escaped preset directory: ${filePath}`);
+  }
+  const content = fs.readFileSync(resolved, "utf8");
 
   const labelMatch = content.match(/label:\s*(.+)/);
   const valueMatch = content.match(/value:\s*(.+)/);

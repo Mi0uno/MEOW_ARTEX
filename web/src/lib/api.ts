@@ -799,7 +799,10 @@ export const api = {
     const fd = new FormData();
     for (const f of files) fd.append("file", f);
     const token = getToken();
-    const r = await fetch(`/api/chat/upload?scope=${scope}&id=${encodeURIComponent(id)}`, {
+    // query 统一走 URLSearchParams 构造（同 chatMentions）：参数值一律正确编码，
+    // 不做字符串手拼，避免半成品编码造成的注入/参数混淆。
+    const query = new URLSearchParams({ scope, id });
+    const r = await fetch(`/api/chat/upload?${query}`, {
       method: "POST",
       headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       body: fd,
