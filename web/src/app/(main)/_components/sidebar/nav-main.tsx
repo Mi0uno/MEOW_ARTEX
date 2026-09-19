@@ -171,11 +171,16 @@ function InterceptPendingBadge() {
       try {
         const list = await api.interceptPending();
         if (live) setCount(list.length);
-      } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      }
     }
     poll();
     const t = setInterval(poll, 5000);
-    return () => { live = false; clearInterval(t); };
+    return () => {
+      live = false;
+      clearInterval(t);
+    };
   }, []);
   if (count === 0) return null;
   return (
@@ -262,8 +267,30 @@ function NavDropdownItem({ item, isActive, isSubItemActive }: NavDropdownItemPro
 function NavCollapsibleItem({ item, isActive, defaultOpen, isSubItemActive }: NavCollapsibleItemProps) {
   const Icon = item.icon;
 
+  // 展开/收回状态按分类 id 持久化到 localStorage：刷新后保持用户上次的折叠
+  // 习惯。挂载后再读存储覆盖初始值（初始值来自当前路由是否命中），避免 SSR
+  // 与客户端首帧不一致导致 hydration 警告。
+  const storageKey = `sidebar_open_${item.id}`;
+  const [open, setOpen] = React.useState(defaultOpen);
+  React.useEffect(() => {
+    try {
+      const stored = window.localStorage.getItem(storageKey);
+      if (stored !== null) setOpen(stored === "1");
+    } catch {
+      /* 隐私模式等场景 localStorage 不可用时静默降级为会话内记忆 */
+    }
+  }, [storageKey]);
+  const handleOpenChange = (value: boolean) => {
+    setOpen(value);
+    try {
+      window.localStorage.setItem(storageKey, value ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+  };
+
   return (
-    <Collapsible asChild defaultOpen={defaultOpen} className="group/collapsible">
+    <Collapsible asChild open={open} onOpenChange={handleOpenChange} className="group/collapsible">
       <SidebarMenuItem>
         <CollapsibleTrigger asChild>
           <SidebarMenuButton tooltip={item.title} isActive={isActive} disabled={item.disabled}>
