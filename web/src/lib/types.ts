@@ -2,6 +2,7 @@
 // Derived from the functional spec (section 7: 关键数据形状).
 
 export type TaskStatus = "created" | "queued" | "running" | "paused" | "done" | "failed" | "timeout";
+export type TaskStage = "recon" | "exploit" | "post" | "report";
 export type EngineMode = "exploring" | "paused" | "stalled" | "idle";
 
 export interface Task {
@@ -14,6 +15,18 @@ export interface Task {
   description: string;
   goal: string;
   status: TaskStatus;
+  stage?: TaskStage; // 三阶段平台;缺省=exploit
+  kind?: "agent" | "pipeline"; // agent=现有引擎;pipeline=信息搜集确定性步骤任务
+  step_key?: string; // recon 单步骤任务:收集器 key(手动录入/证书透明日志/…)
+  src_mode?: boolean; // SRC 模式:产出计入 SRC 成果,并按企业 SRC 规范约束 AI 边界
+  src_profile_id?: number;
+  /** 出网方式(任务级覆盖):""=跟随全局 / "direct"=强制直连 / "pool"=强制走代理池 */
+  proxy_mode?: string;
+  /** 仅 pool 时有效:指定用哪个代理组;0/缺省=用全局选中的组 */
+  proxy_group_id?: number;
+  /** 实际生效的出网地址(后端回显,便于确认任务真的走了代理池);空=直连 */
+  proxy_egress?: string;
+  step_config?: Record<string, unknown>; // 步骤配置
   created_at: string;
   created_unix?: number; // created_at as unix seconds (run-duration calc)
   completed_at?: string; // RFC3339 finish time (done/failed); "" if unfinished
@@ -38,6 +51,306 @@ export interface Task {
   archive_blocked_by_task_id?: string; // live direct dependent that must be archived first
   company_ids?: number[]; // associated company scopes; current company assets join the task at creation
   coverage_enabled?: boolean; // 资产覆盖度功能开关(创建时定,默认开)；false=不计算/不展示覆盖度
+}
+
+// ---- 三阶段平台:信息搜集 ----
+
+export interface ReconCollectorDesc {
+  key: string;
+  title: string;
+  kind: "api" | "tool" | "manual" | string;
+}
+
+// 信息搜集的自动检测计划:哪些数据源会跑、query 从哪来、哪些因未配置跳过。
+export interface ReconSourcePlan {
+  provider: string;
+  title: string;
+  kind: "search" | "domain_enum" | string;
+  external_api?: number;
+  api_name?: string;
+  domain?: string;
+  query?: string;
+  query_source?: "ai" | "default" | "manual" | string;
+  skip_reason?: string;
+}
+
+export interface ReconPlan {
+  sources: ReconSourcePlan[];
+  domains: string[];
+  available: number;
+  skipped: number;
+  ai_used: boolean;
+  ai_note?: string;
+  companies: number[];
+  target_name?: string;
+}
+
+export interface ReconPipelineStep {
+  key: string;
+  enabled?: boolean; // 缺省=true
+  config?: Record<string, unknown>;
+}
+
+export interface ReconPipeline {
+  collectors: ReconPipelineStep[];
+}
+
+export interface CollectorRun {
+  id: number;
+  task_id: number;
+  collector: string;
+  position: number;
+  status: "running" | "done" | "failed" | "skipped" | string;
+  stats?: Record<string, unknown>;
+  error: string;
+  raw_evidence_hash: string;
+  started_at: string;
+  ended_at?: string | null;
+}
+
+export interface StagedAsset {
+  id: number;
+  task_id: number;
+  run_id?: number;
+  company_id?: number;
+  collector: string;
+  type: "root_domain" | "domain" | "ip" | "service" | "app" | string;
+  value: string;
+  port: number;
+  extra?: Record<string, unknown>;
+  status: "pending" | "accepted" | "ignored" | string;
+  batch_id: number;
+  created_at: string;
+  decided_at?: string | null;
+}
+
+export interface StagedAssetCounts {
+  pending: number;
+  accepted: number;
+  ignored: number;
+}
+
+export interface StagedDecideResult {
+  action: "adopt" | "ignore" | string;
+  results: { id: number; asset_id?: number; status: string }[];
+  errors: { id: number; value: string; error: string }[];
+  counts: StagedAssetCounts;
+  remaining_pending: number;
+}
+
+// ---- 漏洞库(0day / nday / CVE + PoC 管理) ----
+
+export type VulnCategory = "0day" | "nday" | "cve";
+
+export interface VulnEntry {
+  id: number;
+  category: VulnCategory | string;
+  title: string;
+  cve_id?: string;
+  vendor: string;
+  product: string;
+  affected: string;
+  severity: string;
+  vuln_class: string;
+  description?: string;
+  exploitation?: string;
+  remediation?: string;
+  source: "manual" | "ai_finding" | "cve_feed" | string;
+  task_id?: number;
+  finding_id?: number;
+  refs: string[];
+  tags: string[];
+  poc_count: number;
+  status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface VulnPoc {
+  id: number;
+  entry_id: number;
+  name: string;
+  kind: "poc" | "exp" | "nuclei" | "script" | string;
+  language: string;
+  content?: string;
+  source: "manual" | "github" | "exploitdb" | "ai_generated" | string;
+  source_url: string;
+  verified: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface VulnSyncRun {
+  id: number;
+  source: string;
+  status: string;
+  fetched: number;
+  inserted: number;
+  updated: number;
+  pocs_found: number;
+  error: string;
+  started_at: string;
+  finished_at?: string;
+}
+
+// ---- SRC 模式 ----
+
+export interface SRCProfile {
+  id: number;
+  company_id: number;
+  company_name?: string;
+  name: string;
+  platform: string;
+  scope_note: string;
+  forbidden: string;
+  allowed_types: string;
+  rate_limit: string;
+  rules: string;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SRCReward {
+  id: number;
+  company_id?: number;
+  company_name?: string;
+  task_id?: number;
+  finding_id?: number;
+  entry_id?: number;
+  title: string;
+  severity: string;
+  vuln_class: string;
+  status: "pending" | "submitted" | "accepted" | "rejected" | "duplicate" | string;
+  platform_ref: string;
+  feedback: string;
+  submitted_at?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SRCOverview {
+  total: number;
+  by_status: Record<string, number>;
+  by_company: { company_id: number; company_name: string; total: number; accepted: number }[];
+}
+
+// ---- 报告中心 ----
+
+export interface ReportSummary {
+  id: number;
+  kind: "task" | "finding" | "custom" | string;
+  title: string;
+  summary: string;
+  task_id?: number;
+  finding_id?: number;
+  source: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ReportDetail extends ReportSummary {
+  content: string;
+}
+
+// 报告中心的「先选企业」列表项:企业名下的报告数与分类细分。
+export interface ReportCompanyCount {
+  company_id: number;
+  name: string;
+  total: number;
+  task: number;
+  finding: number;
+  custom: number;
+}
+
+// ---- 报告模板(上传 docx/md → 按模板导出报告) ----
+
+export interface ReportTemplateHeading {
+  level: number;
+  title: string;
+}
+
+export interface ReportTemplateStructure {
+  headings?: ReportTemplateHeading[];
+  paragraphs?: number;
+  tables?: number;
+  words?: number;
+}
+
+export interface ReportTemplate {
+  id: number;
+  name: string;
+  category?: string; // 分类(渗透测试报告/漏扫报告/通用模板等)
+  format: "markdown" | "docx" | "doc" | string;
+  content?: string; // 仅详情返回
+  structure?: ReportTemplateStructure;
+  source_note?: string;
+  // AI 占位模板识别(异步任务):状态/失败原因 + 监看任务与会话 id(跳转过程用)
+  analyze_status?: "" | "running" | "done" | "failed" | string;
+  analyze_error?: string;
+  suggested_content?: string; // AI 草稿(仅详情返回,由用户确认采用)
+  analyze_task_id?: number;
+  analyze_conv_id?: number;
+  analyzed_at?: string;
+  created_at: string;
+}
+
+// ---- 报告生成过程事件流 ----
+
+export interface ReportEvent {
+  id: number;
+  report_id?: number;
+  template_id?: number;
+  kind: "created" | "archived" | "updated" | "exported" | "uploaded" | "deleted" | string;
+  actor: "user" | "agent" | "system" | string;
+  task_id?: number;
+  detail?: Record<string, unknown>;
+  created_at: string;
+}
+
+// ---- 决策引擎(AI监管前置决策模型) ----
+
+export interface DecisionEngine {
+  key: string;
+  title: string;
+  description: string;
+  enabled: boolean;
+  api_key_set: boolean;
+  base_url: string;
+  model: string;
+  default_base_url: string;
+  default_model: string;
+  endpoint_path?: string; // 已接入引擎的协议路径:配置填根地址,运行时自动拼接
+  available: boolean; // 协议已接入=false 仅可配置预留
+}
+
+// ---- 外部接口(空间测绘 API 配置) ----
+
+export interface ExternalAPICredField {
+  key: string;
+  label: string;
+  secret: boolean;
+}
+
+export interface ExternalAPIProviderDesc {
+  key: string;
+  title: string;
+  default_base: string;
+  cred_fields: ExternalAPICredField[];
+  kind?: "search" | "domain_enum" | string; // search=查询语句型;domain_enum=域名枚举型
+}
+
+export interface ExternalAPIConfig {
+  id: number;
+  provider: string;
+  provider_title: string;
+  name: string;
+  base_url: string;
+  enabled: boolean;
+  last_test_at?: string;
+  last_test_ok?: boolean | null;
+  quota_info?: Record<string, unknown>;
+  masked?: Record<string, string>;
 }
 
 export interface TaskCategory {
@@ -398,6 +711,14 @@ export interface Company {
   logo?: string; // 远程图标 URL；空则前端用名称首字母
   asset_count: number;
   scope?: ScopeRow[];
+}
+
+// 企业列表页(「先选资产主体」)的一行:在 Company 基础上带任务数/报告数与更新时间。
+export interface CompanyWithCounts extends Company {
+  task_count?: number;
+  report_count?: number;
+  created_at?: string;
+  updated_at?: string;
 }
 
 // ---- Exploration graph (per task) ----
@@ -940,6 +1261,218 @@ export interface Settings {
   // worker/主 agent/对话)由 noa 接管上下文压缩,取代内置 compaction;每 run 读一次,对
   // 之后启动的 run 生效。
   noa_compaction?: boolean;
+  // ---- 代理中心 ----
+  // 出网模式:direct=本地裸网(直连) / pool=代理池(经选中的代理组)。默认 direct。
+  proxy_egress_mode?: string;
+  // 代理池模式下使用的代理组 id(0=未选)。
+  proxy_active_group_id?: number;
+  // 代理池模式下 agent 出网指向的本地监听地址(只读,由后端回显)。
+  proxy_listen_addr?: string;
+}
+
+// ---- 代理中心 ----
+// 代理组:调度的单位,承载策略、监听端口与测活参数。
+export interface ProxyGroup {
+  id: number;
+  name: string;
+  /** manual(纯手工) / api(接入代理池 API) / wild(全网在野搜集) / mixed(混合) */
+  kind: "manual" | "api" | "wild" | "mixed" | string;
+  /** round_robin / random / least_latency / failover */
+  strategy: "round_robin" | "random" | "least_latency" | "failover" | string;
+  /** 本地代理池监听端口;0=启用时自动分配 */
+  listen_port: number;
+  enabled: boolean;
+  auto_check: boolean;
+  check_interval_minutes: number;
+  test_url: string;
+  timeout_ms: number;
+  max_failures: number;
+  concurrency: number;
+  remark: string;
+  created_at: string;
+  updated_at: string;
+  // 派生计数(列表页展示)
+  proxy_count: number;
+  alive_count: number;
+  dead_count: number;
+  source_count: number;
+}
+
+/** 组内单条代理。 */
+export interface ProxyEntry {
+  id: number;
+  group_id: number;
+  url: string;
+  /** http / https / socks5 */
+  protocol: string;
+  host: string;
+  port: number;
+  label: string;
+  /** manual(手工) / api(代理池 API) / public(公益池) / wild(全网在野搜集) */
+  source: "manual" | "api" | "public" | "wild" | string;
+  source_ref: string;
+  region: string;
+  /** 地区识别结果(由出口 IP 解析):ISO 两位国家码,如 CN/US。空 = 未识别 */
+  country_code: string;
+  /** 地区识别结果的国家名,如「中国」。空 = 未识别 */
+  country: string;
+  /** transparent / anonymous / elite */
+  anonymity: string;
+  /** 最近一次测活延迟(毫秒);0=未测 */
+  latency_ms: number;
+  /** untested / alive / dead / checking */
+  status: "untested" | "alive" | "dead" | "checking" | string;
+  fail_count: number;
+  success_count: number;
+  last_checked_at?: string;
+  last_ok_at?: string;
+  /** 测活观测到的出口 IP */
+  exit_ip: string;
+  /** 累计被调度次数 */
+  use_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** 挂在组上的一个代理池 API 接入配置。 */
+export interface ProxySource {
+  id: number;
+  group_id: number;
+  provider_key: string;
+  name: string;
+  api_url: string;
+  username: string;
+  params: Record<string, unknown>;
+  enabled: boolean;
+  interval_minutes: number;
+  last_sync_at?: string;
+  /** idle / running / ok / failed */
+  last_status: string;
+  last_error: string;
+  imported_count: number;
+  total_count: number;
+  created_at: string;
+  updated_at: string;
+  /** 凭据存在性标记(密文永不回显) */
+  has_api_key: boolean;
+  has_password: boolean;
+}
+
+/** 内置代理源定义(商业 / 公益 / 在野搜集)。 */
+export interface ProxyProviderDef {
+  key: string;
+  title: string;
+  kind: "commercial" | "public" | "wild" | string;
+  docs?: string;
+  homepage?: string;
+  default_url: string;
+  need_key: boolean;
+  need_auth: boolean;
+  protocol: string;
+  region: string;
+  parse: string;
+  params?: string[];
+}
+
+/** 一条走代理池的请求流水。 */
+export interface ProxyRequest {
+  id: number;
+  ts: string;
+  group_id: number;
+  proxy_id: number;
+  proxy_url: string;
+  method: string;
+  host: string;
+  url: string;
+  status_code: number;
+  latency_ms: number;
+  bytes_in: number;
+  bytes_out: number;
+  ok: boolean;
+  error: string;
+  task_id: number;
+  stage: string;
+}
+
+/** 仪表盘时间桶聚合。 */
+export interface ProxyTrafficStat {
+  bucket: string;
+  total: number;
+  failed: number;
+  avg_ms: number;
+  bytes_in: number;
+  bytes_out: number;
+}
+
+/** 仪表盘顶部总览。 */
+export interface ProxyTrafficSummary {
+  total: number;
+  failed: number;
+  success_rate: number;
+  avg_ms: number;
+  bytes_in: number;
+  bytes_out: number;
+  window_mins: number;
+}
+
+/** 按代理聚合的调度占比(仪表盘「动态调度」排行)。 */
+export interface ProxyUsageStat {
+  proxy_id: number;
+  proxy_url: string;
+  region: string;
+  /** 地区识别结果:国家码 + 国家名(空 = 未识别) */
+  country_code: string;
+  country: string;
+  source: string;
+  status: string;
+  latency_ms: number;
+  total: number;
+  failed: number;
+  avg_ms: number;
+}
+
+/** 一次测活批次。 */
+export interface ProxyCheckRun {
+  id: number;
+  group_id: number;
+  /** manual(手动) / auto(定时) */
+  trigger: string;
+  /** running / done / failed */
+  status: string;
+  checked: number;
+  alive: number;
+  dead: number;
+  error: string;
+  started_at: string;
+  finished_at?: string;
+}
+
+/** 按国家聚合的代理计数(代理列表的国家筛选器)。 */
+export interface ProxyCountryStat {
+  country_code: string;
+  country: string;
+  total: number;
+  alive: number;
+}
+
+/** 出网状态总览(仪表盘顶部 + 快速切换)。 */
+export interface ProxyEgressStatus {
+  /** direct / pool */
+  mode: string;
+  active_group_id: number;
+  active_group_name: string;
+  /** 代理池模式下 agent 出网指向的本地地址;direct 时为空 */
+  listen_addr: string;
+  /** 当前生效的出网地址(direct 时是全局出口代理或空) */
+  effective_proxy: string;
+  /** 已装载的代理组数(启用中) */
+  loaded_groups: number;
+  /** 全平台代理统计 */
+  total_proxies: number;
+  alive_proxies: number;
+  dead_proxies: number;
+  /** 调度器是否在跑 */
+  running: boolean;
 }
 
 // ---- LLM config ----
@@ -1036,6 +1569,7 @@ export interface Agent {
   name: string;
   description?: string;
   role: string;
+  stage?: "" | "recon" | "exploit" | "post" | "report"; // 归属阶段:''=通用(跨阶段,只在任务中心的对话可见)
   builtin: boolean;
   enabled: boolean;
   llm_profile_id?: number | null; // 绑定的 LLM 配置；null/absent = 跟随任务/会话/全局
@@ -1157,7 +1691,50 @@ export interface Tool {
   exec?: Record<string, any>; // 自定义工具执行规格(kind!=builtin)
   deferred?: boolean; // schema 延迟(SearchExtraTools/ExecuteExtraTool)
   calls?: number; // persistent runtime invocation count (older APIs may omit it)
+  stage?: "" | "recon" | "exploit" | "post"; // 归属阶段;缺省=通用(跨阶段)
 }
+
+// ---- 工具手动执行记录(三阶段工具执行页) ----
+
+export interface ToolExecution {
+  id: number;
+  stage: string;
+  tool_key: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  input?: Record<string, any>;
+  status: "running" | "done" | "failed" | string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  summary?: Record<string, any>;
+  raw_evidence_hash: string;
+  created_at: string;
+  ended_at?: string | null;
+}
+
+export interface RawReconAsset {
+  type: string;
+  value: string;
+  port?: number;
+}
+
+// ---- 字典库 ----
+
+export interface Wordbook {
+  id: number;
+  name: string;
+  kind: "subdomain" | "path" | "password" | "username" | "other" | string;
+  line_count: number;
+  byte_size: number;
+  note: string;
+  created_at: string;
+}
+
+export const WORDBOOK_KIND_LABEL: Record<string, string> = {
+  subdomain: "子域字典",
+  path: "目录路径",
+  password: "密码",
+  username: "用户名",
+  other: "其他",
+};
 
 // ---- Stats ----
 export interface Stats {

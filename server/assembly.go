@@ -217,19 +217,27 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 	for _, s := range agent.BuiltinToolSeeds() {
 		schema, _ := json.Marshal(s.Schema)
 		agents, _ := json.Marshal(s.Agents)
-		if err := pg.SeedTool(s.Key, s.Desc, schema, agents); err != nil {
+		if err := pg.SeedToolWithStage(s.Key, s.Desc, schema, agents, s.Stage); err != nil {
 			log.Printf("[tools] seed %s 失败: %v", s.Key, err)
+		}
+		// 后加 stage 列的老库:给存量行回填归属(仅空值)。
+		if err := pg.BackfillToolStage(s.Key, s.Stage); err != nil {
+			log.Printf("[tools] 回填 %s stage 失败: %v", s.Key, err)
 		}
 	}
 	// Seed the traffic host tools so they're bindable per-agent like built-ins.
 	// Default binding = worker (preserves prior behavior). Their runtime availability
 	// is still gated by the global capture switch (hostTools() returns them only when
 	// capture is on), so an off-capture binding simply never surfaces the tool.
+	// 阶段归属:渗透(exploit) —— MITM 流量工具是渗透测试的工作武器。
 	trafficAgents, _ := json.Marshal([]string{"worker"})
 	for _, t := range traffic.SeedToolMetas() {
 		schema, _ := json.Marshal(t.InputSchema())
-		if err := pg.SeedTool(t.Name(), t.Description(), schema, trafficAgents); err != nil {
+		if err := pg.SeedToolWithStage(t.Name(), t.Description(), schema, trafficAgents, "exploit"); err != nil {
 			log.Printf("[tools] seed %s 失败: %v", t.Name(), err)
+		}
+		if err := pg.BackfillToolStage(t.Name(), "exploit"); err != nil {
+			log.Printf("[tools] 回填 %s stage 失败: %v", t.Name(), err)
 		}
 	}
 	// bashInteractiveShellNote is appended to Bash's description ONLY for agents whose

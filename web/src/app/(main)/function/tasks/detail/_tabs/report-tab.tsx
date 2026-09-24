@@ -2,7 +2,7 @@
 
 import * as React from "react";
 
-import { CheckIcon, CopyIcon, FileTextIcon } from "lucide-react";
+import { ArchiveIcon, CheckIcon, CopyIcon, FileTextIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { Markdown } from "@/components/markdown";
@@ -15,6 +15,7 @@ export function ReportTab({ taskId }: { taskId: string }) {
   const [report, setReport] = React.useState<string>("");
   const [loading, setLoading] = React.useState(true);
   const [copied, setCopied] = React.useState(false);
+  const [archiving, setArchiving] = React.useState(false);
 
   React.useEffect(() => {
     let active = true;
@@ -44,6 +45,19 @@ export function ReportTab({ taskId }: { taskId: string }) {
       setTimeout(() => setCopied(false), 1500);
     } else {
       toast.error("复制失败，请手动选择文本复制");
+    }
+  }
+
+  // 存入报告中心:同一任务的报告只会有一份,重复点击覆盖旧存档。
+  async function archive() {
+    setArchiving(true);
+    try {
+      const r = await api.generateTaskReport(taskId);
+      toast.success(r.created ? "已存入报告中心" : "报告中心存档已更新");
+    } catch (e) {
+      toast.error(`存入失败:${(e as Error).message}`);
+    } finally {
+      setArchiving(false);
     }
   }
 
@@ -78,9 +92,14 @@ export function ReportTab({ taskId }: { taskId: string }) {
         </CardTitle>
         <div className="flex gap-2">
           {report && (
-            <Button size="sm" variant="outline" onClick={copy}>
-              {copied ? <CheckIcon /> : <CopyIcon />} 复制
-            </Button>
+            <>
+              <Button size="sm" variant="outline" onClick={() => void archive()} disabled={archiving}>
+                <ArchiveIcon /> 存入报告中心
+              </Button>
+              <Button size="sm" variant="outline" onClick={copy}>
+                {copied ? <CheckIcon /> : <CopyIcon />} 复制
+              </Button>
+            </>
           )}
         </div>
       </CardHeader>

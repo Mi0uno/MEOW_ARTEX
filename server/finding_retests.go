@@ -195,9 +195,10 @@ func (s *Server) seedFindingRetester() error {
 	for _, t := range s.findingRetestTools() {
 		schema, _ := json.Marshal(t.InputSchema())
 		bindings, _ := json.Marshal([]string{db.FindingRetestAgentKey})
-		if err := s.m.pg.SeedTool(t.Name(), t.Description(), schema, bindings); err != nil {
+		if err := s.m.pg.SeedToolWithStage(t.Name(), t.Description(), schema, bindings, "exploit"); err != nil {
 			return err
 		}
+		_ = s.m.pg.BackfillToolStage(t.Name(), "exploit")
 	}
 	const flag = "finding_retester_seed_v1"
 	tx, err := s.m.pg.Begin()

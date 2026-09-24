@@ -3,7 +3,7 @@
 import * as React from "react";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useSearchParams } from "next/navigation";
 
 import { ChevronRight } from "lucide-react";
 
@@ -84,7 +84,25 @@ function hasSubItems(item: NavMainItem): item is NavMainParentItem {
 }
 
 export function NavMain({ items }: NavMainProps) {
+  // useSearchParams 必须挂在 Suspense 边界内(静态导出预渲染约束),
+  // 与任务页 ToolsPage/ToolsPageInner 的拆分同一模式。
+  return (
+    <React.Suspense fallback={null}>
+      <NavMainInner items={items} />
+    </React.Suspense>
+  );
+}
+
+// 把导航 url 拆成路径与 query 两段。同一页面会挂在多个分组(任务中心的"任务/对话"
+// 与三阶段分组各自的"任务/对话"),靠 query(?stage=)区分归属。
+function splitNavUrl(url: string): { path: string; query: string } {
+  const idx = url.indexOf("?");
+  return idx === -1 ? { path: url, query: "" } : { path: url.slice(0, idx), query: url.slice(idx + 1) };
+}
+
+function NavMainInner({ items }: NavMainProps) {
   const rawPath = usePathname();
+  const searchParams = useSearchParams();
   // 路由段含中文，pathname 可能是百分号编码，解码后再与导航 url 比较，保证高亮命中。
   const path = (() => {
     try {
@@ -94,20 +112,58 @@ export function NavMain({ items }: NavMainProps) {
     }
   })();
 
+  // 当前路由命中的导航 url:优先在「路径相同」的候选里选——query 与当前完全一致者
+  // 优先,否则取无 query 的规范链接(任务中心的"任务/对话")。没有精确命中时回退到
+  // 「无 query 且路径为当前路径前缀」的最长候选,让详情页(/function/tasks/detail 等)
+  // 依然点亮所属分组。这样 /function/tasks?stage=recon 只点亮信息搜集分组的"任务",
+  // 不再与任务中心串高亮。
+  const activeUrl = React.useMemo(() => {
+    const all: string[] = [];
+    for (const group of items) {
+      for (const item of group.items) {
+        if (hasSubItems(item)) {
+          for (const sub of item.subItems) all.push(sub.url);
+        } else {
+          all.push(item.url);
+        }
+      }
+    }
+    const pickFrom = (cands: string[]): string => {
+      const withQuery = cands.find((u) => {
+        const q = splitNavUrl(u).query;
+        if (!q) return false;
+        return [...new URLSearchParams(q).entries()].every(([k, v]) => searchParams.get(k) === v);
+      });
+      if (withQuery) return withQuery;
+      return cands.find((u) => !splitNavUrl(u).query) ?? cands[0] ?? "";
+    };
+    const exactPath = all.filter((u) => splitNavUrl(u).path === path);
+    if (exactPath.length > 0) return pickFrom(exactPath);
+    const prefixCands = all.filter((u) => {
+      const { path: p, query } = splitNavUrl(u);
+      return !query && p !== path && path.startsWith(`${p}/`);
+    });
+    if (prefixCands.length > 0) {
+      // 最长前缀优先(/system/intercept/approvals 命中 /system/intercept/approvals 而非更短的父路径)。
+      return prefixCands.reduce((best, u) => (splitNavUrl(u).path.length > splitNavUrl(best).path.length ? u : best));
+    }
+    return "";
+  }, [items, path, searchParams]);
+
   const isItemActive = (item: NavMainItem) => {
     if (hasSubItems(item)) {
-      return item.subItems.some((sub) => path.startsWith(sub.url));
+      return item.subItems.some((sub) => sub.url === activeUrl);
     }
 
-    return path === item.url;
+    return item.url === activeUrl;
   };
 
   const isSubItemActive = (url: string) => {
-    return path === url;
+    return url === activeUrl;
   };
 
   const isSubmenuOpen = (item: NavMainParentItem) => {
-    return item.subItems.some((sub) => path.startsWith(sub.url));
+    return item.subItems.some((sub) => sub.url === activeUrl);
   };
 
   return (
@@ -340,6 +396,7 @@ function NavCollapsibleItem({ item, isActive, defaultOpen, isSubItemActive }: Na
 
 // NavItemBadge 行内徽标：由父级 flex 排版（ml-auto 由外层控制），不再使用
 // SidebarMenuBadge 的绝对定位——那会与折叠箭头/右缘内容重叠。
+// wip 渲染为中文「建设中」(占位功能的标识)，new/soon 原样展示。
 function NavItemBadge({ badge }: { badge?: NavBadge }) {
   if (!badge) {
     return null;
@@ -349,11 +406,11 @@ function NavItemBadge({ badge }: { badge?: NavBadge }) {
     <span
       className={cn(
         "flex h-4.5 shrink-0 items-center justify-center rounded-sm border px-1 font-medium text-[10px] capitalize leading-none",
+        (badge === "soon" || badge === "wip") && "border-muted-foreground text-muted-foreground",
         badge === "new" && "border-green-600 text-green-600",
-        badge === "soon" && "border-muted-foreground text-muted-foreground",
       )}
     >
-      {badge}
+      {badge === "wip" ? "建设中" : badge}
     </span>
   );
 }

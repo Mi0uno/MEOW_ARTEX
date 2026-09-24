@@ -13,7 +13,7 @@ import (
 )
 
 func TestInterceptDetailHTTP(t *testing.T) {
-	dsn, _, err := db.DSN()
+	dsn, err := testDSN()
 	if err != nil {
 		t.Skip("no test database configured")
 	}

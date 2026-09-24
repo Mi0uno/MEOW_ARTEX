@@ -10,6 +10,7 @@ import {
   FileTextIcon,
   FilePlusIcon,
   PlusIcon,
+  SearchIcon,
   Trash2Icon,
   UploadIcon,
   AlertTriangleIcon,
@@ -299,6 +300,14 @@ export default function SkillsPage() {
   const [selected, setSelected] = React.useState<Selected | null>(null);
   const [visibility, setVisibility] = React.useState<Record<string, string[]>>({});
   const [expanded, setExpanded] = React.useState<Set<string>>(new Set());
+  // 左侧技能树的标准搜索(技能库可能很大,按名称过滤)。
+  const [skillQuery, setSkillQuery] = React.useState("");
+
+  const filteredSkills = React.useMemo(() => {
+    const q = skillQuery.trim().toLowerCase();
+    if (!q) return skills;
+    return skills.filter((s) => s.name.toLowerCase().includes(q));
+  }, [skills, skillQuery]);
 
   // file editor
   const [fileContent, setFileContent] = React.useState("");
@@ -737,6 +746,15 @@ export default function SkillsPage() {
         {/* ── 左侧文件树 ── */}
         <div className="flex w-64 shrink-0 flex-col border-r">
           <div className="flex flex-col gap-2 border-b p-2">
+            <div className="relative">
+              <SearchIcon className="text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2" />
+              <Input
+                value={skillQuery}
+                onChange={(e) => setSkillQuery(e.target.value)}
+                placeholder="搜索 Skill 名称"
+                className="h-8 pl-8 text-xs"
+              />
+            </div>
             <Button size="sm" variant="outline" className="w-full" onClick={() => setNewOpen(true)}>
               <PlusIcon className="size-3.5" />新建 Skill
             </Button>
@@ -764,7 +782,7 @@ export default function SkillsPage() {
               widening the rows past the sidebar. */}
           <ScrollArea className="flex-1 [&>[data-slot=scroll-area-viewport]>div]:!block">
             <div className="p-1">
-              {skills.map((s) => {
+              {filteredSkills.map((s) => {
                 const isOpen = expanded.has(s.name);
                 const tree = buildTree(s.files);
                 const isSkillSelected = selected?.skill === s.name && selected.path === null;

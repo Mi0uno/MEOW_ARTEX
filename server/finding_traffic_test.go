@@ -22,6 +22,13 @@ import (
 
 func trafficEvidenceServer(t *testing.T) (*Server, *db.RecordedFinding, func(string, string, string) *httptest.ResponseRecorder) {
 	t.Helper()
+	// 本 helper 经生产 NewManager 间接取 DSN（内部 pgdb.DSN()），不显式调用
+	// testDSN。先按测试门禁确认隔离库已显式配置：未配置则跳过，避免 NewManager
+	// 回退 config.json 连上用户正库。NewManager 在已配置 DSN 下仍失败才是真错误，
+	// 保持 t.Fatal 的响亮失败。
+	if _, err := testDSN(); err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
 		t.Fatal(err)

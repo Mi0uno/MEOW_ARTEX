@@ -5,10 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"runtime/debug"
 	"math"
 	"net/http"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -57,7 +57,15 @@ func (s *Server) pgListConversations(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
-	cs, err := pg.ListConversations()
+	// 可选 ?stage=recon|exploit|post——三阶段分组的「对话」入口只拉本阶段 agent 的会话;
+	// 无参数 = 全部(任务中心视图)。
+	var cs []*db.Conversation
+	var err error
+	if stage := r.URL.Query().Get("stage"); stage != "" {
+		cs, err = pg.ListConversationsByStage(stage)
+	} else {
+		cs, err = pg.ListConversations()
+	}
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return

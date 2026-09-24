@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { toast } from "sonner";
-import { PlusIcon, RefreshCwIcon, ServerIcon, Trash2Icon } from "lucide-react";
+import { PlusIcon, RefreshCwIcon, SearchIcon, ServerIcon, Trash2Icon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -12,6 +12,8 @@ import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { TablePagination } from "@/components/table-pagination";
 import {
   Sheet,
   SheetContent,
@@ -56,6 +58,35 @@ export default function MCPPage() {
   const [tools, setTools] = React.useState<MCPTool[]>([]);
   const [toolsLoading, setToolsLoading] = React.useState(false);
   const [refreshing, setRefreshing] = React.useState(false);
+  // 列表页标准能力:搜索 / 状态筛选 / 分页(服务器数量有限,客户端处理即可)。
+  const [query, setQuery] = React.useState("");
+  const [statusFilter, setStatusFilter] = React.useState("all");
+  const [page, setPage] = React.useState(1);
+  const [pageSize, setPageSize] = React.useState(12);
+
+  const filtered = React.useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return servers.filter((s) => {
+      if (statusFilter === "enabled" && !s.enabled) return false;
+      if (statusFilter === "disabled" && s.enabled) return false;
+      if (!q) return true;
+      return (
+        s.name.toLowerCase().includes(q) ||
+        (s.command ?? "").toLowerCase().includes(q) ||
+        (s.url ?? "").toLowerCase().includes(q)
+      );
+    });
+  }, [servers, query, statusFilter]);
+
+  const paged = React.useMemo(
+    () => filtered.slice((page - 1) * pageSize, page * pageSize),
+    [filtered, page, pageSize],
+  );
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: filters intentionally reset pagination.
+  React.useEffect(() => {
+    setPage(1);
+  }, [query, statusFilter]);
 
   const load = React.useCallback(() => {
     api.agents().then(setAgents).catch(() => {});
@@ -366,17 +397,47 @@ export default function MCPPage() {
         <p className="text-muted-foreground text-sm">外部 MCP 工具服务器 · 按 Agent 授权可见</p>
       </div>
 
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <button
-          type="button"
-          onClick={openAdd}
-          className="text-foreground/70 border-foreground/70 hover:bg-muted/60 hover:shadow-sm flex min-h-[116px] flex-col items-center justify-center gap-2 rounded-xl border border-dashed transition"
-        >
-          <PlusIcon className="size-6" />
-          <span className="text-sm">添加 MCP</span>
-        </button>
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative w-full sm:max-w-xs">
+          <SearchIcon className="text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2" />
+          <Input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="搜索名称 / 命令 / URL"
+            className="pl-8"
+          />
+        </div>
+        <Select value={statusFilter} onValueChange={setStatusFilter}>
+          <SelectTrigger className="w-32">
+            <SelectValue placeholder="状态" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectGroup>
+              <SelectItem value="all">全部状态</SelectItem>
+              <SelectItem value="enabled">已启用</SelectItem>
+              <SelectItem value="disabled">已停用</SelectItem>
+            </SelectGroup>
+          </SelectContent>
+        </Select>
+        <span className="text-muted-foreground ml-auto text-xs tabular-nums">
+          {filtered.length}/{servers.length} 个
+        </span>
+      </div>
 
-        {servers.map((s) => (
+      {filtered.length === 0 && servers.length > 0 ? (
+        <p className="text-muted-foreground py-12 text-center text-sm">没有匹配的 MCP 服务器</p>
+      ) : (
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <button
+            type="button"
+            onClick={openAdd}
+            className="text-foreground/70 border-foreground/70 hover:bg-muted/60 hover:shadow-sm flex min-h-[116px] flex-col items-center justify-center gap-2 rounded-xl border border-dashed transition"
+          >
+            <PlusIcon className="size-6" />
+            <span className="text-sm">添加 MCP</span>
+          </button>
+
+          {paged.map((s) => (
           <Card
             key={s.id}
             onClick={() => openEdit(s)}
@@ -427,7 +488,22 @@ export default function MCPPage() {
             </CardContent>
           </Card>
         ))}
-      </div>
+        </div>
+      )}
+
+      {filtered.length > 0 && (
+        <TablePagination
+          page={page}
+          pageSize={pageSize}
+          total={filtered.length}
+          onPageChange={setPage}
+          onPageSizeChange={(s) => {
+            setPage(1);
+            setPageSize(s);
+          }}
+          pageSizeOptions={[12, 24, 48]}
+        />
+      )}
 
       <Sheet open={open} onOpenChange={setOpen}>
         <SheetContent

@@ -79,7 +79,12 @@ var errWorkControlConflict = errors.New("work control conflict")
 // retryableWorkerModelError excludes errors already handled by the task router.
 // In particular, a quota error after partial streaming advances the task cursor
 // for the next LLM call but must not replay this whole intent on the backup.
+// 任务行已消失(ErrTaskGone)同样不重试:重放只会再烧一轮 LLM 调用并仍以 not found
+// 收场,而任务已不存在,写回结果也没有意义。
 func retryableWorkerModelError(reason harness.TerminalReason, err error) bool {
+	if errors.Is(err, ErrTaskGone) {
+		return false
+	}
 	return reason == harness.ReasonModelError && !isTaskLLMRuntimeError(err)
 }
 
@@ -288,6 +293,25 @@ func (e *Engine) StopTask(taskID string) {
 	e.deleteMu.Lock()
 	e.deleting.Delete(taskID)
 	e.deleteMu.Unlock()
+}
+
+// cancelTaskRuntime cancels a task's long-lived runtime context without waiting for
+// its goroutines to join. Unlike StopTask it is safe to call FROM one of those
+// goroutines (StopTask waits on the same WaitGroup it would be running in → self
+// deadlock). Used when a task's DB row is gone: the loops unwind via ctx.Done()
+// and the maps are reclaimed by the next Start/StopTask or the delete path.
+//
+// 只取消运行时,不安装 delete 屏障:屏障会挡住 Engine.Run(IsDeleting 早退),而归档
+// 恢复走的正是 Run——归档任务同样把 deleted_at 置为 now(),若在这里装屏障,归档恢复
+// 就再也起不来了。
+func (e *Engine) cancelTaskRuntime(taskID string) {
+	e.cancelExec(taskID, agent.AbortTaskDeleted)
+	e.runtimeMu.Lock()
+	rt := e.runtimes[taskID]
+	e.runtimeMu.Unlock()
+	if rt != nil {
+		rt.cancel()
+	}
 }
 
 // cancelExec cancels a task's current per-task exec context (any in-flight
@@ -881,6 +905,14 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		e.EndLLMCall(t.ID)
 		switch {
 		case err != nil && ectx.Err() == nil:
+			// 任务行已消失(库行被删/归档清理/外部直接改库):运行时句柄还在内存里,
+			// 但规划已经毫无意义,继续跑只会每轮唤醒都打一条报错。取消本任务的运行时
+			// context 并退出——worker/deadline 协程会在各自的 ctx.Done() 分支自然收场。
+			if errors.Is(err, ErrTaskGone) {
+				log.Printf("[planner] task %s 库行已不存在,停止任务运行时", t.ID)
+				e.cancelTaskRuntime(t.ID)
+				return
+			}
 			log.Printf("[planner] task %s 规划出错: %v", t.ID, err)
 		case met:
 			log.Printf("[planner] task %s 判定目标达成: %s", t.ID, reason)

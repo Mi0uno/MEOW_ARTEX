@@ -181,7 +181,7 @@ CREATE TABLE IF NOT EXISTS exploration_nodes (
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at   TIMESTAMPTZ,
-    CONSTRAINT ck_node_kind CHECK (kind IN ('begin','goal','intent','fact','finding','hint','digest')),
+    CONSTRAINT ck_node_kind CHECK (kind IN ('begin','goal','intent','fact','finding','hint','digest','recon_step','recon_finding','recon_summary')),
     CONSTRAINT ck_node_state CHECK (
         (kind='begin'   AND state IN ('open')) OR
         (kind='intent'  AND state IN ('open','running','paused','done','blocked','exhausted','stopped','deleted')) OR
@@ -189,7 +189,10 @@ CREATE TABLE IF NOT EXISTS exploration_nodes (
         (kind='fact'    AND state IN ('confirmed','dismissed','origin')) OR
         (kind='finding' AND state IN ('confirmed','dismissed')) OR
         (kind='hint'    AND state IN ('active','consumed')) OR
-        (kind='digest'  AND state IN ('active','superseded'))
+        (kind='digest'  AND state IN ('active','superseded')) OR
+        (kind='recon_step'    AND state IN ('open','running','done','failed','skipped')) OR
+        (kind='recon_finding' AND state IN ('confirmed','dismissed')) OR
+        (kind='recon_summary' AND state IN ('active','superseded'))
     )
 );
 ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS blocked_reason TEXT;
@@ -207,11 +210,12 @@ BEGIN
         SELECT 1 FROM pg_constraint
         WHERE conrelid='exploration_nodes'::regclass
           AND conname='ck_node_kind'
-          AND pg_get_constraintdef(oid) NOT LIKE '%digest%'
+          AND (pg_get_constraintdef(oid) NOT LIKE '%digest%'
+               OR pg_get_constraintdef(oid) NOT LIKE '%recon_step%')
     ) THEN
         ALTER TABLE exploration_nodes DROP CONSTRAINT ck_node_kind;
         ALTER TABLE exploration_nodes ADD CONSTRAINT ck_node_kind
-            CHECK (kind IN ('begin','goal','intent','fact','finding','hint','digest'));
+            CHECK (kind IN ('begin','goal','intent','fact','finding','hint','digest','recon_step','recon_finding','recon_summary'));
     END IF;
 END $$;
 -- ck_node_state: recreate when it lacks the 'paused' (older), 'superseded' (digest rev),
@@ -224,7 +228,8 @@ BEGIN
           AND conname='ck_node_state'
           AND (pg_get_constraintdef(oid) NOT LIKE '%paused%'
                OR pg_get_constraintdef(oid) NOT LIKE '%superseded%'
-               OR pg_get_constraintdef(oid) NOT LIKE '%deleted%')
+               OR pg_get_constraintdef(oid) NOT LIKE '%deleted%'
+               OR pg_get_constraintdef(oid) NOT LIKE '%recon_step%')
     ) THEN
         ALTER TABLE exploration_nodes DROP CONSTRAINT ck_node_state;
         ALTER TABLE exploration_nodes ADD CONSTRAINT ck_node_state CHECK (
@@ -234,7 +239,10 @@ BEGIN
             (kind='fact'    AND state IN ('confirmed','dismissed','origin')) OR
             (kind='finding' AND state IN ('confirmed','dismissed')) OR
             (kind='hint'    AND state IN ('active','consumed')) OR
-            (kind='digest'  AND state IN ('active','superseded'))
+            (kind='digest'  AND state IN ('active','superseded')) OR
+            (kind='recon_step'    AND state IN ('open','running','done','failed','skipped')) OR
+            (kind='recon_finding' AND state IN ('confirmed','dismissed')) OR
+            (kind='recon_summary' AND state IN ('active','superseded'))
         );
     END IF;
 END $$;
@@ -762,6 +770,7 @@ CREATE TABLE IF NOT EXISTS agents (
     name              TEXT NOT NULL,
     description       TEXT,
     role              TEXT NOT NULL,
+    stage             TEXT NOT NULL DEFAULT '',
     builtin           BOOLEAN NOT NULL DEFAULT true,
     enabled           BOOLEAN NOT NULL DEFAULT true,
     llm_profile_id    BIGINT REFERENCES llm_profiles(id) ON DELETE SET NULL,
@@ -785,6 +794,14 @@ CREATE TABLE IF NOT EXISTS agents (
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS trigger_run_mode     TEXT    NOT NULL DEFAULT 'serial';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS trigger_merge_mode   TEXT    NOT NULL DEFAULT 'all';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS trigger_max_parallel INTEGER NOT NULL DEFAULT 5;
+-- agent 归属阶段(''=通用,跨阶段;recon/exploit/post/report):三阶段分组与报告中心的
+-- 「对话」入口按 ?stage= 只显示本阶段 agent 的会话,''=通用只在任务中心(全部)可见。与 tools.stage 同一套取值。
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS stage TEXT NOT NULL DEFAULT '';
+ALTER TABLE agents DROP CONSTRAINT IF EXISTS agents_stage_check;
+ALTER TABLE agents ADD CONSTRAINT agents_stage_check CHECK (stage IN ('','recon','exploit','post','report'));
+-- 回填内置 agent 的阶段归属:仅在仍为空时写入,不覆盖用户后续手改。
+UPDATE agents SET stage='recon'   WHERE key IN ('recon_worker','recon_analyst') AND stage='';
+UPDATE agents SET stage='exploit' WHERE key = 'pentest' AND stage='';
 -- per-agent LLM 绑定(agent 级默认模型):列自初版即在上方 CREATE 中,此 ALTER 仅为极旧库兜底(幂等)。
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS llm_profile_id BIGINT REFERENCES llm_profiles(id) ON DELETE SET NULL;
 -- run_seconds 单次 run 墙钟默认 600→1200:只改列默认(影响将来新插入的行),不动旧库存量行。
@@ -1220,3 +1237,543 @@ CREATE INDEX IF NOT EXISTS idx_side_requests_history ON side_question_requests(s
 -- Additive v3 archive fields; old archives restore these as empty objects.
 ALTER TABLE side_question_sessions ADD COLUMN IF NOT EXISTS memory JSONB NOT NULL DEFAULT '{}';
 ALTER TABLE side_question_requests ADD COLUMN IF NOT EXISTS context_info JSONB NOT NULL DEFAULT '{}';
+
+-- ============================================================
+-- 三阶段平台 M1：任务阶段(stage) + 信息搜集收集器流水线
+-- recon/exploit/post 三阶段；recon 任务 kind=pipeline 走确定性收集器，
+-- 其余任务 kind=agent 走现有 agent 引擎。存量任务默认 exploit/agent。
+-- ============================================================
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS stage TEXT NOT NULL DEFAULT 'exploit';
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'agent';
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS pipeline JSONB;
+-- 单步骤任务模型(信息搜集):每条 recon 任务对应一个细分步骤(收集器)。
+-- step_key=收集器 key;step_config=该步骤配置。pipeline 字段保留兼容旧读法。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS step_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS step_config JSONB;
+ALTER TABLE tasks DROP CONSTRAINT IF EXISTS tasks_stage_check;
+-- 'report' = 报告中心的 AI 识别任务(AI 占位模板生成等),由任务行承载过程与状态。
+ALTER TABLE tasks ADD CONSTRAINT tasks_stage_check CHECK (stage IN ('recon','exploit','post','report'));
+ALTER TABLE tasks DROP CONSTRAINT IF EXISTS tasks_kind_check;
+ALTER TABLE tasks ADD CONSTRAINT tasks_kind_check CHECK (kind IN ('agent','pipeline'));
+CREATE INDEX IF NOT EXISTS idx_tasks_stage ON tasks(stage, created_at DESC) WHERE deleted_at IS NULL;
+
+-- 收集器执行记录：流水线里每个收集器一次执行的完整轨迹(状态/统计/错误)。
+-- raw_evidence_hash 指向 evidence blob(内容寻址)，原始输出落盘留证。
+CREATE TABLE IF NOT EXISTS task_collector_runs (
+    id          BIGSERIAL PRIMARY KEY,
+    task_id     BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    collector   TEXT NOT NULL,
+    position    INTEGER NOT NULL DEFAULT 0,
+    status      TEXT NOT NULL DEFAULT 'running'
+                CHECK (status IN ('running','done','failed','skipped')),
+    stats       JSONB NOT NULL DEFAULT '{}',
+    error       TEXT NOT NULL DEFAULT '',
+    raw_evidence_hash TEXT NOT NULL DEFAULT '',
+    started_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ended_at    TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_collector_runs_task ON task_collector_runs(task_id, position, id);
+
+-- 外部结果暂存区：收集器产出先落这里，人工采纳后才合并进正式资产图。
+-- (task_id, collector, type, value, port) 唯一 —— 重跑幂等，重复产出只刷计数。
+CREATE TABLE IF NOT EXISTS staged_assets (
+    id          BIGSERIAL PRIMARY KEY,
+    task_id     BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    run_id      BIGINT REFERENCES task_collector_runs(id) ON DELETE SET NULL,
+    company_id  BIGINT REFERENCES companies(id) ON DELETE CASCADE,
+    collector   TEXT NOT NULL DEFAULT '',
+    type        TEXT NOT NULL DEFAULT 'domain'
+                CHECK (type IN ('root_domain','domain','ip','service','app')),
+    value       TEXT NOT NULL,
+    port        INTEGER NOT NULL DEFAULT 0,
+    extra       JSONB NOT NULL DEFAULT '{}',
+    status      TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending','accepted','ignored')),
+    batch_id    BIGINT NOT NULL DEFAULT 0,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    decided_at  TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_staged_assets_dedupe
+    ON staged_assets(task_id, collector, type, value, port);
+CREATE INDEX IF NOT EXISTS idx_staged_assets_status ON staged_assets(task_id, status);
+
+-- ============================================================
+-- M2：外部接口(FOFA/Hunter 等)配置表
+-- credentials 用 AES-256-GCM 加密落库(密钥在 data/external_api_secret.key);
+-- base_url 允许自建网关,但请求前必须通过公网 URL 校验。
+-- ============================================================
+CREATE TABLE IF NOT EXISTS external_apis (
+    id          BIGSERIAL PRIMARY KEY,
+    provider    TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    base_url    TEXT NOT NULL DEFAULT '',
+    credentials BYTEA NOT NULL,
+    enabled     BOOLEAN NOT NULL DEFAULT true,
+    last_test_at TIMESTAMPTZ,
+    last_test_ok BOOLEAN,
+    quota_info  JSONB NOT NULL DEFAULT '{}',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_external_apis_provider ON external_apis(provider, enabled);
+DROP TRIGGER IF EXISTS trg_external_apis_upd ON external_apis;
+CREATE TRIGGER trg_external_apis_upd BEFORE UPDATE ON external_apis
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ============================================================
+-- M2：三阶段工具体系
+-- tools.stage: 工具归属阶段(''=通用跨阶段),三阶段工具页各自管理本阶段工具,
+-- 系统设置→工具 统一管理全部。
+-- ============================================================
+ALTER TABLE tools ADD COLUMN IF NOT EXISTS stage TEXT NOT NULL DEFAULT '';
+ALTER TABLE tools DROP CONSTRAINT IF EXISTS tools_stage_check;
+ALTER TABLE tools ADD CONSTRAINT tools_stage_check CHECK (stage IN ('','recon','exploit','post'));
+CREATE INDEX IF NOT EXISTS idx_tools_stage ON tools(stage) WHERE enabled;
+
+-- 工具手动执行记录(阶段工具执行页的历史底账)
+CREATE TABLE IF NOT EXISTS tool_executions (
+    id          BIGSERIAL PRIMARY KEY,
+    stage       TEXT NOT NULL,
+    tool_key    TEXT NOT NULL,
+    input       JSONB NOT NULL DEFAULT '{}',
+    status      TEXT NOT NULL DEFAULT 'running' CHECK (status IN ('running','done','failed')),
+    summary     JSONB NOT NULL DEFAULT '{}',
+    raw_evidence_hash TEXT NOT NULL DEFAULT '',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ended_at    TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_tool_executions_stage ON tool_executions(stage, id DESC);
+
+-- ============================================================
+-- M2：字典库(信息搜集的枚举弹药)
+-- 文件本体落 dataDir/wordbooks/<id>.txt,表里只存元数据。
+-- kind: subdomain=子域爆破 / path=目录路径 / password=密码 / username=用户名 / other
+-- ============================================================
+CREATE TABLE IF NOT EXISTS wordbooks (
+    id         BIGSERIAL PRIMARY KEY,
+    name       TEXT NOT NULL UNIQUE,
+    kind       TEXT NOT NULL DEFAULT 'other' CHECK (kind IN ('subdomain','path','password','username','other')),
+    line_count INTEGER NOT NULL DEFAULT 0,
+    byte_size  BIGINT NOT NULL DEFAULT 0,
+    file_path  TEXT NOT NULL,
+    note       TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ============================================================
+-- 报告中心：持久化的产出报告(任务总结/漏洞报告/自定义)
+-- 产出报告此前只有按需渲染(GET /api/report)与 findings.report 字段,
+-- 报告中心需要一个可检索的实体。归档走 upsert:同一来源重复归档覆盖正文。
+-- ============================================================
+CREATE TABLE IF NOT EXISTS reports (
+    id          BIGSERIAL PRIMARY KEY,
+    kind        TEXT NOT NULL DEFAULT 'task' CHECK (kind IN ('task','finding','custom')),
+    title       TEXT NOT NULL,
+    summary     TEXT NOT NULL DEFAULT '',
+    content     TEXT NOT NULL DEFAULT '',
+    task_id     BIGINT,
+    finding_id  BIGINT,
+    source      TEXT NOT NULL DEFAULT 'manual',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_reports_kind_created ON reports (kind, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_reports_created ON reports (created_at DESC);
+-- 同一任务/同一发现的报告只保留一份,重复归档覆盖(部分唯一索引 + ON CONFLICT)。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_reports_task ON reports (task_id) WHERE kind='task' AND task_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_reports_finding ON reports (finding_id) WHERE kind='finding' AND finding_id IS NOT NULL;
+
+-- ============================================================
+-- 报告模板:上传 md/docx 模板,解析结构后用于按模板导出报告。
+-- content 归一化为 markdown(docx 解析后落地);structure 存章节树等解析产物。
+-- 模板中可使用内置占位符:{{title}} {{date}} {{summary}} {{content}}
+--   {{findings_table}} {{findings_detail}} {{assets_summary}}
+-- ============================================================
+CREATE TABLE IF NOT EXISTS report_templates (
+    id          BIGSERIAL PRIMARY KEY,
+    name        TEXT NOT NULL,
+    format      TEXT NOT NULL DEFAULT 'markdown' CHECK (format IN ('markdown','docx','doc')),
+    content     TEXT NOT NULL DEFAULT '',
+    structure   JSONB NOT NULL DEFAULT '{}',
+    source_note TEXT NOT NULL DEFAULT '',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ============================================================
+-- 报告/模板事件流:记录报告中心产出的生成过程
+-- (新建/归档/更新/导出/应用模板),供详情页「生成过程」时间线展示。
+-- report_id 与 template_id 二选一;报告删除后事件保留,历史可溯。
+-- ============================================================
+CREATE TABLE IF NOT EXISTS report_events (
+    id          BIGSERIAL PRIMARY KEY,
+    report_id   BIGINT,
+    template_id BIGINT,
+    kind        TEXT NOT NULL,
+    actor       TEXT NOT NULL DEFAULT '',
+    task_id     BIGINT,
+    detail      JSONB NOT NULL DEFAULT '{}',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_report_events_report ON report_events(report_id, id);
+CREATE INDEX IF NOT EXISTS idx_report_events_template ON report_events(template_id, id);
+-- 报告模板原始 docx 存档路径:格式保真导出时以此文件为外壳只替换变量文本。
+ALTER TABLE report_templates ADD COLUMN IF NOT EXISTS orig_path TEXT NOT NULL DEFAULT '';
+-- 模板分类(自由文本,如:渗透测试报告/漏扫报告/通用模板),供分类筛选。
+ALTER TABLE report_templates ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT '';
+-- AI 占位模板识别(异步任务化):每次识别 = 一条 stage='report' 任务 + 一条
+-- template_engineer 监看会话。analyze_status: ''=未识别 running/done/failed;
+-- 草稿存 suggested_content,由用户在编辑器确认采用,不自动覆盖正文。
+ALTER TABLE report_templates ADD COLUMN IF NOT EXISTS analyze_status     TEXT NOT NULL DEFAULT '';
+ALTER TABLE report_templates ADD COLUMN IF NOT EXISTS suggested_content  TEXT NOT NULL DEFAULT '';
+ALTER TABLE report_templates ADD COLUMN IF NOT EXISTS analyze_error      TEXT NOT NULL DEFAULT '';
+ALTER TABLE report_templates ADD COLUMN IF NOT EXISTS analyze_task_id    BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE report_templates ADD COLUMN IF NOT EXISTS analyze_conv_id    BIGINT;
+ALTER TABLE report_templates ADD COLUMN IF NOT EXISTS analyzed_at        TIMESTAMPTZ;
+
+-- ============================================================
+-- 漏洞库(vulndb_entries):沉淀漏洞情报与利用指引。
+-- 三类:0day(未公开/自研发现) / nday(已公开无 CVE 编号或未收录) / cve(有 CVE 编号)。
+-- 与 findings(某次任务的实测发现)分表:findings 是「打出来的」,vulndb 是「知识库」;
+-- 实测成果经自动归类后入本表,由 SRC 成果页引用。
+-- ============================================================
+CREATE TABLE IF NOT EXISTS vulndb_entries (
+    id           BIGSERIAL PRIMARY KEY,
+    -- 分类:0day / nday / cve(不加 CHECK,由 server 白名单校验,便于将来扩展)
+    category     TEXT NOT NULL DEFAULT 'nday',
+    title        TEXT NOT NULL DEFAULT '',
+    -- CVE 编号(仅 category=cve 时非空,如 CVE-2024-1234);唯一索引防重复入库。
+    cve_id       TEXT NOT NULL DEFAULT '',
+    vendor       TEXT NOT NULL DEFAULT '',
+    product      TEXT NOT NULL DEFAULT '',
+    affected     TEXT NOT NULL DEFAULT '',
+    severity     TEXT NOT NULL DEFAULT '',
+    -- 漏洞类别(与 findings.vulnclass 同语义:sql_injection/rce/ssrf/…)
+    vuln_class   TEXT NOT NULL DEFAULT '',
+    description  TEXT NOT NULL DEFAULT '',
+    -- 利用指引/复现要点(Markdown)
+    exploitation TEXT NOT NULL DEFAULT '',
+    remediation  TEXT NOT NULL DEFAULT '',
+    -- 来源:manual(手工) / ai_finding(渗透任务成果自动入库) / cve_feed(定时搜集)
+    source       TEXT NOT NULL DEFAULT 'manual',
+    task_id      BIGINT,
+    finding_id   BIGINT,
+    -- 参考链接与标签(数组 JSON)
+    refs         JSONB NOT NULL DEFAULT '[]',
+    tags         JSONB NOT NULL DEFAULT '[]',
+    -- 已收录 PoC 数(由 vulndb_pocs 派生,冗余存储便于列表展示)
+    poc_count    INT NOT NULL DEFAULT 0,
+    -- 状态:active(有效) / archived(归档) / draft(草稿)
+    status       TEXT NOT NULL DEFAULT 'active',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- CVE 编号唯一(非空时);同一 CVE 重复拉取只更新不新增。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vulndb_cve_unique
+    ON vulndb_entries(cve_id) WHERE cve_id <> '';
+CREATE INDEX IF NOT EXISTS idx_vulndb_category ON vulndb_entries(category, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_vulndb_severity ON vulndb_entries(severity, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_vulndb_time     ON vulndb_entries(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_vulndb_task     ON vulndb_entries(task_id) WHERE task_id IS NOT NULL;
+-- 全文检索(标题/描述)走 pg_trgm,与流量正文检索同套路。
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE INDEX IF NOT EXISTS idx_vulndb_title_trgm ON vulndb_entries USING GIN(title gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_vulndb_desc_trgm  ON vulndb_entries USING GIN(description gin_trgm_ops);
+DROP TRIGGER IF EXISTS trg_vulndb_upd ON vulndb_entries;
+CREATE TRIGGER trg_vulndb_upd BEFORE UPDATE ON vulndb_entries
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ============================================================
+-- 漏洞 PoC(vulndb_pocs):一条漏洞可挂多个 PoC(多来源/多语言)。
+-- kind 区分 poc(验证) / exp(利用) / nuclei / script。
+-- ============================================================
+CREATE TABLE IF NOT EXISTS vulndb_pocs (
+    id          BIGSERIAL PRIMARY KEY,
+    entry_id    BIGINT NOT NULL REFERENCES vulndb_entries(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL DEFAULT '',
+    kind        TEXT NOT NULL DEFAULT 'poc',
+    language    TEXT NOT NULL DEFAULT '',
+    -- PoC 正文(代码/脚本/请求报文);大文本只详情页读取
+    content     TEXT NOT NULL DEFAULT '',
+    -- 来源:manual / github(自动发现) / exploitdb / ai_generated
+    source      TEXT NOT NULL DEFAULT 'manual',
+    source_url  TEXT NOT NULL DEFAULT '',
+    verified    BOOLEAN NOT NULL DEFAULT false,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_vulndb_pocs_entry ON vulndb_pocs(entry_id, id);
+-- 同一来源 URL 不重复入库(自动发现时靠它去重)。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vulndb_pocs_url_unique
+    ON vulndb_pocs(entry_id, source_url) WHERE source_url <> '';
+DROP TRIGGER IF EXISTS trg_vulndb_pocs_upd ON vulndb_pocs;
+CREATE TRIGGER trg_vulndb_pocs_upd BEFORE UPDATE ON vulndb_pocs
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ============================================================
+-- 漏洞库采集状态:定时搜集器每轮运行记录(供页面展示「上次同步」)。
+-- ============================================================
+CREATE TABLE IF NOT EXISTS vulndb_sync_runs (
+    id           BIGSERIAL PRIMARY KEY,
+    source       TEXT NOT NULL DEFAULT '',       -- nvd / github_advisory / exploitdb / github_poc
+    status       TEXT NOT NULL DEFAULT 'running', -- running / done / failed
+    fetched      INT NOT NULL DEFAULT 0,
+    inserted     INT NOT NULL DEFAULT 0,
+    updated      INT NOT NULL DEFAULT 0,
+    pocs_found   INT NOT NULL DEFAULT 0,
+    error        TEXT NOT NULL DEFAULT '',
+    started_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at  TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_vulndb_sync_time ON vulndb_sync_runs(started_at DESC);
+
+-- ============================================================
+-- SRC 模式:企业 SRC 规范(限制 AI 边界) + 成果产出。
+-- ============================================================
+-- 企业 SRC 规范:每个企业一套。规范文本作为最高优先级约束注入任务的
+-- Planner/Worker 提示词,防止 AI 在 SRC 授权范围外动作(打到非授权域名、
+-- 使用高危 payload、超出速率限制等)。
+CREATE TABLE IF NOT EXISTS src_profiles (
+    id            BIGSERIAL PRIMARY KEY,
+    company_id    BIGINT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    name          TEXT NOT NULL DEFAULT '',
+    platform      TEXT NOT NULL DEFAULT '',      -- SRC 平台名称(补天/漏洞盒子/教育SRC…)
+    scope_note    TEXT NOT NULL DEFAULT '',      -- 授权范围说明(人可读)
+    forbidden     TEXT NOT NULL DEFAULT '',      -- 禁止事项,每行一条,注入约束
+    allowed_types TEXT NOT NULL DEFAULT '',      -- 允许的测试类型
+    rate_limit    TEXT NOT NULL DEFAULT '',      -- 速率/强度限制说明
+    rules         TEXT NOT NULL DEFAULT '',      -- 额外规范正文(Markdown)
+    enabled       BOOLEAN NOT NULL DEFAULT true,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_src_profiles_company ON src_profiles(company_id);
+DROP TRIGGER IF EXISTS trg_src_profiles_upd ON src_profiles;
+CREATE TRIGGER trg_src_profiles_upd BEFORE UPDATE ON src_profiles
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- SRC 成果:任务在 SRC 模式下产出的可提交成果(漏洞 + 提交状态跟踪)。
+CREATE TABLE IF NOT EXISTS src_rewards (
+    id           BIGSERIAL PRIMARY KEY,
+    company_id   BIGINT REFERENCES companies(id) ON DELETE SET NULL,
+    task_id      BIGINT REFERENCES tasks(id) ON DELETE SET NULL,
+    finding_id   BIGINT,
+    entry_id     BIGINT REFERENCES vulndb_entries(id) ON DELETE SET NULL,
+    title        TEXT NOT NULL DEFAULT '',
+    severity     TEXT NOT NULL DEFAULT '',
+    vuln_class   TEXT NOT NULL DEFAULT '',
+    -- 提交状态: pending(待提交) / submitted(已提交) / accepted(已收录) / rejected(已驳回) / duplicate(重复)
+    status       TEXT NOT NULL DEFAULT 'pending',
+    platform_ref TEXT NOT NULL DEFAULT '',       -- 平台侧编号/链接
+    feedback     TEXT NOT NULL DEFAULT '',       -- 平台反馈/赏金说明
+    submitted_at TIMESTAMPTZ,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_src_rewards_company ON src_rewards(company_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_src_rewards_task    ON src_rewards(task_id);
+CREATE INDEX IF NOT EXISTS idx_src_rewards_status  ON src_rewards(status, created_at DESC);
+DROP TRIGGER IF EXISTS trg_src_rewards_upd ON src_rewards;
+CREATE TRIGGER trg_src_rewards_upd BEFORE UPDATE ON src_rewards
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- 任务标记 SRC 模式 + 关联企业 SRC 规范。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS src_mode       BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS src_profile_id BIGINT REFERENCES src_profiles(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_tasks_src_mode ON tasks(src_mode, id DESC) WHERE src_mode;
+
+-- ============================================================
+-- 代理中心(proxy_groups / proxies / proxy_sources / proxy_requests / proxy_check_runs):
+-- 统一管理出网代理,支撑「本地裸网 ⇄ 代理池」热切换。
+--
+-- 分层:
+--   proxy_groups      代理组(调度策略/监听端口/测活参数)—— 调度的单位
+--   proxies           组内单个代理(来源:手工 / 商业 API / 公益 API / 全网在野搜集)
+--   proxy_sources     组上接入的代理池 API(商业 + 公益),定时拉取入库
+--   proxy_requests    走代理池的请求流水(仪表盘数据源,记录「本次调度到哪条代理」)
+--   proxy_check_runs  测活批次台账
+--
+-- 枚举取值一律不加 CHECK(旧库靠 ALTER 补列,CHECK 无法回填),由 server 侧白名单校验。
+-- ============================================================
+CREATE TABLE IF NOT EXISTS proxy_groups (
+    id            BIGSERIAL PRIMARY KEY,
+    name          TEXT NOT NULL UNIQUE,
+    -- 组类型:manual(纯手工) / api(接入代理池 API) / wild(全网在野搜集) / mixed(混合)
+    kind          TEXT NOT NULL DEFAULT 'mixed',
+    -- 调度策略:round_robin(轮询) / random(随机) / least_latency(最低延迟优先) / failover(故障转移)
+    strategy      TEXT NOT NULL DEFAULT 'round_robin',
+    -- 本地代理池监听端口:0 = 启用时自动分配(18080 起找空闲端口)。
+    -- agent 侧把出网地址指向 http://127.0.0.1:<port>,由本进程按策略动态选代理。
+    listen_port   INT NOT NULL DEFAULT 0,
+    enabled       BOOLEAN NOT NULL DEFAULT true,
+    -- 自动测活:定时对本组代理做连通性检测,连续失败超阈值标记 dead
+    auto_check    BOOLEAN NOT NULL DEFAULT true,
+    check_interval_minutes INT NOT NULL DEFAULT 10,
+    -- 测活目标 URL(经代理请求它,判断是否真的能出网)
+    test_url      TEXT NOT NULL DEFAULT 'http://httpbin.org/ip',
+    timeout_ms    INT NOT NULL DEFAULT 10000,
+    -- 连续失败次数达到该值即标记 dead(成功一次即清零)
+    max_failures  INT NOT NULL DEFAULT 3,
+    -- 单次测活/拉取的最大并发(避免把本机打满,也避免被源站限流)
+    concurrency   INT NOT NULL DEFAULT 20,
+    remark        TEXT NOT NULL DEFAULT '',
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_proxy_groups_kind ON proxy_groups(kind, id DESC);
+
+CREATE TABLE IF NOT EXISTS proxies (
+    id            BIGSERIAL PRIMARY KEY,
+    group_id      BIGINT NOT NULL REFERENCES proxy_groups(id) ON DELETE CASCADE,
+    -- 完整代理地址:http://user:pass@host:port / https://... / socks5://...
+    url           TEXT NOT NULL,
+    -- 协议(由 url 解析冗余存储,便于筛选):http / https / socks5
+    protocol      TEXT NOT NULL DEFAULT 'http',
+    host          TEXT NOT NULL DEFAULT '',
+    port          INT NOT NULL DEFAULT 0,
+    label         TEXT NOT NULL DEFAULT '',
+    -- 来源:manual(手工录入) / api(代理池 API) / public(公益池) / wild(全网在野搜集)
+    source        TEXT NOT NULL DEFAULT 'manual',
+    -- 来源标识:API 源 id 或在野搜集的站点 key,用于追溯与批量清理
+    source_ref    TEXT NOT NULL DEFAULT '',
+    -- 出口地区(源站给的,或测活时由响应推断)
+    region        TEXT NOT NULL DEFAULT '',
+    -- 匿名度:transparent(透明) / anonymous(匿名) / elite(高匿);测活时探测
+    anonymity     TEXT NOT NULL DEFAULT '',
+    -- 最近一次测活延迟(毫秒),0 = 未测
+    latency_ms    INT NOT NULL DEFAULT 0,
+    -- 状态:untested(未测) / alive(存活) / dead(失效) / checking(测活中)
+    status        TEXT NOT NULL DEFAULT 'untested',
+    fail_count    INT NOT NULL DEFAULT 0,
+    success_count INT NOT NULL DEFAULT 0,
+    last_checked_at TIMESTAMPTZ,
+    last_ok_at    TIMESTAMPTZ,
+    -- 测活时观测到的出口 IP(用于识别「一批代理其实是同一出口」)
+    exit_ip       TEXT NOT NULL DEFAULT '',
+    -- 累计被调度次数(仪表盘用)
+    use_count     BIGINT NOT NULL DEFAULT 0,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- 同一组内同一地址只留一条(不同组可重复,便于跨组对比)。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_proxies_group_url ON proxies(group_id, url);
+CREATE INDEX IF NOT EXISTS idx_proxies_status ON proxies(group_id, status, latency_ms);
+CREATE INDEX IF NOT EXISTS idx_proxies_source ON proxies(group_id, source, source_ref);
+
+CREATE TABLE IF NOT EXISTS proxy_sources (
+    id            BIGSERIAL PRIMARY KEY,
+    group_id      BIGINT NOT NULL REFERENCES proxy_groups(id) ON DELETE CASCADE,
+    -- 内置源 key(见 proxycenter/providers.go):如 fofa_proxy / kuaidaili / proxyscrape …
+    provider_key  TEXT NOT NULL DEFAULT '',
+    name          TEXT NOT NULL DEFAULT '',
+    -- 自定义源的取用地址(内置源可留空,用 provider 默认地址)
+    api_url       TEXT NOT NULL DEFAULT '',
+    -- 凭据(API Key / 用户名 / 密码),加密存储,接口只回显是否已配置
+    api_key       TEXT NOT NULL DEFAULT '',
+    username      TEXT NOT NULL DEFAULT '',
+    password      TEXT NOT NULL DEFAULT '',
+    -- 额外参数(JSON,如地区/协议/数量上限)
+    params        JSONB NOT NULL DEFAULT '{}',
+    enabled       BOOLEAN NOT NULL DEFAULT true,
+    -- 拉取间隔(分钟),0 = 只手动拉
+    interval_minutes INT NOT NULL DEFAULT 30,
+    last_sync_at  TIMESTAMPTZ,
+    -- 最近一次拉取状态:idle / running / ok / failed
+    last_status   TEXT NOT NULL DEFAULT 'idle',
+    last_error    TEXT NOT NULL DEFAULT '',
+    -- 最近一次拉取结果计数
+    imported_count INT NOT NULL DEFAULT 0,
+    total_count    INT NOT NULL DEFAULT 0,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_proxy_sources_group ON proxy_sources(group_id, enabled, id);
+
+CREATE TABLE IF NOT EXISTS proxy_requests (
+    id            BIGSERIAL PRIMARY KEY,
+    ts            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    group_id      BIGINT,
+    -- 本次动态调度命中的代理(代理被删后置空,流水本身保留)
+    proxy_id      BIGINT,
+    -- 冗余记录调度到的代理地址与来源:代理被删后流水仍可读
+    proxy_url     TEXT NOT NULL DEFAULT '',
+    method        TEXT NOT NULL DEFAULT '',
+    host          TEXT NOT NULL DEFAULT '',
+    url           TEXT NOT NULL DEFAULT '',
+    status_code   INT NOT NULL DEFAULT 0,
+    latency_ms    INT NOT NULL DEFAULT 0,
+    bytes_in      BIGINT NOT NULL DEFAULT 0,
+    bytes_out     BIGINT NOT NULL DEFAULT 0,
+    ok            BOOLEAN NOT NULL DEFAULT true,
+    error         TEXT NOT NULL DEFAULT '',
+    -- 归属任务(经 agent 出网时带上,便于按任务回看)
+    task_id       BIGINT,
+    stage         TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_proxy_requests_ts ON proxy_requests(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_proxy_requests_group ON proxy_requests(group_id, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_proxy_requests_proxy ON proxy_requests(proxy_id, ts DESC);
+
+CREATE TABLE IF NOT EXISTS proxy_check_runs (
+    id            BIGSERIAL PRIMARY KEY,
+    group_id      BIGINT,
+    -- 触发方式:manual(手动) / auto(定时)
+    trigger       TEXT NOT NULL DEFAULT 'manual',
+    -- 状态:running / done / failed
+    status        TEXT NOT NULL DEFAULT 'running',
+    checked       INT NOT NULL DEFAULT 0,
+    alive         INT NOT NULL DEFAULT 0,
+    dead          INT NOT NULL DEFAULT 0,
+    error         TEXT NOT NULL DEFAULT '',
+    started_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at   TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_proxy_check_runs_group ON proxy_check_runs(group_id, started_at DESC);
+
+DROP TRIGGER IF EXISTS trg_proxy_groups_upd ON proxy_groups;
+CREATE TRIGGER trg_proxy_groups_upd BEFORE UPDATE ON proxy_groups
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+DROP TRIGGER IF EXISTS trg_proxies_upd ON proxies;
+CREATE TRIGGER trg_proxies_upd BEFORE UPDATE ON proxies
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+DROP TRIGGER IF EXISTS trg_proxy_sources_upd ON proxy_sources;
+CREATE TRIGGER trg_proxy_sources_upd BEFORE UPDATE ON proxy_sources
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- 代理地区识别:代理的出口 IP → 国家/地区。
+--   proxies 增补国家码/国家名两列(便于按国家筛选与展示);
+--   proxy_geo_cache 按 IP 缓存解析结果——地区查询走第三方限速接口(ip-api 免费档
+--   约 45 次/分钟),而在野代理清单里大量条目共用同一出口 IP,不缓存会很快被限流。
+ALTER TABLE proxies ADD COLUMN IF NOT EXISTS country_code TEXT NOT NULL DEFAULT '';
+ALTER TABLE proxies ADD COLUMN IF NOT EXISTS country      TEXT NOT NULL DEFAULT '';
+-- 按国家筛选 + 按「已解析/未解析」挑回填对象。
+CREATE INDEX IF NOT EXISTS idx_proxies_country ON proxies(group_id, country_code);
+CREATE INDEX IF NOT EXISTS idx_proxies_geo_pending ON proxies(group_id, exit_ip)
+    WHERE country_code = '' AND exit_ip <> '';
+
+CREATE TABLE IF NOT EXISTS proxy_geo_cache (
+    ip           TEXT PRIMARY KEY,
+    country_code TEXT NOT NULL DEFAULT '',
+    country      TEXT NOT NULL DEFAULT '',
+    -- 地区细分(省/市),仅展示用
+    region_name  TEXT NOT NULL DEFAULT '',
+    city         TEXT NOT NULL DEFAULT '',
+    -- 解析失败也要缓存:否则每个失败 IP 每轮都会重试,白白消耗限速配额
+    ok           BOOLEAN NOT NULL DEFAULT true,
+    error        TEXT NOT NULL DEFAULT '',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+DROP TRIGGER IF EXISTS trg_proxy_geo_cache_upd ON proxy_geo_cache;
+CREATE TRIGGER trg_proxy_geo_cache_upd BEFORE UPDATE ON proxy_geo_cache
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- 任务的出网方式(创建任务时可选是否走代理池)。
+--   proxy_mode:'' 或 'inherit' = 跟随全局出网模式(默认,保持既有行为)
+--               'direct'        = 本任务强制直连(本地裸网),不受全局代理池影响
+--               'pool'          = 本任务强制走代理池(需同时给 proxy_group_id)
+--   proxy_group_id:'pool' 时指定用哪个代理组;0 = 用全局选中的那个组。
+-- 语义是「任务级覆盖」:agent 与信息搜集流水线都按它取出口,空值不改变任何现有行为。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS proxy_mode     TEXT NOT NULL DEFAULT '';
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS proxy_group_id BIGINT REFERENCES proxy_groups(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_tasks_proxy_mode ON tasks(proxy_mode) WHERE proxy_mode <> '';
+

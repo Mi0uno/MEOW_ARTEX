@@ -121,7 +121,7 @@ func TestDeleteProfileLocksNonTaskReferencesBeforeProfile(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		agent, err := d.CreateAgent(fmt.Sprintf("lock_agent_%d", suffix), "lock agent", "")
+		agent, err := d.CreateAgent(fmt.Sprintf("lock_agent_%d", suffix), "lock agent", "", "")
 		if err != nil {
 			_ = d.DeleteProfile(profileID)
 			t.Fatal(err)
@@ -234,7 +234,7 @@ func TestNonTaskProfileMutationsLockReferenceBeforeProfile(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		agent, err := d.CreateAgent(fmt.Sprintf("write_lock_agent_%d", suffix), "write lock agent", "")
+		agent, err := d.CreateAgent(fmt.Sprintf("write_lock_agent_%d", suffix), "write lock agent", "", "")
 		if err != nil {
 			_ = d.DeleteProfile(profileID)
 			t.Fatal(err)

@@ -19,12 +19,30 @@ type Tool struct {
 	Kind        string          `json:"kind"`     // builtin | command | script | http
 	Exec        json.RawMessage `json:"exec"`     // 自定义工具执行规格(kind!=builtin)
 	Deferred    bool            `json:"deferred"` // schema 延迟(走 SearchExtraTools/ExecuteExtraTool)
+	Stage       string          `json:"stage"`    // 归属阶段:''=通用跨阶段 | recon | exploit | post
 	Calls       int             `json:"calls"`    // runtime ledger aggregate; not stored in tools
 }
 
-const toolCols = `key, system, description, schema, agents, enabled, kind, exec, deferred`
+const toolCols = `key, system, description, schema, agents, enabled, kind, exec, deferred, COALESCE(stage,'')`
 
-// SeedTool inserts a built-in tool's code-defined defaults ONCE. ON CONFLICT DO
+// SeedToolWithStage inserts a built-in tool's code-defined defaults ONCE, with
+// its owning stage. ON CONFLICT DO NOTHING: existing rows (possibly edited in
+// the UI) are never overwritten on startup.
+func (d *DB) SeedToolWithStage(key, desc string, schema, agents json.RawMessage, stage string) error {
+	if len(schema) == 0 {
+		schema = json.RawMessage("{}")
+	}
+	if len(agents) == 0 {
+		agents = json.RawMessage("[]")
+	}
+	_, err := d.Exec(`
+INSERT INTO tools(key, system, description, schema, agents, enabled, stage)
+VALUES ($1, true, $2, $3, $4, true, $5)
+ON CONFLICT (key) DO NOTHING`, key, desc, schema, agents, stage)
+	return err
+}
+
+// SeedTool inserts a built-in tool's code-defined defaults ONCE (通用工具,stage=”)。 ON CONFLICT DO
 // NOTHING: an existing row (possibly edited in the UI) is never overwritten on
 // startup — that's what keeps page edits from being wiped every restart. Use
 // UpsertToolForce for an explicit "reset to code default".
@@ -40,6 +58,29 @@ INSERT INTO tools(key, system, description, schema, agents, enabled)
 VALUES ($1, true, $2, $3, $4, true)
 ON CONFLICT (key) DO NOTHING`, key, desc, schema, agents)
 	return err
+}
+
+// BackfillToolStage 给存量工具行补阶段归属(仅当 stage 仍为空;stage 不参与 UI 编辑,
+// 回填不会覆盖用户数据)。seed 是首插不改存量,后加 stage 列的老库靠这里补齐。
+func (d *DB) BackfillToolStage(key, stage string) error {
+	if stage == "" {
+		return nil
+	}
+	_, err := d.Exec(`UPDATE tools SET stage=$2 WHERE key=$1 AND stage=''`, key, stage)
+	return err
+}
+
+// DeleteToolsByKeys 按 key 批量删除工具行(用于清理被真工具取代的展示壳行)。
+func (d *DB) DeleteToolsByKeys(keys []string) (int64, error) {
+	if len(keys) == 0 {
+		return 0, nil
+	}
+	res, err := d.Exec(`DELETE FROM tools WHERE key = ANY($1)`, keys)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 // AddAgentToToolBinding adds an agent key to the given tools' `agents` arrays if
@@ -107,8 +148,13 @@ func (d *DB) RefreshToolDefaults(key, desc string, schema json.RawMessage) error
 func scanTool(rows interface{ Scan(...any) error }) (*Tool, error) {
 	var t Tool
 	var agents []byte
-	if err := rows.Scan(&t.Key, &t.System, &t.Description, &t.Schema, &agents, &t.Enabled, &t.Kind, &t.Exec, &t.Deferred); err != nil {
+	// 列序与 toolCols 一致(末列 stage 可空)。
+	var stage *string
+	if err := rows.Scan(&t.Key, &t.System, &t.Description, &t.Schema, &agents, &t.Enabled, &t.Kind, &t.Exec, &t.Deferred, &stage); err != nil {
 		return nil, err
+	}
+	if stage != nil {
+		t.Stage = *stage
 	}
 	if len(agents) > 0 {
 		_ = json.Unmarshal(agents, &t.Agents)

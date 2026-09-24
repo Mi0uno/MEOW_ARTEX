@@ -190,6 +190,9 @@ func NewToolSet(ts *db.ExplorationStore, worker string) *ToolSet {
 // dual-write to the standalone findings table (which survives task deletion).
 func (t *ToolSet) SetTaskID(id int64) { t.taskID = id }
 
+// TaskID returns the PG task id bound to this toolset (0 when unknown).
+func (t *ToolSet) TaskID() int64 { return t.taskID }
+
 // SetCoverageEnabled records whether this task has the asset-coverage feature on
 // (default enabled). Passing false makes graphOverviewData omit the coverage block
 // and DropCoverageTools filter the two coverage-only tools out of the agent's tool
@@ -1440,6 +1443,11 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 			}
 		}
 		raw, _ := json.Marshal(result)
+		// 漏洞库自动归类 + SRC 成果自动创建:回调由 server 注入(见 prompt.go)。
+		// recorded.FindingID 是独立 finding 行 id;taskID 供成果归属。
+		if OnFindingRecorded != nil && recorded.FindingID > 0 {
+			OnFindingRecorded(recorded.FindingID, t.TaskID())
+		}
 		return actool.Text(fmt.Sprintf("finding recorded: %d\n%s", recorded.NodeID, raw)), nil
 	})
 }

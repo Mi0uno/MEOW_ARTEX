@@ -19,6 +19,7 @@ import (
 	"github.com/Autumn-27/artex/enrich"
 	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
+	"github.com/Autumn-27/artex/proxycenter"
 	"github.com/Autumn-27/artex/traffic"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -55,16 +56,30 @@ type Task struct {
 	CompanyIDs         []int64 `json:"company_ids,omitempty"`
 	Status             string  `json:"status"` // persisted lifecycle status (done/failed/timeout 为终态；空/其它则由运行态推导)
 	// 任务级超时(见 docs/任务级超时与收尾设计.md)。DeadlineAt/FirstRunAt 为 unix 秒,0=未设/未运行。
-	TimeoutSeconds       int                    `json:"timeout_seconds"`
-	PlanHeartbeatSeconds int                    `json:"plan_heartbeat_seconds"` // planner 心跳触发间隔(秒)
-	CoverageEnabled      bool                   `json:"coverage_enabled"`       // 资产覆盖度功能开关(创建时定,默认开)
-	FirstRunAt           int64                  `json:"first_run_at,omitempty"`
-	DeadlineAt           int64                  `json:"deadline_at,omitempty"`
-	Store                *pgdb.ExplorationStore `json:"-"`
-	Guard                *guard.Guard           `json:"-"`
-	notify               chan struct{}
-	lifecycleMu          sync.RWMutex
-	llmMu                sync.RWMutex
+	TimeoutSeconds       int   `json:"timeout_seconds"`
+	PlanHeartbeatSeconds int   `json:"plan_heartbeat_seconds"` // planner 心跳触发间隔(秒)
+	CoverageEnabled      bool  `json:"coverage_enabled"`       // 资产覆盖度功能开关(创建时定,默认开)
+	FirstRunAt           int64 `json:"first_run_at,omitempty"`
+	DeadlineAt           int64 `json:"deadline_at,omitempty"`
+	// 三阶段字段(创建后不变,无需 lifecycle 锁):recon/exploit/post + agent/pipeline。
+	Stage    string          `json:"stage"`
+	Kind     string          `json:"kind"`
+	Pipeline json.RawMessage `json:"pipeline,omitempty"`
+	// recon 单步骤任务:StepKey=收集器 key(空=多步 pipeline 兼容路径)。
+	StepKey    string          `json:"step_key,omitempty"`
+	StepConfig json.RawMessage `json:"step_config,omitempty"`
+	// SRC 模式:任务产出算 SRC 成果(自动建成果记录),并按企业 SRC 规范约束 AI 边界。
+	SRCMode      bool  `json:"src_mode,omitempty"`
+	SRCProfileID int64 `json:"src_profile_id,omitempty"`
+	// 出网方式(任务级覆盖):''=跟随全局;direct=强制直连;pool=强制走代理池。
+	// ProxyGroupID 仅在 pool 时有效(0=用全局选中的组)。
+	ProxyMode    string                 `json:"proxy_mode,omitempty"`
+	ProxyGroupID int64                  `json:"proxy_group_id,omitempty"`
+	Store        *pgdb.ExplorationStore `json:"-"`
+	Guard        *guard.Guard           `json:"-"`
+	notify       chan struct{}
+	lifecycleMu  sync.RWMutex
+	llmMu        sync.RWMutex
 
 	// pendingTriggers accumulates the concrete changes (worker done / finding) that
 	// fired planning rounds since the last one consumed them. The debounce coalesces
@@ -245,6 +260,16 @@ type Manager struct {
 	// capture is on it becomes the MITM's upstream; when capture is off it is
 	// injected into agent bash env / WebFetch directly. See ProxyAddr.
 	globalProxy string
+
+	// proxyCenter 是代理中心运行时(代理组监听器 + 测活 + 源站拉取)。
+	// 非空且处于代理池模式时,ProxyAddr 返回其本地监听地址,于是平台全部出网
+	// 都经它按策略动态选上游代理——这是「本地裸网 ⇄ 代理池」的切换落点。
+	proxyCenter *proxycenter.Manager
+
+	// onTaskTerminal 在任务首次进入终态、状态落库成功后异步调用(参数为任务 id)。
+	// 由 Server 在构造后注入,用于报告中心的自动归档等「任务收尾」副作用——
+	// Manager 不反向依赖 Server,故用回调而非直接调用。
+	onTaskTerminal func(taskID int64)
 }
 
 // Settings keys the UI toggles at runtime.
@@ -738,6 +763,9 @@ func (m *Manager) PG() *pgdb.DB              { return m.pg }
 func (m *Manager) Traffic() *traffic.Traffic { return m.traffic }
 
 // ProxyAddr returns the egress proxy address agents route target traffic through:
+//   - proxy pool ON → the local pool listener (127.0.0.1:<port>), which picks an
+//     upstream proxy per request by the group's strategy. Takes precedence over
+//     everything else: the user explicitly asked for pool egress.
 //   - capture ON  → the recording MITM proxy (which itself exits via the global
 //     proxy when one is set); agents also get its CA (see ProxyCACert).
 //   - capture OFF → the global egress proxy directly (empty CA — real target
@@ -746,12 +774,80 @@ func (m *Manager) Traffic() *traffic.Traffic { return m.traffic }
 // So the global proxy takes effect in both modes: at the MITM's upstream when
 // capturing, in the agent's own bash env / WebFetch when not.
 func (m *Manager) ProxyAddr() string {
+	if m.proxyCenter != nil {
+		if addr := m.proxyCenter.ActiveProxyAddr(); addr != "" {
+			return addr
+		}
+	}
 	if m.traffic != nil && m.TrafficEnabled() {
 		return m.traffic.ProxyAddr()
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.globalProxy
+}
+
+// ProxyCenter 返回代理中心运行时(可能为 nil:未初始化)。
+func (m *Manager) ProxyCenter() *proxycenter.Manager { return m.proxyCenter }
+
+// ProxyAddrForTask 返回某个任务该用的出网代理地址(任务级覆盖优先于全局模式)。
+//
+// 语义:
+//   - 任务未指定出网方式("") → 跟随全局(等同 ProxyAddr())。
+//   - 任务指定 direct        → 强制直连,返回 ""(即便全局正走代理池)。
+//   - 任务指定 pool          → 走代理池;给了 groupID 就用该组,否则用全局选中的组。
+//
+// 代理池不可用时**退回全局模式而不是静默直连**:用户明确要求走代理池,
+// 悄悄放直连会把真实 IP 暴露出去,比报错更危险。
+func (m *Manager) ProxyAddrForTask(mode string, groupID int64) string {
+	switch mode {
+	case "direct":
+		return ""
+	case "pool":
+		if m.proxyCenter == nil {
+			log.Printf("[proxy] 任务要求走代理池,但代理中心未初始化,退回全局出口")
+			return m.ProxyAddr()
+		}
+		if groupID > 0 {
+			if addr := m.proxyCenter.PoolAddr(groupID); addr != "" {
+				return addr
+			}
+			log.Printf("[proxy] 任务指定的代理组 #%d 未启用监听,退回全局出口", groupID)
+			return m.ProxyAddr()
+		}
+		if addr := m.proxyCenter.ActiveProxyAddr(); addr != "" {
+			return addr
+		}
+		// 全局没开代理池但任务要求走池:临时启动一个组(全局选中的,没有则第一个启用的)。
+		if gid := m.proxyCenter.DefaultGroupID(); gid > 0 {
+			if err := m.proxyCenter.EnsurePool(gid); err == nil {
+				return m.proxyCenter.PoolAddr(gid)
+			}
+		}
+		log.Printf("[proxy] 任务要求走代理池,但没有可用代理组,退回全局出口")
+		return m.ProxyAddr()
+	default:
+		return m.ProxyAddr()
+	}
+}
+
+// ProxyCACertForTask 返回任务级出网对应的 CA 证书路径。
+//
+// 任务走代理池时,上游是外部代理而非本机 MITM,证书是目标站真实证书 → 不需要自定义 CA;
+// 只有回落到本机 MITM 录制时才需要。任务强制直连同理不需要 CA。
+func (m *Manager) ProxyCACertForTask(mode string, groupID int64) string {
+	if mode == "direct" {
+		return ""
+	}
+	if mode == "pool" {
+		addr := m.ProxyAddrForTask(mode, groupID)
+		// 仍在池监听地址上 → 无 MITM CA;若已回落到 MITM 则按全局给 CA。
+		if m.proxyCenter != nil && addr != "" &&
+			(addr == m.proxyCenter.ActiveProxyAddr() || addr == m.proxyCenter.PoolAddr(groupID)) {
+			return ""
+		}
+	}
+	return m.ProxyCACert()
 }
 
 // ProxyCACert returns the CA cert path agents must trust to verify HTTPS through
@@ -846,6 +942,10 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		TimeoutSeconds: pt.TimeoutSeconds, PlanHeartbeatSeconds: pt.PlanHeartbeatSeconds,
 		CoverageEnabled: pt.CoverageEnabled,
 		FirstRunAt:      unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
+		Stage: pt.Stage, Kind: pt.Kind, Pipeline: append(json.RawMessage(nil), pt.Pipeline...),
+		StepKey: pt.StepKey, StepConfig: append(json.RawMessage(nil), pt.StepConfig...),
+		SRCMode: pt.SRCMode, SRCProfileID: pt.SRCProfileID,
+		ProxyMode: pt.ProxyMode, ProxyGroupID: pt.ProxyGroupID,
 		Store: store, Guard: guard.NewWithInterceptor(ic), notify: make(chan struct{}, 1),
 	}
 }
@@ -1400,6 +1500,9 @@ func (m *Manager) SetTaskStatusGuarded(id, status string) (won bool, err error) 
 		})
 	}
 	m.mu.Unlock()
+	if m.onTaskTerminal != nil {
+		m.onTaskTerminal(n)
+	}
 	return true, nil
 }
 
@@ -1431,7 +1534,21 @@ func (m *Manager) SetTaskStatus(id, status string) error {
 		})
 	}
 	m.mu.Unlock()
+	// 首次进入终态时触发收尾副作用(报告自动归档等)。DB 层 SetStatus 已落库,
+	// 且 IsTerminal 判定保证只在真终态触发;回调自行异步化,不阻塞状态写入。
+	if pgdb.IsTerminal(status) && m.onTaskTerminal != nil {
+		m.onTaskTerminal(n)
+	}
 	return nil
+}
+
+// SetTaskTerminalHook installs the callback fired when a task first reaches a
+// terminal status. Set once at construction; the callback must not block the
+// status write (Server wraps the archive work in a goroutine).
+func (m *Manager) SetTaskTerminalHook(fn func(taskID int64)) {
+	m.mu.Lock()
+	m.onTaskTerminal = fn
+	m.mu.Unlock()
 }
 
 // DeleteTask removes a task and optionally its related global data. Traffic has

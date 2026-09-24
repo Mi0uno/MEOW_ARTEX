@@ -12,6 +12,13 @@ import (
 // behavior is identical until a user edits a prompt in the UI.
 var PromptOverride func(agentKey string) (string, bool)
 
+// OnFindingRecorded, if set, is called after report_finding successfully records a
+// finding. The server wires it to the vulndb auto-classification + SRC reward
+// creation. findingID is the standalone finding-row id (not the node id).
+// Runs synchronously in the tool's goroutine — implementations must be fast or
+// spawn their own goroutine (the server does the latter).
+var OnFindingRecorded func(findingID, taskID int64)
+
 // Prompt-variable structs — fields mirror each agent's catalog (docs §5a) so a
 // user template referencing a catalog variable renders; referencing anything else
 // fails template execution and falls back to the built-in default.

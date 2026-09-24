@@ -40,7 +40,9 @@ func jsonResult(v any) (actool.Result, error) {
 func (s *Server) hostTools() ([]actool.CoreTool, map[string][]string) {
 	tools := append(s.m.HostTools(), s.orchestrationTools()...)
 	tools = append(tools, s.findingRetestTools()...)
-	tools = append(tools, s.platformTools()...) // 平台操作工具(建改 skill/工具/MCP，给 Auto 用)
+	tools = append(tools, s.platformTools()...)   // 平台操作工具(建改 skill/工具/MCP，给 Auto 用)
+	tools = append(tools, s.reconQueryTools()...) // 信息搜集 AI 查询工具(fofa_search/hunter_search, stage=recon)
+	tools = append(tools, s.reportTools()...)     // 报告工具(archive_task_report → 报告中心)
 	custom, err := s.customTools()
 	if err != nil {
 		log.Printf("[custom-tool] 加载失败: %v", err)
@@ -449,6 +451,13 @@ func (s *Server) toolUpdateFindingReport() actool.CoreTool {
 			if n == 0 {
 				return actool.Errorf(fmt.Sprintf("未找到 finding_id=%d 对应的漏洞记录(先用 report_finding 登记)", nodeID)), nil
 			}
+			// 报告中心自动汇聚:详细报告写入即归档(异步,不阻塞工具返回)。
+			// finding_id 是探索节点 id,归档用独立记录 id,故做一次映射。
+			if fid, err := s.m.pg.FindingIDByNodeID(nodeID); err == nil && fid > 0 {
+				go s.autoArchiveFindingReport(fid)
+				// 漏洞库自动归类:AI 判定 0day/nday/cve 后入库(异步)。
+				go s.autoClassifyFinding(fid)
+			}
 			return actool.Text(fmt.Sprintf("finding %d report updated (%d chars)", nodeID, len(a.Report))), nil
 		})
 }
@@ -480,11 +489,18 @@ func (s *Server) seedOrchestrationTools() {
 		if t.Name() == "bind_finding_traffic" {
 			bindings = json.RawMessage(`["reporter"]`)
 		}
-		_ = s.m.PG().SeedTool(t.Name(), t.Description(), schema, bindings)
+		_ = s.m.PG().SeedToolWithStage(t.Name(), t.Description(), schema, bindings, "")
 	}
 	for _, t := range s.platformTools() {
 		schema, _ := json.Marshal(t.InputSchema())
-		_ = s.m.PG().SeedTool(t.Name(), t.Description(), schema, autoAgents)
+		_ = s.m.PG().SeedToolWithStage(t.Name(), t.Description(), schema, autoAgents, "")
+	}
+	s.seedReconQueryTools()
+	for _, t := range s.reportTools() {
+		schema, _ := json.Marshal(t.InputSchema())
+		// 报告归档工具默认绑 reporter(报告撰写)/pentest/worker:任务收尾即可归档。
+		bindings, _ := json.Marshal([]string{"reporter", "pentest", "worker"})
+		_ = s.m.PG().SeedToolWithStage(t.Name(), t.Description(), schema, bindings, "")
 	}
 	s.refreshBuiltinToolSchemas()
 	s.seedAutoDefaultBindings()
@@ -503,6 +519,8 @@ func (s *Server) seedOrchestrationTools() {
 	s.upgradeReporterTriggerMessage() // 老库补迁移:让 reporter 回传 evidence_version(一次性)
 	s.seedFindingTrafficTools()       // 增加可选证据参数及只读证据工具，保留用户配置
 	s.seedFindingWorkflowTools()
+	// 注：报告回填不在这里——它需要任务已加载进内存(renderTaskReport 走内存句柄),
+	// 见 server.go 的 restoreTaskRuntimes() 之后。
 	// 注：pentest 的默认工具绑定无需迁移——BuiltinToolSeeds 在全新初始化时就把
 	// list_assets/insert_assets/report_finding/list_findings/list_companies 连同
 	// pentest 一起 seed 好了（项目尚无旧库，不做迁移）。
@@ -743,7 +761,7 @@ func (s *Server) seedReporterAgent() {
 		return // key 已被占用(用户手建过)——不覆盖
 	}
 	a, err := s.m.pg.CreateAgent("reporter", "报告撰写",
-		"漏洞详细报告撰写：发现漏洞时自动触发，查取证据与执行过程后写 Markdown 报告并回写。")
+		"漏洞详细报告撰写：发现漏洞时自动触发，查取证据与执行过程后写 Markdown 报告并回写。", "")
 	if err != nil {
 		log.Printf("[reporter] 创建 agent 失败: %v", err)
 		return

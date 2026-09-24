@@ -228,6 +228,22 @@ These serve as the fallback; there is no separate default.css file. */
   html[data-font="playfairDisplay"] body {
     --font-sans: var(--font-playfair-display);
   }
+
+  /* 表格行内的操作按钮(ghost 变体)默认是「透明背景 + 透明边框」,在表格里与内容
+     完全融为一体——用户看不出那是可点的操作入口(实测计算样式:背景与边框都是
+     rgba(0,0,0,0))。这里给表格单元格内的 ghost 按钮补上可见的边框与底色,悬停再加深,
+     让「可点」这件事一眼可见。
+     只作用于 [data-slot="table-cell"] 内的按钮:工具栏/对话框/分页等处的 ghost
+     本就有上下文,不该跟着变重。放在这里而不是逐个改 57 个调用点,是为了让所有
+     列表页(含以后新增的)表现一致,不会漏改。 */
+  [data-slot="table-cell"] [data-slot="button"][data-variant="ghost"] {
+    border-color: var(--border);
+    background-color: var(--muted);
+  }
+
+  [data-slot="table-cell"] [data-slot="button"][data-variant="ghost"]:hover {
+    background-color: color-mix(in oklch, var(--muted), var(--foreground) 10%);
+  }
 }
 
 html {

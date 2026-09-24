@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import Link from "next/link";
 
 import {
   BuildingIcon,
@@ -366,7 +367,13 @@ export default function AssetsPage() {
                       <TableCell>
                         <div className="flex items-center gap-2">
                           <CompanyAvatar name={c.name} logo={c.logo} />
-                          <span className="font-medium">{c.name}</span>
+                          <Link
+                            href={`/function/assets/detail?id=${c.id}`}
+                            className="font-medium hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                            title={`查看企业详情: ${c.name}`}
+                          >
+                            {c.name}
+                          </Link>
                         </div>
                       </TableCell>
                       <TableCell className="text-right tabular-nums text-sm">{c.asset_count}</TableCell>

@@ -51,13 +51,15 @@ func TestApplySchemaRetriesOnlyDeadlocks(t *testing.T) {
 	}
 }
 
-// testDSN returns the configured DSN, skipping the test when neither the env var
-// nor a config file supplies one (DSN no longer has a built-in default).
+// testDSN 返回测试套件用的 PostgreSQL DSN，未显式配置则跳过测试。它只认环境变量
+// ARTEX_PG_DSN（底层解析见 testmain_test.go 的 testDSNFromEnv），绝不回退
+// config.json——那是运行实例（含用户正库）的配置来源，读它等于让测试的建删数据
+// 落进用户正在使用的库。本包装保留给本包大量既有调用点使用。
 func testDSN(t *testing.T) string {
 	t.Helper()
-	dsn, _, err := DSN()
+	dsn, err := testDSNFromEnv()
 	if err != nil {
-		t.Skipf("no database config (%v) — skipping", err)
+		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
 	return dsn
 }

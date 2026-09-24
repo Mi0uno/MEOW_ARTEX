@@ -26,6 +26,27 @@ type goalSpec struct {
 //
 // 异步(goroutine)所以调用方立即返回,两条路径行为一致:秒建任务、后台拆目标。
 func (s *Server) launchTask(t *Task, seedText string, seedFirstIntent bool) {
+	// 信息搜集任务分两种形态:
+	//   kind=pipeline(默认):确定性收集器流水线,不进 agent 引擎、不耗 LLM;
+	//   kind=agent:AI 自主搜集——由 agent 引擎驱动(recon_worker 自主决定数据源、
+	//   生成查询语句、交叉验证、写回暂存区),用于「最全面搜集暴露面」的场景。
+	if t.Stage == "recon" && t.Kind != "agent" {
+		if !s.engine.beginTaskOperation(t.ID) {
+			return
+		}
+		defer s.engine.decInflight(t.ID)
+		s.launchReconTask(t)
+		return
+	}
+	// AI 识别任务(报告中心):同流水线语义,不进 agent 引擎,由 tmplRunner 驱动。
+	if t.Stage == "report" {
+		if !s.engine.beginTaskOperation(t.ID) {
+			return
+		}
+		defer s.engine.decInflight(t.ID)
+		s.launchTemplateTask(t)
+		return
+	}
 	if !s.engine.beginTaskOperation(t.ID) {
 		return
 	}
@@ -67,6 +88,11 @@ func (s *Server) startTaskEngine(t *Task) {
 
 func (s *Server) occupiesConcurrencySlot(t *Task) bool {
 	if t == nil {
+		return false
+	}
+	// 信息搜集流水线不占 agent 并发槽(无 LLM 消耗,由 reconRunner 独立驱动)。
+	// AI 识别任务同理:直连 LLM 不走 agent 并发槽,由 tmplRunner 独立驱动。
+	if t.Stage == "recon" || t.Stage == "report" {
 		return false
 	}
 	lifecycle := t.lifecycleSnapshot()

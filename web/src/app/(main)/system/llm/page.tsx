@@ -9,6 +9,7 @@ import {
   RefreshCwIcon,
   RotateCcwIcon,
   SaveIcon,
+  SearchIcon,
   StarIcon,
   Trash2Icon,
   ZapIcon,
@@ -21,7 +22,15 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { TablePagination } from "@/components/table-pagination";
 import { Separator } from "@/components/ui/separator";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Switch } from "@/components/ui/switch";
@@ -56,10 +65,41 @@ const MAX_TOKENS_FIELD_HINTS: Record<string, string> = {
   anthropic: "仅 openai 格式可选。Anthropic 的字段名固定为 max_tokens。",
   "openai-responses": "仅 openai 格式可选。Responses API 的字段名固定为 max_output_tokens。",
 };
+// 按 format 的 Base URL 占位与常用端点预设(一键填充)。
+// 注意契约差异:anthropic 的 base 不带 /v1(SDK 自己拼 /v1/messages);
+// openai / openai-responses 的 base 带 /v1(SDK 拼 /chat/completions 或 /responses)。
+const BASE_URL_PRESETS: Record<
+  string,
+  { placeholder: string; presets: { label: string; url: string }[] }
+> = {
+  anthropic: {
+    placeholder: "留空 = 官方 https://api.anthropic.com（不带 /v1）",
+    presets: [
+      { label: "官方 Anthropic", url: "" },
+      { label: "网关转发(Gateway)", url: "https://your-gateway.example.com/anthropic" },
+    ],
+  },
+  openai: {
+    placeholder: "留空 = 官方 https://api.openai.com/v1；兼容网关一般填到 /v1",
+    presets: [
+      { label: "官方 OpenAI", url: "" },
+      { label: "Ollama", url: "http://127.0.0.1:11434/v1" },
+      { label: "vLLM", url: "http://127.0.0.1:8000/v1" },
+      { label: "LM Studio", url: "http://127.0.0.1:1234/v1" },
+      { label: "DeepSeek", url: "https://api.deepseek.com/v1" },
+      { label: "Gemini 兼容", url: "https://generativelanguage.googleapis.com/v1beta/openai" },
+      { label: "one-api/new-api", url: "http://127.0.0.1:3000/v1" },
+    ],
+  },
+  "openai-responses": {
+    placeholder: "留空 = 官方 https://api.openai.com/v1",
+    presets: [{ label: "官方 OpenAI", url: "" }],
+  },
+};
+
 const EFFORT_LEVELS: { value: string; label: string }[] = [
   { value: NONE, label: "不发送（默认）" },
-  { value: "low", label: "low" },
-  { value: "medium", label: "medium" },
+  { value: "low", label: "low" },  { value: "medium", label: "medium" },
   { value: "high", label: "high" },
   { value: "xhigh", label: "xhigh" },
   { value: "max", label: "max" },
@@ -334,6 +374,17 @@ function ProfileSheet({
   const [models, setModels] = React.useState<string[]>([]);
   const [loadingModels, setLoadingModels] = React.useState(false);
   const [modelsOpen, setModelsOpen] = React.useState(false);
+  // 侧栏弹出卡顿修复:滑入动画(200ms)期间不同步挂载整棵长表单,动画结束后再挂载,
+  // 动画帧只画骨架 → 不掉帧。所有侧栏抽屉通用此模式。
+  const [sheetReady, setSheetReady] = React.useState(false);
+  React.useEffect(() => {
+    if (!open) {
+      setSheetReady(false);
+      return;
+    }
+    const t = setTimeout(() => setSheetReady(true), 240);
+    return () => clearTimeout(t);
+  }, [open]);
 
   // 每次打开时从传入的 profile 灌一遍表单（新建则重置为默认值）。抽屉关掉再打开
   // 就是一次干净的开始，不会留下上一个配置的残影。
@@ -360,6 +411,14 @@ function ProfileSheet({
     setKeyHint(profile?.api_key_hint ?? "");
     setModels([]);
     setModelsOpen(false);
+    // 固化的模型列表:编辑已存端点时,回填最近一次成功拉取的列表(可直接选用)。
+    const pid = profile ? Number(profile.id) : NaN;
+    if (Number.isFinite(pid) && pid > 0) {
+      api
+        .llmModelsCache(pid)
+        .then(setModels)
+        .catch(() => undefined);
+    }
   }, [open, profile]);
 
   const profileId = profile ? Number(profile.id) : undefined;
@@ -479,6 +538,19 @@ function ProfileSheet({
           </SheetDescription>
         </SheetHeader>
 
+        {/* 侧栏弹出卡顿修复:滑入动画帧里只画骨架,动画结束后再挂载整棵表单 */}
+        {!sheetReady ? (
+          <div className="flex min-h-0 flex-1 flex-col gap-3 px-4 py-4">
+            {[0, 1, 2, 3, 4, 5, 6, 7].map((i) => (
+              <div
+                key={i}
+                className="h-9 animate-pulse rounded-md bg-muted/60"
+                style={{ width: `${90 - (i % 3) * 10}%` }}
+              />
+            ))}
+          </div>
+        ) : (
+          <>
         <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 pb-4">
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="grid gap-2">
@@ -533,11 +605,16 @@ function ProfileSheet({
                 </PopoverTrigger>
                 {models.length > 0 && (
                   <PopoverContent className="max-h-72 w-72 gap-0 overflow-y-auto overscroll-contain p-1" align="end">
+                    <div className="text-muted-foreground sticky top-0 bg-popover px-2 py-1 text-xs">
+                      共 {models.length} 个模型 · 点击选用
+                    </div>
                     {models.map((m) => (
                       <button
                         key={m}
                         type="button"
-                        className="w-full shrink-0 rounded-md px-2 py-1.5 text-left font-mono text-xs hover:bg-accent hover:text-accent-foreground"
+                        className={`w-full shrink-0 rounded-md px-2 py-1.5 text-left font-mono text-xs hover:bg-accent hover:text-accent-foreground ${
+                          m === model ? "bg-accent text-accent-foreground" : ""
+                        }`}
                         onClick={() => {
                           setModel(m);
                           setModelsOpen(false);
@@ -553,14 +630,29 @@ function ProfileSheet({
           </div>
 
           <div className="grid gap-2">
-            <Label htmlFor="p-base-url">Base URL（可选）</Label>
+            <Label htmlFor="p-base-url">Base URL（可选，留空 = 该格式官方地址）</Label>
             <Input
               id="p-base-url"
               className="font-mono"
-              placeholder="https://api.openai.com/v1"
+              placeholder={BASE_URL_PRESETS[format]?.placeholder ?? "https://"}
               value={baseUrl}
               onChange={(e) => setBaseUrl(e.target.value)}
             />
+            {/* 常用端点预设:一键填充;粘贴完整补全路径(…/chat/completions)保存时会自动剥掉 */}
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-muted-foreground text-xs">常用:</span>
+              {(BASE_URL_PRESETS[format]?.presets ?? []).map((preset) => (
+                <button
+                  key={preset.url}
+                  type="button"
+                  onClick={() => setBaseUrl(preset.url)}
+                  className="rounded-full border px-2.5 py-0.5 text-xs transition-colors hover:bg-muted"
+                  title={preset.url}
+                >
+                  {preset.label}
+                </button>
+              ))}
+            </div>
           </div>
 
           <div className="grid gap-2">
@@ -778,6 +870,8 @@ function ProfileSheet({
             {isNew ? "新建" : "保存"}
           </Button>
         </div>
+          </>
+        )}
       </SheetContent>
     </Sheet>
   );
@@ -789,6 +883,34 @@ export default function LLMPage() {
   const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
   const [pool, setPool] = React.useState<LLMPoolStatus | null>(null);
   const [poolOpen, setPoolOpen] = React.useState(false);
+  // 列表页标准能力:搜索 / 格式筛选 / 分页。
+  const [query, setQuery] = React.useState("");
+  const [formatFilter, setFormatFilter] = React.useState("all");
+  const [page, setPage] = React.useState(1);
+  const [pageSize, setPageSize] = React.useState(12);
+
+  const filtered = React.useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return profiles.filter((p) => {
+      if (formatFilter !== "all" && (p.format ?? "") !== formatFilter) return false;
+      if (!q) return true;
+      return (
+        p.name.toLowerCase().includes(q) ||
+        (p.model ?? "").toLowerCase().includes(q) ||
+        (p.base_url ?? "").toLowerCase().includes(q)
+      );
+    });
+  }, [profiles, query, formatFilter]);
+
+  const paged = React.useMemo(
+    () => filtered.slice((page - 1) * pageSize, page * pageSize),
+    [filtered, page, pageSize],
+  );
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: filters intentionally reset pagination.
+  React.useEffect(() => {
+    setPage(1);
+  }, [query, formatFilter]);
   // 抽屉的开关和内容分开存：关闭时 editing 保持不变，否则关闭动画期间标题会从
   // 「编辑 X」闪成「新建」。editing = null 表示新建。
   const [editOpen, setEditOpen] = React.useState(false);
@@ -883,8 +1005,41 @@ export default function LLMPage() {
         </TabsList>
 
         <TabsContent value="profiles" className="mt-4">
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-            {profiles.map((p) => {
+          <div className="mb-3 flex flex-wrap items-center gap-2">
+            <div className="relative w-full sm:max-w-xs">
+              <SearchIcon className="text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2" />
+              <Input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="搜索名称 / 模型 / 地址"
+                className="pl-8"
+              />
+            </div>
+            <Select value={formatFilter} onValueChange={setFormatFilter}>
+              <SelectTrigger className="w-48">
+                <SelectValue placeholder="协议格式" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectItem value="all">全部格式</SelectItem>
+                  <SelectItem value="openai">OpenAI (Chat)</SelectItem>
+                  <SelectItem value="openai-responses">OpenAI (Responses)</SelectItem>
+                  <SelectItem value="anthropic">Anthropic</SelectItem>
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+            <span className="text-muted-foreground ml-auto text-xs tabular-nums">
+              {filtered.length}/{profiles.length} 个
+            </span>
+          </div>
+          {filtered.length === 0 ? (
+            <p className="text-muted-foreground py-12 text-center text-sm">
+              {profiles.length === 0 ? "还没有模型配置,点右上角「新建」添加" : "没有匹配的配置"}
+            </p>
+          ) : (
+            <>
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+                {paged.map((p) => {
               const h = healthOf(p, health.get(p.id));
               return (
                 // biome-ignore lint/a11y/useSemanticElements: 卡片内含自己的操作按钮，用原生 <button> 会造成按钮嵌套（非法 HTML）
@@ -970,12 +1125,20 @@ export default function LLMPage() {
                 </Card>
               );
             })}
-            {profiles.length === 0 && (
-              <div className="col-span-full rounded-lg border border-dashed p-10 text-center text-muted-foreground text-sm">
-                还没有模型配置，点击右上角「新建」创建第一个。
               </div>
-            )}
-          </div>
+              <TablePagination
+                page={page}
+                pageSize={pageSize}
+                total={filtered.length}
+                onPageChange={setPage}
+                onPageSizeChange={(s) => {
+                  setPage(1);
+                  setPageSize(s);
+                }}
+                pageSizeOptions={[12, 24, 48]}
+              />
+            </>
+          )}
         </TabsContent>
 
         <TabsContent value="retry" className="mt-4">

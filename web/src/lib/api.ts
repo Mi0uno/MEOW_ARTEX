@@ -18,21 +18,26 @@ import type {
   BatchCategoryItem,
   BatchControlItem,
   ChatAttachment,
+  CollectorRun,
   CommandRecord,
   Company,
   CompanyScopeMutation,
   CompanyScopeRule,
+  CompanyWithCounts,
   Conversation,
   ConvTokenSummary,
   CoverageAssetRefs,
   CoverageGraphData,
   DailyTokenBucket,
+  DecisionEngine,
   DeleteTaskOptions,
   DeleteTaskResult,
   Edge,
   EvidenceBodyPreview,
   ExplorationNodePage,
   ExplorationNodeQuery,
+  ExternalAPIConfig,
+  ExternalAPIProviderDesc,
   Finding,
   FindingAssetTree,
   FindingDeepenResponse,
@@ -64,6 +69,26 @@ import type {
   ModelTokenStat,
   PromptVar,
   PromptVersion,
+  ProxyCheckRun,
+  ProxyCountryStat,
+  ProxyEgressStatus,
+  ProxyEntry,
+  ProxyGroup,
+  ProxyProviderDef,
+  ProxyRequest,
+  ProxySource,
+  ProxyTrafficStat,
+  ProxyTrafficSummary,
+  ProxyUsageStat,
+  RawReconAsset,
+  ReconCollectorDesc,
+  ReconPlan,
+  ReconPipeline,
+  ReportCompanyCount,
+  ReportDetail,
+  ReportEvent,
+  ReportSummary,
+  ReportTemplate,
   SessionTokenUsage,
   Settings,
   Severity,
@@ -71,8 +96,17 @@ import type {
   SkillItem,
   SSProject,
   SSTask,
+  StagedAsset,
+  StagedAssetCounts,
+  StagedDecideResult,
   Stats,
+  SRCOverview,
+  SRCProfile,
+  SRCReward,
   Task,
+  VulnEntry,
+  VulnPoc,
+  VulnSyncRun,
   TaskArchive,
   TaskArchivePage,
   TaskAssetMutation,
@@ -87,6 +121,7 @@ import type {
   TokenTotal,
   TokenUsage,
   Tool,
+  ToolExecution,
   ToolStat,
   TrafficDetail,
   TrafficEvidenceRef,
@@ -95,6 +130,7 @@ import type {
   TrafficResp,
   UpdateCheck,
   UsageStats,
+  Wordbook,
   WorkspaceFile,
   WorkspaceListing,
 } from "@/lib/types";
@@ -117,7 +153,9 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
     signal,
     headers: {
-      ...(init?.body ? { "Content-Type": "application/json" } : {}),
+      // FormData(body 是 Blob/FormData)由浏览器自动生成带 boundary 的
+      // multipart Content-Type,绝不能覆盖成 JSON——否则服务端解析失败。
+      ...(init?.body instanceof FormData ? {} : init?.body ? { "Content-Type": "application/json" } : {}),
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(init?.headers as Record<string, string> | undefined),
     },
@@ -188,6 +226,23 @@ export function sseUrl(path: string): string {
 }
 
 const get = <T>(p: string) => http<T>(p);
+// httpText 取回文本正文(证据原始输出预览/下载),不做 JSON 解析。
+export async function httpText(path: string, init?: RequestInit): Promise<string> {
+  const token = getToken();
+  const signal = AbortSignal.timeout(60_000);
+  const r = await fetch(`/api${path}`, {
+    ...init,
+    signal,
+    headers: {
+      ...(init?.body ? { "Content-Type": "text/plain" } : {}),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(init?.headers as Record<string, string> | undefined),
+    },
+  });
+  if (r.status === 401) throw new Error("未授权");
+  if (!r.ok) throw new Error(`${path}: ${r.status}`);
+  return r.text();
+}
 const post = <T>(p: string, body?: unknown) =>
   http<T>(p, { method: "POST", body: body ? JSON.stringify(body) : undefined });
 const put = <T>(p: string, body?: unknown) =>
@@ -249,6 +304,13 @@ export const api = {
     seedFirstIntent?: boolean;
     planHeartbeatSeconds?: number;
     coverageEnabled?: boolean;
+    stage?: "recon" | "exploit" | "post" | "report"; // recon=信息搜集步骤任务;report=报告中心 AI 识别任务(系统创建)
+    srcMode?: boolean; // SRC 模式:产出计入 SRC 成果,并按企业 SRC 规范约束 AI 边界
+    proxyMode?: string; // 出网方式:""=跟随全局 / "direct"=强制直连 / "pool"=强制走代理池
+    proxyGroupId?: number; // 仅 pool 时有效:指定代理组;0/缺省=用全局选中的组
+    stepKey?: string; // recon 单步骤:收集器 key(推荐)
+    stepConfig?: Record<string, unknown>; // 步骤配置
+    pipeline?: ReconPipeline; // 兼容旧多步编排;stepKey 优先
   }) =>
     post<Task>("/tasks", {
       name: input.name ?? "",
@@ -262,8 +324,103 @@ export const api = {
       seed_first_intent: input.seedFirstIntent ?? false,
       plan_heartbeat_seconds: input.planHeartbeatSeconds ?? 0, // 0 = 后端归一到默认 600(10min)
       coverage_enabled: input.coverageEnabled ?? true, // 默认开;false=关闭资产覆盖度功能
+      stage: input.stage,
+      src_mode: input.srcMode ?? false,
+      proxy_mode: input.proxyMode ?? "",
+      proxy_group_id: input.proxyGroupId ?? 0,
+      step_key: input.stepKey,
+      step_config: input.stepConfig,
+      pipeline: input.pipeline,
     }),
   taskCategories: () => get<{ categories: TaskCategory[] }>("/task-categories").then((r) => arr(r.categories)),
+  // ---- 信息搜集(stage=recon)执行面 ----
+  reconCollectors: () => get<{ collectors: ReconCollectorDesc[] }>("/recon/collectors").then((r) => arr(r.collectors)),
+  // 自动检测可用数据源 + AI 生成查询语句(创建信息搜集任务前的预览)。
+  reconPlan: (companyIds: number[], useAI = true) =>
+    post<ReconPlan>("/recon/plan", { company_ids: companyIds, use_ai: useAI }),
+  collectorRuns: (taskId: string) =>
+    get<{ runs: CollectorRun[] }>(`/tasks/${encodeURIComponent(taskId)}/collector-runs`).then((r) => arr(r.runs)),
+  stagedAssets: (taskId: string, status?: string) => {
+    const q = status && status !== "all" ? `?status=${encodeURIComponent(status)}` : "";
+    return get<{ assets: StagedAsset[]; counts: StagedAssetCounts }>(
+      `/tasks/${encodeURIComponent(taskId)}/staged-assets${q}`,
+    ).then((r) => ({ assets: arr(r.assets), counts: r.counts }));
+  },
+  rerunRecon: (taskId: string) =>
+    post<{ id: string; rerun: boolean }>(`/tasks/${encodeURIComponent(taskId)}/recon/rerun`),
+  // 暂存资产采纳/忽略:ids 省略(空数组)时作用于全部 pending。
+  decideStagedAssets: (taskId: string, ids: number[], action: "adopt" | "ignore") =>
+    post<StagedDecideResult>(`/tasks/${encodeURIComponent(taskId)}/staged-assets/decide`, { ids, action }),
+  // 收集器原始输出(证据 blob 文本)。isTruncated=预览截断标记由调用方自行处理。
+  rawEvidence: (taskId: string, runId: number) =>
+    httpText(`/tasks/${encodeURIComponent(taskId)}/collector-runs/${runId}/raw`),
+  // ---- 外部接口(FOFA/Hunter 配置) ----
+  externalApis: () =>
+    get<{ apis: ExternalAPIConfig[]; providers: ExternalAPIProviderDesc[] }>("/external-apis").then((r) => ({
+      apis: arr(r.apis),
+      providers: arr(r.providers),
+    })),
+  createExternalApi: (input: {
+    provider: string;
+    name?: string;
+    baseUrl?: string;
+    credentials: Record<string, string>;
+  }) =>
+    post<{ id: number }>("/external-apis", {
+      provider: input.provider,
+      name: input.name ?? "",
+      base_url: input.baseUrl ?? "",
+      credentials: input.credentials,
+    }),
+  updateExternalApi: (
+    id: number,
+    input: { name?: string; baseUrl?: string; credentials?: Record<string, string>; enabled?: boolean },
+  ) =>
+    patch<{ ok: boolean }>(`/external-apis/${id}`, {
+      name: input.name,
+      base_url: input.baseUrl,
+      credentials: input.credentials,
+      enabled: input.enabled,
+    }),
+  deleteExternalApi: (id: number) => del<{ deleted: boolean }>(`/external-apis/${id}`),
+  testExternalApi: (id: number) =>
+    post<{ ok: boolean; message: string; quota_info?: Record<string, unknown> }>(`/external-apis/${id}/test`),
+  // ---- 工具手动执行(信息搜集) ----
+  reconExecute: (input: { tool: string; config: Record<string, unknown>; companyId?: number }) =>
+    post<{
+      id: number;
+      status: "done" | "failed" | string;
+      assets?: RawReconAsset[];
+      stats?: Record<string, unknown>;
+      raw_evidence_hash?: string;
+      error?: string;
+    }>("/recon/execute", { tool: input.tool, config: input.config, company_id: input.companyId }),
+  reconExecutions: (limit = 50) =>
+    get<{ executions: ToolExecution[] }>(`/recon/execute?limit=${limit}`).then((r) => arr(r.executions)),
+  // ---- 字典库 ----
+  wordbooks: () => get<{ wordbooks: Wordbook[] }>("/recon/wordbooks").then((r) => arr(r.wordbooks)),
+  uploadWordbook: (file: File, name: string, kind: string, note?: string) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("name", name);
+    fd.append("kind", kind);
+    if (note) fd.append("note", note);
+    const token = getToken();
+    return fetch(`/api/recon/wordbooks`, {
+      method: "POST",
+      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      body: fd,
+    }).then(async (r) => {
+      if (!r.ok) throw new Error(await r.text());
+      return r.json() as Promise<{ id: number; line_count: number }>;
+    });
+  },
+  deleteWordbook: (id: number) => del<{ deleted: boolean }>(`/recon/wordbooks/${id}`),
+  wordbookPreview: (id: number, limit = 30) =>
+    get<{ lines: string[]; truncated: boolean }>(`/recon/wordbooks/${id}/preview?limit=${limit}`),
+  wordbookContent: (id: number) => httpText(`/recon/wordbooks/${id}/content`),
+  saveWordbookContent: (id: number, content: string) =>
+    httpText(`/recon/wordbooks/${id}/content`, { method: "PUT", body: content }),
   updateTask: (id: string, input: { name?: string; pinned?: boolean }) => patch<Task>(`/tasks/${id}`, input),
   renameTask: (id: string, name: string) => patch<Task>(`/tasks/${id}`, { name }),
   pinTask: (id: string, pinned: boolean) => patch<Task>(`/tasks/${id}`, { pinned }),
@@ -452,6 +609,10 @@ export const api = {
     get<{ count: number; total: number; assets: Asset[] }>(`/assets?type=${type}&limit=${limit}&offset=${offset}`).then(
       (r) => ({ assets: r?.assets ?? [], total: r?.total ?? r?.count ?? 0 }),
     ),
+  assetsByCompany: (companyId: number, type = "", limit = 2000, offset = 0) =>
+    get<{ count: number; total: number; assets: Asset[] }>(
+      `/assets?company_id=${companyId}${type ? `&type=${encodeURIComponent(type)}` : ""}&limit=${limit}&offset=${offset}`,
+    ).then((r) => ({ assets: r?.assets ?? [], total: r?.total ?? r?.count ?? 0 })),
   searchAssets: (dsl: string, type = "", limit = 50, offset = 0) =>
     get<{ count: number; total: number; assets: Asset[] }>(
       `/assets?dsl=${encodeURIComponent(dsl)}${type ? `&type=${encodeURIComponent(type)}` : ""}&limit=${limit}&offset=${offset}`,
@@ -484,6 +645,27 @@ export const api = {
 
   // ---- companies (企业 + 资产范围；归属唯一来源) ----
   companies: () => get<Company[]>("/companies").then(arr),
+  // 企业列表页(「先选资产主体」):服务端搜索/范围类型筛选/排序/分页。
+  companiesPage: (input?: {
+    q?: string;
+    kind?: string;
+    sort?: "name" | "assets" | "tasks" | "reports" | "updated";
+    desc?: boolean;
+    limit?: number;
+    offset?: number;
+  }) => {
+    const p = new URLSearchParams();
+    if (input?.q) p.set("q", input.q);
+    if (input?.kind) p.set("kind", input.kind);
+    if (input?.sort) p.set("sort", input.sort);
+    if (input?.desc) p.set("desc", "1");
+    p.set("limit", String(input?.limit ?? 20));
+    p.set("offset", String(input?.offset ?? 0));
+    return get<{ companies: CompanyWithCounts[]; total: number }>(`/companies?${p.toString()}`).then((r) => ({
+      companies: arr(r.companies),
+      total: r.total ?? 0,
+    }));
+  },
   createCompany: (name: string, scope: CompanyScopeRule[]) =>
     post<{ id: number; created: boolean; scope_added?: number; scope_invalid?: number; scope_errors?: string[] }>(
       "/companies",
@@ -777,6 +959,213 @@ export const api = {
     if (!r.ok) throw new Error(`report: ${r.status}`);
     return r.text();
   },
+  // ---- 漏洞库 ----
+  vulnEntries: (input?: {
+    category?: string;
+    categories?: string[];
+    severity?: string;
+    status?: string;
+    source?: string;
+    q?: string;
+    taskId?: number;
+    hasPoc?: string;
+    sort?: string;
+    limit?: number;
+    offset?: number;
+  }) => {
+    const p = new URLSearchParams();
+    if (input?.category) p.set("category", input.category);
+    if (input?.categories?.length) p.set("categories", input.categories.join(","));
+    if (input?.severity) p.set("severity", input.severity);
+    if (input?.status) p.set("status", input.status);
+    if (input?.source) p.set("source", input.source);
+    if (input?.q) p.set("q", input.q);
+    if (input?.taskId) p.set("task_id", String(input.taskId));
+    if (input?.hasPoc) p.set("has_poc", input.hasPoc);
+    if (input?.sort) p.set("sort", input.sort);
+    p.set("limit", String(input?.limit ?? 50));
+    p.set("offset", String(input?.offset ?? 0));
+    return get<{ entries: VulnEntry[]; total: number; counts: Record<string, number> }>(
+      `/vulndb/entries?${p.toString()}`,
+    ).then((r) => ({ entries: arr(r.entries), total: r.total, counts: r.counts ?? {} }));
+  },
+  vulnEntry: (id: number) =>
+    get<{ entry: VulnEntry; pocs: VulnPoc[] }>(`/vulndb/entries/${id}`).then((r) => ({
+      entry: r.entry,
+      pocs: arr(r.pocs),
+    })),
+  createVulnEntry: (input: Partial<VulnEntry>) => post<{ entry: VulnEntry }>("/vulndb/entries", input),
+  updateVulnEntry: (id: number, input: Partial<VulnEntry>) =>
+    put<{ entry: VulnEntry }>(`/vulndb/entries/${id}`, input),
+  deleteVulnEntry: (id: number) => del<{ deleted: boolean }>(`/vulndb/entries/${id}`),
+  createVulnPoc: (entryId: number, input: Partial<VulnPoc>) =>
+    post<{ poc: VulnPoc }>(`/vulndb/entries/${entryId}/pocs`, input),
+  updateVulnPoc: (id: number, input: Partial<VulnPoc>) => put<{ ok: boolean }>(`/vulndb/pocs/${id}`, input),
+  deleteVulnPoc: (id: number) => del<{ deleted: boolean }>(`/vulndb/pocs/${id}`),
+  vulnSyncStatus: () =>
+    get<{
+      runs: VulnSyncRun[];
+      counts: Record<string, number>;
+      total: number;
+      enabled: boolean;
+      interval_hours: number;
+    }>("/vulndb/sync").then((r) => ({ ...r, runs: arr(r.runs), counts: r.counts ?? {} })),
+  triggerVulnSync: () => post<{ status: string }>("/vulndb/sync", {}),
+  setVulnSyncConfig: (input: { enabled?: boolean; interval_hours?: number }) =>
+    put<{ ok: boolean }>("/vulndb/sync/config", input),
+  // ---- SRC 模式 ----
+  srcProfiles: (input?: { companyId?: number; q?: string; limit?: number; offset?: number }) => {
+    const p = new URLSearchParams();
+    if (input?.companyId) p.set("company_id", String(input.companyId));
+    if (input?.q) p.set("q", input.q);
+    p.set("limit", String(input?.limit ?? 50));
+    p.set("offset", String(input?.offset ?? 0));
+    return get<{ profiles: SRCProfile[]; total: number }>(`/src/profiles?${p.toString()}`).then((r) => ({
+      profiles: arr(r.profiles),
+      total: r.total ?? 0,
+    }));
+  },
+  saveSRCProfile: (input: Partial<SRCProfile>) => post<{ profile: SRCProfile }>("/src/profiles", input),
+  deleteSRCProfile: (id: number) => del<{ deleted: boolean }>(`/src/profiles/${id}`),
+  srcRewards: (input?: {
+    companyId?: number;
+    taskId?: number;
+    status?: string;
+    severity?: string;
+    q?: string;
+    sort?: string;
+    limit?: number;
+    offset?: number;
+  }) => {
+    const p = new URLSearchParams();
+    if (input?.companyId) p.set("company_id", String(input.companyId));
+    if (input?.taskId) p.set("task_id", String(input.taskId));
+    if (input?.status) p.set("status", input.status);
+    if (input?.severity) p.set("severity", input.severity);
+    if (input?.q) p.set("q", input.q);
+    if (input?.sort) p.set("sort", input.sort);
+    p.set("limit", String(input?.limit ?? 50));
+    p.set("offset", String(input?.offset ?? 0));
+    return get<{ rewards: SRCReward[]; total: number; counts: Record<string, number> }>(
+      `/src/rewards?${p.toString()}`,
+    ).then((r) => ({ rewards: arr(r.rewards), total: r.total, counts: r.counts ?? {} }));
+  },
+  createSRCReward: (input: Partial<SRCReward>) => post<{ reward: SRCReward }>("/src/rewards", input),
+  updateSRCReward: (id: number, input: Partial<SRCReward>) =>
+    put<{ reward: SRCReward }>(`/src/rewards/${id}`, input),
+  deleteSRCReward: (id: number) => del<{ deleted: boolean }>(`/src/rewards/${id}`),
+  srcOverview: () => get<SRCOverview>("/src/overview"),
+
+  // ---- 报告中心 ----
+  listReports: (input?: { kind?: string; q?: string; companyId?: number; limit?: number; offset?: number }) => {
+    const p = new URLSearchParams();
+    if (input?.kind) p.set("kind", input.kind);
+    if (input?.q) p.set("q", input.q);
+    if (input?.companyId) p.set("company_id", String(input.companyId));
+    p.set("limit", String(input?.limit ?? 50));
+    p.set("offset", String(input?.offset ?? 0));
+    return get<{ reports: ReportSummary[]; total: number; counts: Record<string, number> }>(
+      `/reports?${p.toString()}`,
+    ).then((r) => ({ reports: arr(r.reports), total: r.total, counts: r.counts ?? {} }));
+  },
+  // 报告中心的「先选企业」列表:每个企业名下的报告数与分类细分。
+  reportCompanies: () =>
+    get<{ companies: ReportCompanyCount[]; assigned: number; unassigned: number }>("/reports/companies").then((r) => ({
+      companies: arr(r.companies),
+      assigned: r.assigned ?? 0,
+      unassigned: r.unassigned ?? 0,
+    })),
+  // 「未关联企业」桶:自定义报告 + 任务/漏洞都没挂企业的报告。
+  listUnassignedReports: (input?: { kind?: string; q?: string; limit?: number; offset?: number }) => {
+    const p = new URLSearchParams();
+    if (input?.kind) p.set("kind", input.kind);
+    if (input?.q) p.set("q", input.q);
+    p.set("company_id", "-1");
+    p.set("limit", String(input?.limit ?? 50));
+    p.set("offset", String(input?.offset ?? 0));
+    return get<{ reports: ReportSummary[]; total: number; counts: Record<string, number> }>(
+      `/reports?${p.toString()}`,
+    ).then((r) => ({ reports: arr(r.reports), total: r.total, counts: r.counts ?? {} }));
+  },
+  reportDetail: (id: number) => get<{ report: ReportDetail }>(`/reports/${id}`).then((r) => r.report),
+  createReport: (input: { title: string; summary?: string; content: string }) =>
+    post<{ report: ReportDetail }>("/reports", {
+      title: input.title,
+      summary: input.summary ?? "",
+      content: input.content,
+    }),
+  deleteReport: (id: number) => del<{ deleted: boolean }>(`/reports/${id}`),
+  // ---- 报告模板 ----
+  reportTemplates: (input?: { category?: string; q?: string; limit?: number; offset?: number }) => {
+    const p = new URLSearchParams();
+    if (input?.category) p.set("category", input.category);
+    if (input?.q) p.set("q", input.q);
+    p.set("limit", String(input?.limit ?? 20));
+    p.set("offset", String(input?.offset ?? 0));
+    return get<{ templates: ReportTemplate[]; total: number }>(`/report-templates?${p.toString()}`).then((r) => ({
+      templates: arr(r.templates),
+      total: r.total,
+    }));
+  },
+  reportTemplate: (id: number) => get<{ template: ReportTemplate }>(`/report-templates/${id}`).then((r) => r.template),
+  uploadReportTemplate: (file: File, name?: string, category?: string) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    if (name) fd.append("name", name);
+    if (category) fd.append("category", category);
+    const token = getToken();
+    return http<{ template: ReportTemplate }>("/report-templates", {
+      method: "POST",
+      body: fd,
+      signal: AbortSignal.timeout(120_000),
+      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+    });
+  },
+  updateReportTemplate: (id: number, patch: { name?: string; category?: string; content?: string }) =>
+    put<{ ok: boolean }>(`/report-templates/${id}`, patch),
+  deleteReportTemplate: (id: number) => del<{ deleted: boolean }>(`/report-templates/${id}`),
+  // AI 占位模板识别(异步任务化):202 立即返回监看任务/会话 id,生成在服务端跑,
+  // 不再受 HTTP 超时约束;进度用 reportTemplate(id) 轮询 analyze_status。
+  analyzeReportTemplate: (id: number, profileId?: number) =>
+    http<{ status: string; task_id: number; conv_id: number }>(`/report-templates/${id}/analyze`, {
+      method: "POST",
+      body: JSON.stringify({ profile_id: profileId ?? 0 }),
+    }),
+  reportEvents: (id: number) => get<{ events: ReportEvent[] }>(`/reports/${id}/events`).then((r) => arr(r.events)),
+  // 按模板导出报告为文件并触发浏览器下载。
+  exportReport: async (id: number, templateId?: number, format: "md" | "docx" = "md") => {
+    const token = getToken();
+    const p = new URLSearchParams({ format });
+    if (templateId) p.set("template_id", String(templateId));
+    const url = "/api/reports/" + encodeURIComponent(String(id)) + "/export?" + p.toString();
+    const r = await fetch(url, {
+      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+    });
+    if (!r.ok) throw new Error(`导出失败:${r.status}`);
+    const blob = await r.blob();
+    const cd = r.headers.get("Content-Disposition") ?? "";
+    const m = cd.match(/filename\*=UTF-8''([^;]+)/);
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = m ? decodeURIComponent(m[1]) : `report-${id}.${format}`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  },
+  // 从现有产出归档:任务总结报告(即时渲染探索图)/漏洞报告(需 findings.report 已有正文)。
+  generateTaskReport: (taskId: string) =>
+    post<{ id: number; created: boolean }>("/reports/generate", { source: "task", task_id: taskId }),
+  generateFindingReport: (findingId: number) =>
+    post<{ id: number; created: boolean }>("/reports/generate", { source: "finding", finding_id: findingId }),
+  // ---- 决策引擎(AI管理·Decision 配置;监管&规则·AI监管 编排) ----
+  decisionEngines: () => get<{ engines: DecisionEngine[] }>("/decision/engines").then((r) => arr(r.engines)),
+  updateDecisionEngine: (
+    key: string,
+    patch: { enabled?: boolean; base_url?: string; api_key?: string; model?: string },
+  ) => put<{ ok: boolean }>(`/decision/engines/${encodeURIComponent(key)}`, patch),
+  testDecisionEngine: (key: string) =>
+    post<{ ok: boolean; latency_ms?: number; detail?: string; error?: string }>(
+      `/decision/engines/${encodeURIComponent(key)}/test`,
+    ),
   chatMentions: (kind: string, query: string, signal?: AbortSignal, cursor = "") =>
     http<{ items: ChatMention[]; next_cursor?: string }>(
       `/chat/mentions?${new URLSearchParams({ kind, q: query, cursor })}`,
@@ -902,17 +1291,25 @@ export const api = {
       proxy,
       profile_id,
     }),
+  // 最近一次成功拉取的模型列表(固化缓存;随 profile 存,编辑端点时直接可选)。
+  llmModelsCache: (profileId: number) =>
+    get<{ models: string[] }>(`/llm/models-cache?profile_id=${profileId}`).then((r) => arr(r.models)),
 
   // ---- agents ----
   agents: () => get<{ agents: Agent[] }>("/agents").then((r) => arr(r.agents)),
   getAgent: (key: string) => get<AgentDetail>(`/agents/${key}`),
-  createAgent: (key: string, name: string, description = "") => post<Agent>("/agents", { key, name, description }),
+  createAgent: (key: string, name: string, description = "", stage: "" | "recon" | "exploit" | "post" | "report" = "") =>
+    post<Agent>("/agents", { key, name, description, stage }),
   updateAgent: (key: string, name: string, description = "") =>
     patch<{ ok: boolean }>(`/agents/${key}`, { name, description }),
   deleteAgent: (key: string) => del<{ deleted: string }>(`/agents/${key}`),
 
   // ---- conversations (chat page) ----
-  conversations: () => get<{ conversations: Conversation[] }>("/conversations").then((r) => arr(r.conversations)),
+  // stage: 三阶段分组入口传 recon|exploit|post,只拉本阶段 agent 的会话;缺省=全部(任务中心)。
+  conversations: (stage?: string) =>
+    get<{ conversations: Conversation[] }>(
+      stage ? `/conversations?stage=${encodeURIComponent(stage)}` : "/conversations",
+    ).then((r) => arr(r.conversations)),
   createConversation: (agent_key: string, title = "", llm_profile_id?: number | null) =>
     post<Conversation>("/conversations", { agent_key, title, llm_profile_id: llm_profile_id ?? null }),
   updateConversation: (id: number, input: { title?: string; pinned?: boolean }) =>
@@ -979,6 +1376,7 @@ export const api = {
       trigger_run_mode?: "serial" | "parallel";
       trigger_merge_mode?: "by_task" | "all" | "none";
       trigger_max_parallel?: number;
+      stage?: "" | "recon" | "exploit" | "post" | "report"; // 归属阶段;缺省=不动
     },
   ) => put<{ ok: boolean }>(`/agents/${key}/config`, patch),
   agentPromptVersions: (key: string) =>
@@ -993,6 +1391,8 @@ export const api = {
 
   // ---- tools (内置工具目录) ----
   tools: () => get<{ tools: Tool[] }>("/tools").then((r) => arr(r.tools)),
+  toolsStage: (stage: string) =>
+    get<{ tools: Tool[] }>(`/tools?stage=${encodeURIComponent(stage)}`).then((r) => arr(r.tools)),
   saveTool: (key: string, patch: Pick<Tool, "description" | "schema" | "agents" | "enabled">) =>
     put<{ ok: boolean }>(`/tools/${key}`, patch),
   resetTool: (key: string) => post<{ ok: boolean }>(`/tools/${key}/reset`, {}),
@@ -1210,4 +1610,166 @@ export const api = {
   // 202 即返回，实际下载在后台跑，进度走 /api/update/stream。
   applyUpdate: () => post<{ ok: boolean; target: string }>(`/update/apply`),
   rollbackUpdate: () => post<{ ok: boolean }>(`/update/rollback`),
+
+  // ---- 代理中心 ----
+  // 出网状态总览：当前模式(裸网/代理池)、生效代理、全平台代理统计。
+  proxyEgress: () => get<ProxyEgressStatus>(`/proxy/egress`),
+  // 快速切换本地裸网 ⇄ 代理池。mode=pool 时需带 groupId。
+  // 切换会重建 agent(出网地址在 agent 构造时注入)，返回切换后的最新状态。
+  proxySetEgress: (mode: string, groupId = 0) =>
+    put<ProxyEgressStatus>(`/proxy/egress`, { mode, group_id: groupId }),
+  // 代理组列表(分页 + 搜索 + 类型筛选 + 排序)，counts 是各类型总数(供页签)。
+  proxyGroups: (input?: {
+    kind?: string;
+    q?: string;
+    sort?: string;
+    desc?: boolean;
+    limit?: number;
+    offset?: number;
+  }) => {
+    const p = new URLSearchParams();
+    if (input?.kind) p.set("kind", input.kind);
+    if (input?.q) p.set("q", input.q);
+    if (input?.sort) p.set("sort", input.sort);
+    if (input?.desc === false) p.set("desc", "0");
+    p.set("limit", String(input?.limit ?? 50));
+    p.set("offset", String(input?.offset ?? 0));
+    return get<{ groups: ProxyGroup[]; total: number; counts: Record<string, number> }>(
+      `/proxy/groups?${p.toString()}`,
+    ).then((r) => ({ groups: arr(r.groups), total: r.total, counts: r.counts ?? {} }));
+  },
+  proxyGroup: (id: number) => get<{ group: ProxyGroup }>(`/proxy/groups/${id}`).then((r) => r.group),
+  createProxyGroup: (input: Partial<ProxyGroup>) => post<{ group: ProxyGroup }>(`/proxy/groups`, input),
+  updateProxyGroup: (id: number, input: Partial<ProxyGroup>) =>
+    put<{ group: ProxyGroup }>(`/proxy/groups/${id}`, input),
+  deleteProxyGroup: (id: number) => del<{ deleted: boolean }>(`/proxy/groups/${id}`),
+  // 组内代理列表(分页 + 状态/来源/协议/地区筛选 + 搜索)，counts 是各状态总数。
+  proxyEntries: (
+    groupId: number,
+    input?: {
+      status?: string;
+      source?: string;
+      protocol?: string;
+      region?: string;
+      countryCode?: string;
+      q?: string;
+      sort?: string;
+      desc?: boolean;
+      limit?: number;
+      offset?: number;
+    },
+  ) => {
+    const p = new URLSearchParams();
+    if (input?.status) p.set("status", input.status);
+    if (input?.source) p.set("source", input.source);
+    if (input?.protocol) p.set("protocol", input.protocol);
+    if (input?.region) p.set("region", input.region);
+    if (input?.countryCode) p.set("country_code", input.countryCode);
+    if (input?.q) p.set("q", input.q);
+    if (input?.sort) p.set("sort", input.sort);
+    if (input?.desc === false) p.set("desc", "0");
+    p.set("limit", String(input?.limit ?? 50));
+    p.set("offset", String(input?.offset ?? 0));
+    return get<{ proxies: ProxyEntry[]; total: number; counts: Record<string, number> }>(
+      `/proxy/groups/${groupId}/proxies?${p.toString()}`,
+    ).then((r) => ({ proxies: arr(r.proxies), total: r.total, counts: r.counts ?? {} }));
+  },
+  createProxy: (groupId: number, input: { url: string; label?: string; region?: string }) =>
+    post<{ proxy: ProxyEntry; existing: boolean }>(`/proxy/groups/${groupId}/proxies`, input),
+  updateProxy: (id: number, input: { label?: string; region?: string; status?: string }) =>
+    put<{ ok: boolean }>(`/proxy/${id}`, input),
+  deleteProxy: (id: number) => del<{ deleted: boolean }>(`/proxy/${id}`),
+  // 批量删除组内代理；status 非空时按状态清理(如清掉全部 dead)，ids 优先。
+  deleteProxies: (groupId: number, input: { ids?: number[]; status?: string }) =>
+    del<{ deleted: number }>(`/proxy/groups/${groupId}/proxies`, input),
+  // 组上的代理池 API 接入。
+  proxySources: (groupId: number) =>
+    get<{ sources: ProxySource[] }>(`/proxy/groups/${groupId}/sources`).then((r) => ({ sources: arr(r.sources) })),
+  createProxySource: (groupId: number, input: Record<string, unknown>) =>
+    post<{ source: ProxySource }>(`/proxy/groups/${groupId}/sources`, input),
+  updateProxySource: (id: number, input: Record<string, unknown>) =>
+    put<{ source: ProxySource }>(`/proxy/sources/${id}`, input),
+  deleteProxySource: (id: number) => del<{ deleted: boolean }>(`/proxy/sources/${id}`),
+  // 立即从该源拉取一轮代理。
+  syncProxySource: (id: number) =>
+    post<{ imported: number; total: number; message?: string }>(`/proxy/sources/${id}/sync`),
+  // 内置代理源注册表(商业 / 公益 / 在野搜集)。
+  proxyProviders: () => get<{ providers: ProxyProviderDef[] }>(`/proxy/providers`).then((r) => arr(r.providers)),
+  // 一键接入全部公益池 + 在野搜集源(免凭据源),省去逐个添加。
+  syncAllProxySources: (groupId: number) =>
+    post<{ added: number; sources: ProxySource[] }>(`/proxy/groups/${groupId}/sources/auto`),
+  // 触发测活。ids 为空则测整组。
+  checkProxies: (groupId: number, ids?: number[]) =>
+    post<{ run_id: number; checking: number }>(`/proxy/groups/${groupId}/check`, { ids: ids ?? [] }),
+  // 测活批次台账。
+  proxyCheckRuns: (groupId: number, limit = 20) =>
+    get<{ runs: ProxyCheckRun[] }>(`/proxy/check-runs?group_id=${groupId}&limit=${limit}`).then((r) => ({
+      runs: arr(r.runs),
+    })),
+  // 仪表盘:总览 + 时间序列 + 按代理的调度排行(一条请求取齐)。
+  proxyDashboard: (input?: { window_mins?: number; group_id?: number }) => {
+    const p = new URLSearchParams();
+    if (input?.window_mins) p.set("window_mins", String(input.window_mins));
+    if (input?.group_id) p.set("group_id", String(input.group_id));
+    const qs = p.toString();
+    return get<{
+      summary: ProxyTrafficSummary;
+      series: ProxyTrafficStat[];
+      usage: ProxyUsageStat[];
+      egress: ProxyEgressStatus;
+    }>(`/proxy/dashboard${qs ? `?${qs}` : ""}`).then((r) => ({
+      summary: r.summary ?? {
+        total: 0,
+        failed: 0,
+        success_rate: 0,
+        avg_ms: 0,
+        bytes_in: 0,
+        bytes_out: 0,
+        window_mins: input?.window_mins ?? 60,
+      },
+      series: arr(r.series),
+      usage: arr(r.usage),
+      egress: r.egress,
+    }));
+  },
+  // 请求流水(分页 + 筛选)。
+  proxyRequests: (input?: {
+    group_id?: number;
+    proxy_id?: number;
+    task_id?: number;
+    only_failed?: boolean;
+    host?: string;
+    q?: string;
+    limit?: number;
+    offset?: number;
+  }) => {
+    const p = new URLSearchParams();
+    if (input?.group_id) p.set("group_id", String(input.group_id));
+    if (input?.proxy_id) p.set("proxy_id", String(input.proxy_id));
+    if (input?.task_id) p.set("task_id", String(input.task_id));
+    if (input?.only_failed) p.set("only_failed", "1");
+    if (input?.host) p.set("host", input.host);
+    if (input?.q) p.set("q", input.q);
+    p.set("limit", String(input?.limit ?? 50));
+    p.set("offset", String(input?.offset ?? 0));
+    return get<{ requests: ProxyRequest[]; total: number }>(`/proxy/requests?${p.toString()}`).then((r) => ({
+      requests: arr(r.requests),
+      total: r.total,
+    }));
+  },
+  // 清空请求流水(窗口之前的)。
+  purgeProxyRequests: (beforeMins = 0) =>
+    del<{ deleted: number }>(`/proxy/requests${beforeMins > 0 ? `?before_mins=${beforeMins}` : ""}`),
+  // 地区分布(代理列表的国家筛选器用);group_id 省略 = 全平台。
+  // pending 是「已拿到出口 IP 但还没识别国家」的条数,pending 归零即识别完成。
+  proxyCountries: (groupId = 0) =>
+    get<{ countries: ProxyCountryStat[]; pending: number; enabled: boolean }>(
+      `/proxy/countries${groupId > 0 ? `?group_id=${groupId}` : ""}`,
+    ).then((r) => ({ countries: arr(r.countries), pending: r.pending ?? 0, enabled: r.enabled !== false })),
+  // 手动触发一轮地区识别(同步执行,受主动限速约束故单次上限 300)。
+  resolveProxyGeo: (groupId: number, limit = 60) =>
+    post<{ resolved: number; failed: number; updated: number; pending: number }>(
+      `/proxy/groups/${groupId}/geo`,
+      { limit },
+    ),
 };

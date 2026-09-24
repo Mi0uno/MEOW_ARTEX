@@ -248,12 +248,22 @@ func (s *Server) pgCreateAgent(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
-	var req struct{ Key, Name, Description string }
+	var req struct {
+		Key, Name, Description string
+		Stage                  string `json:"stage,omitempty"`
+	}
 	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
 	req.Key, req.Name = strings.TrimSpace(req.Key), strings.TrimSpace(req.Name)
+	req.Stage = strings.TrimSpace(req.Stage)
+	switch req.Stage {
+	case "", "recon", "exploit", "post", "report":
+	default:
+		writeErr(w, 400, "stage 必须为 recon|exploit|post|report 或空(通用)")
+		return
+	}
 	if !reAgentKey.MatchString(req.Key) {
 		writeErr(w, 400, "key 需小写字母开头，仅含小写字母/数字/下划线")
 		return
@@ -266,7 +276,7 @@ func (s *Server) pgCreateAgent(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, "该 key 已存在")
 		return
 	}
-	a, err := pg.CreateAgent(req.Key, req.Name, req.Description)
+	a, err := pg.CreateAgent(req.Key, req.Name, req.Description, req.Stage)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -367,6 +377,8 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 		TriggerRunMode     *string `json:"trigger_run_mode"`
 		TriggerMergeMode   *string `json:"trigger_merge_mode"`
 		TriggerMaxParallel *int    `json:"trigger_max_parallel"`
+		// stage 归属阶段(''=通用 | recon | exploit | post):阶段分组的对话按此过滤。缺省=不动。
+		Stage *string `json:"stage"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -438,6 +450,13 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := pg.SetAgentTriggerBehavior(a.Key, runMode, mergeMode, maxPar); err != nil {
 			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.Stage != nil {
+		stage := strings.TrimSpace(*req.Stage)
+		if err := pg.SetAgentStage(a.Key, stage); err != nil {
+			writeErr(w, 400, err.Error())
 			return
 		}
 	}
@@ -749,6 +768,16 @@ func (s *Server) pgListTools(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
+	}
+	// 可选阶段筛选(?stage=recon|exploit|post)——三阶段工具页各自拉本阶段工具。
+	if stage := r.URL.Query().Get("stage"); stage != "" {
+		filtered := make([]*db.Tool, 0, len(ts))
+		for _, t := range ts {
+			if t.Stage == stage {
+				filtered = append(filtered, t)
+			}
+		}
+		ts = filtered
 	}
 	if ts == nil {
 		ts = []*db.Tool{}
@@ -1822,6 +1851,61 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	if p.Format != "openai" || p.MaxTokensField != llm.MaxTokensFieldCompletion {
 		p.MaxTokensField = ""
 	}
+	// ---- 新建/编辑归一化与校验(把运行时才炸的问题提前到保存时) ----
+	// norma 的 URL 契约: anthropic = {base}/v1/messages(base 不带 /v1);
+	//                     openai   = {base}/chat/completions(base 带 /v1);
+	//                     responses= {base}/responses(base 带 /v1)。
+	// base_url 留空 = 各格式官方地址(NewProvider 内置默认)。
+	p.Name = strings.TrimSpace(p.Name)
+	if p.Name == "" {
+		writeErr(w, 400, "端点名称不能为空")
+		return
+	}
+	switch p.Format {
+	case "openai", "anthropic", "openai-responses":
+	default:
+		writeErr(w, 400, "format 必须为 openai | anthropic | openai-responses")
+		return
+	}
+	p.Model = strings.TrimSpace(p.Model)
+	if p.Model == "" {
+		writeErr(w, 400, "模型名不能为空")
+		return
+	}
+	p.BaseURL = strings.TrimSpace(p.BaseURL)
+	if p.BaseURL != "" {
+		// 常见手误归一化:结尾斜杠、直接粘贴的补全端点后缀、anthropic 误带 /v1。
+		// 循环剥离到稳定(后缀后可能还跟尾斜杠,如 …/v1/chat/completions/)。
+		b := p.BaseURL
+		for i := 0; i < 4; i++ {
+			before := b
+			b = strings.TrimRight(b, "/")
+			for _, suf := range []string{"/chat/completions", "/responses", "/messages", "/completions"} {
+				b = strings.TrimSuffix(b, suf)
+				b = strings.TrimRight(b, "/")
+			}
+			if p.Format == "anthropic" {
+				b = strings.TrimSuffix(b, "/v1")
+				b = strings.TrimRight(b, "/")
+			}
+			if b == before {
+				break
+			}
+		}
+		p.BaseURL = b
+		if u, err := url.Parse(p.BaseURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+			writeErr(w, 400, "base_url 必须是 http/https 地址(留空 = 该格式官方地址)")
+			return
+		}
+	}
+	p.Proxy = strings.TrimSpace(p.Proxy)
+	if p.Proxy != "" {
+		if u, err := url.Parse(p.Proxy); err != nil || (u.Scheme != "http" && u.Scheme != "https" && u.Scheme != "socks5") {
+			writeErr(w, 400, "proxy 必须是 http/https/socks5 地址")
+			return
+		}
+	}
+	p.APIKey = strings.TrimSpace(p.APIKey)
 	id, err := pg.SaveProfile(&p)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -1836,6 +1920,29 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	// engine's provider has to be rebuilt either way.
 	s.reapplyActiveProfile()
 	writeJSON(w, 200, map[string]any{"id": id})
+}
+
+// llmModelsCacheHandler GET /api/llm/models-cache?profile_id=N —
+// 返回该端点最近一次成功拉取的模型列表(固化缓存,编辑端点时直接可选)。
+func (s *Server) llmModelsCacheHandler(w http.ResponseWriter, r *http.Request) {
+	pg := s.pg(w)
+	if pg == nil {
+		return
+	}
+	id, err := strconv.ParseInt(r.URL.Query().Get("profile_id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeJSON(w, 200, map[string]any{"models": []string{}})
+		return
+	}
+	raw, ok, _ := pg.GetSetting(fmt.Sprintf("llm_models_cache:%d", id))
+	var models []string
+	if ok && raw != "" {
+		_ = json.Unmarshal([]byte(raw), &models)
+	}
+	if models == nil {
+		models = []string{}
+	}
+	writeJSON(w, 200, map[string]any{"models": models})
 }
 
 // pgGetLLMRetryPolicy 返回全局重试策略(五层各自的次数+间隔)。未配置过 → 全零，
@@ -2100,6 +2207,12 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if len(models) > 0 {
+			// 固化缓存:按 profile 存最近一次成功拉取的模型列表,编辑端点时直接可选。
+			if req.ProfileID != nil {
+				if cache, err := json.Marshal(models); err == nil {
+					_ = s.m.pg.SetSetting(fmt.Sprintf("llm_models_cache:%d", *req.ProfileID), string(cache))
+				}
+			}
 			writeJSON(w, 200, map[string]any{"ok": true, "models": models})
 			return
 		}

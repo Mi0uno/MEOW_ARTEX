@@ -75,7 +75,8 @@ func (s *Store) writeBody(r io.Reader, expectedLength int64, expectedHash string
 		return "", err
 	}
 	hash = hex.EncodeToString(h.Sum(nil))
-	if n != expectedLength {
+	// expectedLength<0 = 长度未知(流式写入)，跳过长度比对。
+	if expectedLength >= 0 && n != expectedLength {
 		return "", fmt.Errorf("正文不完整: 预期 %d 字节，读取 %d 字节", expectedLength, n)
 	}
 	if expectedHash != "" && expectedHash != hash {
@@ -113,6 +114,32 @@ func (s *Store) writeBody(r io.Reader, expectedLength int64, expectedHash string
 	}
 	defer d.Close()
 	return hash, d.Sync()
+}
+
+// PutBlob stores arbitrary raw bytes as a content-addressed evidence blob and
+// returns its sha256 hash. Used by recon collectors to preserve raw tool/API
+// output independently of traffic. Referenced blobs survive GC (see Collect).
+func (s *Store) PutBlob(r io.Reader) (string, error) {
+	return s.writeBody(r, -1, "")
+}
+
+// OpenRaw opens a recon raw-output blob by hash for preview/download. The hash
+// must be a valid 64-char lowercase sha256 (path traversal safe by construction).
+func (s *Store) OpenRaw(hash string) (*os.File, int64, error) {
+	path, err := hashPath(s.Dir, hash)
+	if err != nil {
+		return nil, 0, err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	st, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, 0, err
+	}
+	return f, st.Size(), nil
 }
 
 // StageFindingsExport freezes bindings/report versions and makes private body
@@ -354,7 +381,8 @@ WHERE unreferenced_at IS NULL AND NOT EXISTS(SELECT 1 FROM finding_traffic_bindi
 AND NOT EXISTS(SELECT 1 FROM finding_traffic_bindings b WHERE b.snapshot_id=s.id)`, now.Add(-24*time.Hour)); err != nil {
 			return err
 		}
-		rows, err := tx.Query(`SELECT req_hash FROM traffic_evidence_snapshots UNION SELECT resp_hash FROM traffic_evidence_snapshots`)
+		rows, err := tx.Query(`SELECT req_hash FROM traffic_evidence_snapshots UNION SELECT resp_hash FROM traffic_evidence_snapshots
+UNION SELECT raw_evidence_hash FROM task_collector_runs WHERE raw_evidence_hash<>''`)
 		if err != nil {
 			return err
 		}

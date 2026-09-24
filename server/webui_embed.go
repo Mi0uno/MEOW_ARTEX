@@ -31,6 +31,11 @@ func (s *Server) webuiHandler() http.Handler {
 		if p == "" {
 			p = "index.html"
 		}
+		// 缓存策略:静态 chunk 内容哈希寻址 → 长缓存;HTML/路由页必须回源校验。
+		// 否则发版后浏览器抱着旧 HTML+旧 chunk 不撒手(踩过:页面"永远不更新")。
+		if !strings.HasPrefix(p, "_next/static/") {
+			w.Header().Set("Cache-Control", "no-cache")
+		}
 		// 1) exact file (assets: _next/*, favicon.ico, ...)
 		// 2) route dir → <p>/index.html (trailingSlash export)
 		// 3) <p>.html

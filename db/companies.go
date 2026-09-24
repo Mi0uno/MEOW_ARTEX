@@ -29,6 +29,11 @@ type CompanyWithScope struct {
 	Company
 	Scope      []ScopeRule `json:"scope"`
 	AssetCount int         `json:"asset_count"`
+	// TaskCount/ReportCount 是「选企业」列表页的汇总列:该企业名下的任务数与
+	// 报告中心报告数(归属口径与报告中心筛选一致)。仅在分页查询里填充。
+	// 不加 omitempty:0 是有效值(该企业没有任务/报告),前端要显示 0 而非空。
+	TaskCount   int `json:"task_count"`
+	ReportCount int `json:"report_count"`
 }
 
 // ScopeRule is one company_scope row.
@@ -254,6 +259,110 @@ func (s *CompanyStore) DeleteCompanyWithAssets(id int64, deleteAssets bool) (ass
 		return 0, err
 	}
 	return assetsDeleted, nil
+}
+
+// CompanyListPage 是「选企业」列表页的一页数据。
+// Companies 只带该页的行;Total 是筛选后的总数(供分页器)。
+type CompanyListPage struct {
+	Companies []*CompanyWithScope `json:"companies"`
+	Total     int                 `json:"total"`
+}
+
+// CompanyListFilter 是列表页的筛选条件。空值 = 不限。
+type CompanyListFilter struct {
+	Q      string // 名称关键字(模糊)
+	Kind   string // 资产范围类型:domain|ip|cidr|icp|keyword(只列含该类型范围的企业)
+	Sort   string // name|assets|reports|tasks|updated(缺省 name)
+	Desc   bool   // 排序方向(仅对有意义的字段)
+	Limit  int
+	Offset int
+}
+
+// ListCompaniesPage 按筛选条件分页返回企业,并带资产数/任务数/报告数,
+// 供「先选资产主体」列表页展示与排序(一次查询带出三个维度的计数)。
+// scope 规则只对当前页的企业加载,避免整库扫描。
+func (s *CompanyStore) ListCompaniesPage(f CompanyListFilter) (*CompanyListPage, error) {
+	if f.Limit <= 0 || f.Limit > 200 {
+		f.Limit = 20
+	}
+	if f.Offset < 0 {
+		f.Offset = 0
+	}
+	where := []string{"1=1"}
+	args := []any{}
+	if q := strings.TrimSpace(f.Q); q != "" {
+		where = append(where, fmt.Sprintf("c.name ILIKE $%d", len(args)+1))
+		args = append(args, "%"+q+"%")
+	}
+	if k := strings.TrimSpace(f.Kind); k != "" {
+		where = append(where, fmt.Sprintf(`EXISTS (SELECT 1 FROM company_scope cs WHERE cs.company_id = c.id AND cs.kind = $%d)`, len(args)+1))
+		args = append(args, k)
+	}
+	kw := strings.Join(where, " AND ")
+
+	// 计数与列表用同一套 JOIN,保证「报告数/任务数」排序稳定。
+	const counts = `
+	(SELECT COUNT(DISTINCT a.id) FROM assets a WHERE a.company_id = c.id) AS asset_count,
+	(SELECT COUNT(DISTINCT ts.task_id) FROM task_scope ts
+	  WHERE ts.company_id = c.id AND ts.kind = 'company') AS task_count,
+	(SELECT COUNT(DISTINCT r.id) FROM reports r
+	  WHERE r.task_id IN (SELECT ts.task_id FROM task_scope ts WHERE ts.company_id = c.id AND ts.kind = 'company')
+	     OR r.finding_id IN (SELECT f.id FROM findings f
+	                          JOIN exploration_anchors ea ON ea.node_id = f.node_id
+	                          JOIN assets a2 ON a2.id = ea.asset_id
+	                         WHERE a2.company_id = c.id)) AS report_count`
+
+	var total int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM companies c WHERE `+kw, args...).Scan(&total); err != nil {
+		return nil, err
+	}
+
+	order := "c.name ASC"
+	switch f.Sort {
+	case "assets":
+		order = "asset_count"
+	case "reports":
+		order = "report_count"
+	case "tasks":
+		order = "task_count"
+	case "updated":
+		order = "c.updated_at"
+	}
+	if f.Desc {
+		order += " DESC"
+	} else if f.Sort != "" && f.Sort != "name" {
+		order += " ASC"
+	}
+
+	q := `SELECT c.id, c.name, c.nkey, c.logo, c.created_at::text, c.updated_at::text,` + counts + `
+FROM companies c WHERE ` + kw + ` ORDER BY ` + order + fmt.Sprintf(`, c.name ASC LIMIT $%d OFFSET $%d`, len(args)+1, len(args)+2)
+	args = append(args, f.Limit, f.Offset)
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []*CompanyWithScope{}
+	for rows.Next() {
+		cws := &CompanyWithScope{}
+		if err := rows.Scan(&cws.ID, &cws.Name, &cws.NKey, &cws.Logo,
+			&cws.CreatedAt, &cws.UpdatedAt, &cws.AssetCount, &cws.TaskCount, &cws.ReportCount); err != nil {
+			return nil, err
+		}
+		out = append(out, cws)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// scope 只加载当前页(整库 scope 会随企业数线性放大)。
+	for _, cws := range out {
+		cws.Scope, err = s.GetScope(cws.ID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &CompanyListPage{Companies: out, Total: total}, nil
 }
 
 // ListCompanies returns all companies with scope and asset count.

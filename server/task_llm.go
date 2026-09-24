@@ -73,6 +73,21 @@ func isTaskLLMRuntimeError(err error) bool {
 	return errors.As(err, &target)
 }
 
+// ErrTaskGone 表示任务行已不在库中(删除、归档清理或外部直接改库)。这不是模型
+// 故障,重试没有意义:任务的运行时句柄还在内存里,但它的库行已经没了,重放只会
+// 再烧一轮 LLM 调用并最终仍以 not found 收场。2026-09-24 实测:测试套件误连生产
+// 库删掉运行中实例的任务行后,worker 对每个残留意图白跑两轮重试才放弃。
+var ErrTaskGone = errors.New("task 已不存在")
+
+// taskGoneError 让上层能用 errors.Is 判定「任务已消失」,而不必解析文案。
+type taskGoneError struct {
+	taskID string
+}
+
+func (e *taskGoneError) Error() string { return fmt.Sprintf("task %s not found", e.taskID) }
+
+func (e *taskGoneError) Is(target error) bool { return target == ErrTaskGone }
+
 func isTaskLLMChainExhausted(err error) bool {
 	var target *taskLLMError
 	return errors.As(err, &target) && target.chainExhausted
@@ -117,7 +132,7 @@ func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
 		return taskLLMSelection{}, err
 	}
 	if pt == nil {
-		return taskLLMSelection{}, fmt.Errorf("task %s not found", r.taskID)
+		return taskLLMSelection{}, &taskGoneError{taskID: r.taskID}
 	}
 	r.s.syncTaskLLMState(pt)
 	t, _ := r.s.m.Task(r.taskID)
@@ -559,6 +574,10 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	plannerRuntime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "planner"}
 	workerRuntime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "worker"}
 	mainRuntime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "mainagent"}
+	// 出网地址按任务解析:创建任务时可指定「跟随全局 / 强制直连 / 强制走代理池」。
+	// 三个 agent(worker/planner/main)共用同一出口,保证任务内行为一致。
+	proxyAddr := s.m.ProxyAddrForTask(t.ProxyMode, t.ProxyGroupID)
+	proxyCA := s.m.ProxyCACertForTask(t.ProxyMode, t.ProxyGroupID)
 	tx := transcript.NewStore(filepath.Join(s.m.dir, "transcripts"))
 	window := workerRuntime.CompactionWindow()
 	wk := agent.NewWorker(workerRuntime, "task-router", s.m.dir, tx, window, s.agentMaxTurns("worker"))
@@ -568,7 +587,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetMaxTokens(workerRuntime.maxTokens)       // 同上,输出上限也跟随当前激活 profile
 	wk.SetNoaEnabled(s.m.NoaCompactionEnabled)     // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
 	wk.SetRunTimeout(time.Duration(s.agentRunSeconds("worker")) * time.Second)
-	wk.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+	wk.SetProxy(proxyAddr, proxyCA)
 	wk.SetWebSearch(s.webSearchFor("worker"))
 	wk.SetConstraintInject(s.constraintInjectWorker) // 操作约束注入 worker(可配置,默认开)
 	pl := agent.NewPlanner(plannerRuntime, "task-router", s.m.dir, tx, plannerRuntime.CompactionWindow(), s.agentMaxTurns("planner"))
@@ -579,7 +598,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	pl.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
 	pl.SetKillWork(s.engine.KillWork)
 	pl.SetSteerWork(s.engine.SteerWork)
-	pl.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+	pl.SetProxy(proxyAddr, proxyCA)
 	pl.SetWebSearch(s.webSearchFor("planner"))
 	pl.SetConstraintInject(s.constraintInjectPlanner) // 操作约束注入 planner(可配置,默认开)
 	// cold-digest §7: 冷节点后台压缩。引擎经权威解析器实际驱动的就是这套 per-task planner
@@ -592,7 +611,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	main.SetNonStreaming(mainRuntime.nonStreaming)
 	main.SetMaxTokens(mainRuntime.maxTokens)
 	main.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
-	main.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+	main.SetProxy(proxyAddr, proxyCA)
 	main.SetWebSearch(s.webSearchFor("mainagent"))
 	main.SetSteerWork(s.engine.SteerWork) // steer_work：人对运行中 work 实时纠偏
 	bundle := &taskAgentBundle{

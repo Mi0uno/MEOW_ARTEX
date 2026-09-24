@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 
 import { CopyButton } from "@/components/copy-button";
+import { FormattedPayload } from "@/components/formatted-payload";
 import { Markdown } from "@/components/markdown";
 import { StatusBadge } from "@/components/status-badge";
 import {
@@ -394,9 +395,7 @@ export function FindingsTable({
                           </span>
                         )}
                       </div>
-                      <pre className="overflow-x-auto rounded-md bg-muted px-3 py-2 font-mono text-xs whitespace-pre-wrap">
-                        {f.evidence}
-                      </pre>
+                      <FormattedPayload raw={f.evidence} maxHeight="max-h-72" />
 
                       {/* 详细报告(Markdown):展开时按 finding_id 懒加载,免进详情页即可查看。 */}
                       {f.finding_id && (

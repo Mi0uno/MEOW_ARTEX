@@ -157,6 +157,29 @@ ORDER BY (pinned_at IS NOT NULL) DESC, pinned_at DESC NULLS LAST, updated_at DES
 	return out, rows.Err()
 }
 
+// ListConversationsByStage 返回指定阶段(”/'recon'/'exploit'/'post')agent 的会话,
+// 排序与 ListConversations 一致。agent 已被删除的会话不进任何阶段视图(只在全量视图可见)。
+func (d *DB) ListConversationsByStage(stage string) ([]*Conversation, error) {
+	rows, err := d.Query(`SELECT c.id, c.agent_key, c.title, c.llm_profile_id, c.pinned_at, c.created_at, c.updated_at
+FROM conversations c
+JOIN agents a ON a.key = c.agent_key
+WHERE a.stage = $1
+ORDER BY (c.pinned_at IS NOT NULL) DESC, c.pinned_at DESC NULLS LAST, c.updated_at DESC, c.id DESC`, stage)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*Conversation{}
+	for rows.Next() {
+		c, err := scanConv(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, &c)
+	}
+	return out, rows.Err()
+}
+
 // GetConversation returns one thread (nil, nil if absent).
 func (d *DB) GetConversation(id int64) (*Conversation, error) {
 	c, err := scanConv(d.QueryRow(`SELECT `+convCols+` FROM conversations WHERE id=$1`, id))

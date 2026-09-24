@@ -3,6 +3,7 @@
 import * as React from "react";
 
 import Link from "next/link";
+import { useRouter, useSearchParams } from "next/navigation";
 
 import {
   DndContext,
@@ -21,11 +22,13 @@ import {
   ArrowDownIcon,
   ArrowUpDownIcon,
   ArrowUpIcon,
+  Building2Icon,
   ChevronRightIcon,
   EyeIcon,
   FolderInputIcon,
   GripVerticalIcon,
   Loader2Icon,
+  NetworkIcon,
   PaperclipIcon,
   PauseIcon,
   PencilIcon,
@@ -44,6 +47,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { CompanyPickerPage } from "@/components/company-picker-page";
 import { StatusBadge } from "@/components/status-badge";
 import { TablePagination } from "@/components/table-pagination";
 import { TaskLLMProfileChain } from "@/components/task-llm-profile-chain";
@@ -130,6 +134,7 @@ import type {
   TaskArchive,
   TaskArchiveState,
   TaskCategory,
+  TaskStage,
   TaskStatus,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -300,13 +305,43 @@ function compareTasks(left: Task, right: Task, field: TaskSortField, direction: 
   return -compareTaskIDs(left.id, right.id);
 }
 
+// 三阶段汇总视图:URL 带 ?stage=recon|exploit|post 时锁定阶段筛选
+// (阶段组侧边栏入口指向本页带参),无参数 = 全阶段汇总。
 export default function TasksPage() {
+  return (
+    <React.Suspense fallback={null}>
+      <TasksPageInner />
+    </React.Suspense>
+  );
+}
+
+function TasksPageInner() {
+  const searchParams = useSearchParams();
+  const router = useRouter();
+  const lockedStage = searchParams.get("stage");
+  // 资产主体(企业):URL 是唯一事实来源,?company=all|unassigned|<id>。
+  // 缺省 = 还没选 → 渲染选择页(先进入选择资产的页面,再看该主体的任务)。
+  // 「全部资产主体」与「未关联企业」在选择页顶部是固定出口——历史任务大多没有企业
+  // 归属,必须保证用户能一键看到全部任务,绝不因为「没选企业」而隐藏数据。
+  const companyParam = searchParams.get("company");
+  const companyID: number | null = React.useMemo(() => {
+    if (companyParam == null) return null; // 还没选 → 显示选择页
+    if (companyParam === "all") return 0;
+    if (companyParam === "unassigned") return -1;
+    return /^\d+$/.test(companyParam) ? Number(companyParam) : null;
+  }, [companyParam]);
+  const [companies, setCompanies] = React.useState<Company[]>([]);
   const [activeTab, setActiveTab] = React.useState("current");
   const [tasks, setTasks] = React.useState<Task[]>([]);
   const [categories, setCategories] = React.useState<TaskCategory[]>([]);
   const [categoriesLoaded, setCategoriesLoaded] = React.useState(false);
   const [query, setQuery] = React.useState("");
   const [statusFilter, setStatusFilter] = React.useState<TaskStatus | "all">("all");
+  const [stageFilter, setStageFilter] = React.useState<TaskStage | "all">(
+    lockedStage === "recon" || lockedStage === "exploit" || lockedStage === "post" || lockedStage === "report"
+      ? (lockedStage as TaskStage)
+      : "all",
+  );
   const [categoryFilter, setCategoryFilter] = React.useState("all");
   const [filtersHydrated, setFiltersHydrated] = React.useState(false);
   const [sortPreference, setSortPreference] = useStoredSortPreference(
@@ -351,10 +386,28 @@ export default function TasksPage() {
     );
   }, [categoryFilter, filtersHydrated, statusFilter]);
 
+  // 阶段锁定跟随 URL:侧边栏在各阶段分组间切换时(?stage= 变化)同步筛选,
+  // 避免同路由软导航不重挂载导致上一阶段的筛选残留。
+  React.useEffect(() => {
+    setStageFilter(
+      lockedStage === "recon" || lockedStage === "exploit" || lockedStage === "post" || lockedStage === "report"
+        ? (lockedStage as TaskStage)
+        : "all",
+    );
+  }, [lockedStage]);
+
   const filtered = React.useMemo(() => {
     const q = query.trim().toLowerCase();
     return tasks.filter((t) => {
+      // 资产主体(企业):0=全部(不限);-1=只看未关联企业的任务;>0=只看关联该企业的任务。
+      if (companyID === -1) {
+        if ((t.company_ids ?? []).length > 0) return false;
+      } else if (companyID != null && companyID > 0) {
+        if (!(t.company_ids ?? []).includes(companyID)) return false;
+      }
       if (statusFilter !== "all" && t.status !== statusFilter) return false;
+      // 任务中心是三阶段任务的汇总视图:recon/exploit/post 全在这里,按阶段可筛。
+      if (stageFilter !== "all" && (t.stage ?? "exploit") !== stageFilter) return false;
       if (categoryFilter === UNCATEGORIZED_VALUE && t.category_id != null) return false;
       if (
         categoryFilter !== "all" &&
@@ -371,7 +424,7 @@ export default function TasksPage() {
         t.id.toLowerCase().includes(q)
       );
     });
-  }, [tasks, query, statusFilter, categoryFilter]);
+  }, [tasks, query, statusFilter, stageFilter, categoryFilter, companyID]);
 
   const sortNowSec = sortField === "duration" ? nowSec : 0;
   const ordered = React.useMemo(() => {
@@ -484,6 +537,15 @@ export default function TasksPage() {
     const i = setInterval(load, POLL_MS);
     return () => clearInterval(i);
   }, [load, loadCategories]);
+
+  // 资产主体(企业)列表:筛选器与「新建任务带入企业」共用。
+  React.useEffect(() => {
+    api
+      .companies()
+      .then(setCompanies)
+      .catch(() => undefined);
+    // 仅在挂载时拉一次:企业列表不是高频变更数据。
+  }, []);
 
   const refreshCategoriesAndTasks = React.useCallback(() => {
     lastRef.current = "";
@@ -775,6 +837,59 @@ export default function TasksPage() {
     [movingCategory, refreshCategoriesAndTasks, selectedIds],
   );
 
+  // 切换资产主体:写进 URL(保留阶段锁定等既有参数),列表与新建任务随之限定该主体。
+  const switchCompany = React.useCallback(
+    (v: string) => {
+      const p = new URLSearchParams(searchParams.toString());
+      p.set("company", v);
+      router.push(`/function/tasks?${p.toString()}`);
+    },
+    [router, searchParams],
+  );
+
+  // 未选资产主体时先进入选择页(先进入选择资产的页面,再看该主体下的任务)。
+  // 顶部固定提供「全部资产主体」「未关联企业」——历史任务大多没有企业归属,
+  // 这两个出口保证用户永远能看到全部任务,不会被筛选藏起来。
+  if (companyID === null) {
+    const unassignedCount = tasks.filter((t) => (t.company_ids ?? []).length === 0).length;
+    // 阶段锁定时在选择页标题里点明,否则用户从「信息搜集 → 任务」进来会不知道
+    // 这一步是在为哪个阶段挑资产主体(阶段会经 switchCompany 原样保留)。
+    const stageLabel =
+      lockedStage === "recon"
+        ? "信息搜集"
+        : lockedStage === "exploit"
+          ? "渗透测试"
+          : lockedStage === "post"
+            ? "后渗透"
+            : lockedStage === "report"
+              ? "报告中心"
+              : "";
+    const stageTasks = stageLabel ? tasks.filter((t) => (t.stage ?? "exploit") === lockedStage) : tasks;
+    const stageUnassigned = stageTasks.filter((t) => (t.company_ids ?? []).length === 0).length;
+    return (
+      <CompanyPickerPage
+        title={stageLabel ? `任务 · 选择资产主体(${stageLabel})` : "任务 · 选择资产主体"}
+        description="先选择资产主体,再看它名下的任务;任务归属读 task_scope,与信息搜集的资产图同源。"
+        onPick={(pick) => {
+          if (pick.kind === "all") switchCompany("all");
+          else if (pick.kind === "unassigned") switchCompany("unassigned");
+          else switchCompany(String(pick.company.id));
+        }}
+        emptyHint="还没有企业。先在「信息搜集 → 资产」里创建企业并录入资产范围,或直接选上方「全部资产主体」浏览全部任务。"
+        countLabel="任务数"
+        synthetic={{
+          selected: null,
+          allCount: stageTasks.length,
+          unassignedCount: stageLabel ? stageUnassigned : unassignedCount,
+          unit: "个任务",
+        }}
+      />
+    );
+  }
+
+  // 门禁已移除:选定资产主体后列表展示该主体的任务;选「全部资产主体」即不限企业。
+  // 企业是筛选维度而非进入条件——历史任务大多没有企业归属,强制先选企业会让它们全部消失
+  // (2026-09-24 实锤的回归);选择页顶部的合成行就是为此保留的固定出口。
   return (
     <Tabs value={activeTab} onValueChange={setActiveTab} className="gap-4">
       <TabsList className="mx-4 lg:mx-6">
@@ -819,6 +934,47 @@ export default function TasksPage() {
                   </SelectGroup>
                 </SelectContent>
               </Select>
+              {/* 资产主体快速切换:主入口是进入页的选择列表,这里保留一个下拉做快速切换。
+                  含「全部」「未关联企业」两个出口,任何时候都能看到全部任务。 */}
+              <Select
+                value={companyID === 0 ? "all" : companyID === -1 ? "unassigned" : String(companyID)}
+                onValueChange={switchCompany}
+              >
+                <SelectTrigger className="w-44">
+                  <SelectValue placeholder="资产主体" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectItem value="all">全部资产主体</SelectItem>
+                    <SelectItem value="unassigned">未关联企业</SelectItem>
+                    {companies.map((c) => (
+                      <SelectItem key={c.id} value={String(c.id)}>
+                        {c.name}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+              <Button variant="outline" size="sm" onClick={() => router.push("/function/tasks")}>
+                <Building2Icon className="size-4" />
+                切换资产主体
+              </Button>
+              {!lockedStage && (
+                <Select value={stageFilter} onValueChange={(v) => setStageFilter(v as TaskStage | "all")}>
+                  <SelectTrigger className="w-36">
+                    <SelectValue placeholder="阶段" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      <SelectItem value="all">全部阶段</SelectItem>
+                      <SelectItem value="recon">信息搜集</SelectItem>
+                      <SelectItem value="exploit">渗透测试</SelectItem>
+                      <SelectItem value="post">后渗透</SelectItem>
+                      <SelectItem value="report">报告中心</SelectItem>
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+              )}
               <Select value={categoryFilter} onValueChange={setCategoryFilter}>
                 <SelectTrigger className="w-40">
                   <SelectValue placeholder="任务分类" />
@@ -902,12 +1058,31 @@ export default function TasksPage() {
                 onChanged={refreshCategoriesAndTasks}
                 onTaskMoved={applyTaskCategoryMove}
               />
-              <CreateTaskSheet
-                tasks={tasks}
-                categories={categories}
-                onCreated={refreshCategoriesAndTasks}
-                onCategoriesChanged={refreshCategoriesAndTasks}
-              />
+              {lockedStage === "recon" ? (
+                <Button size="sm" asChild>
+                  <Link href="/function/recon/create">
+                    <PlusIcon /> 新建步骤任务
+                  </Link>
+                </Button>
+              ) : lockedStage === "report" ? (
+                // 报告中心:识别任务由系统在模板上传/手动识别时自动创建,不提供手工新建。
+                <Button size="sm" variant="outline" asChild>
+                  <Link href="/function/reports/templates">
+                    <PlusIcon /> 识别模板
+                  </Link>
+                </Button>
+              ) : (
+                <CreateTaskSheet
+                  tasks={tasks}
+                  categories={categories}
+                  onCreated={refreshCategoriesAndTasks}
+                  onCategoriesChanged={refreshCategoriesAndTasks}
+                  stage={lockedStage === "exploit" || lockedStage === "post" ? lockedStage : undefined}
+                  // 只有具体企业(>0)才锁定到新建任务;0=全部、-1=未关联都不是真实企业 id,
+                  // 传下去会把新任务错误关联到一个不存在的企业。
+                  lockedCompanyID={companyID != null && companyID > 0 ? companyID : undefined}
+                />
+              )}
             </div>
 
             {tasks.length === 0 ? (
@@ -1189,6 +1364,17 @@ const TaskRow = React.memo(function TaskRow({
           <TaskNameEditor task={task} onRename={onRename} />
           {task.active && <StarIcon className="size-4 shrink-0 fill-amber-400 text-amber-400" />}
           {taskIsPinned(task) && <PinIcon className="text-primary size-4 shrink-0" aria-label="已置顶" />}
+          {/* 出网方式标记:任务级覆盖才显示(跟随全局是默认,不必占位)。 */}
+          {task.proxy_mode === "pool" ? (
+            <Badge variant="outline" className="shrink-0 text-xs" title="本任务出网走代理池">
+              <NetworkIcon className="size-3" />
+              代理池
+            </Badge>
+          ) : task.proxy_mode === "direct" ? (
+            <Badge variant="outline" className="shrink-0 text-xs" title="本任务强制直连,不走代理池">
+              直连
+            </Badge>
+          ) : null}
         </div>
       </TableCell>
       <TableCell className="text-muted-foreground max-w-xs">
@@ -3037,11 +3223,17 @@ function CreateTaskSheet({
   categories,
   onCreated,
   onCategoriesChanged,
+  stage,
+  lockedCompanyID,
 }: {
   tasks: Task[];
   categories: TaskCategory[];
   onCreated: () => void;
   onCategoriesChanged: () => void;
+  // 阶段分组入口(?stage=exploit|post 锁定视图)新建的任务归属该阶段;缺省=exploit。
+  stage?: TaskStage;
+  // 资产主体锁定(?company= 或页面已选企业):新建任务自动关联该企业的资产范围。
+  lockedCompanyID?: number;
 }) {
   const [open, setOpen] = React.useState(false);
   const [name, setName] = React.useState("");
@@ -3066,6 +3258,25 @@ function CreateTaskSheet({
   const fileInputRef = React.useRef<HTMLInputElement>(null);
   const sheetContentRef = React.useRef<HTMLDivElement>(null);
 
+  // 出网方式(任务级覆盖):""=跟随全局 / "direct"=强制直连 / "pool"=强制走代理池。
+  // 代理组列表只在需要选组时拉取。
+  const [proxyMode, setProxyMode] = React.useState("");
+  const [proxyGroupID, setProxyGroupID] = React.useState(0);
+  const [proxyGroups, setProxyGroups] = React.useState<
+    { id: number; name: string; alive_count: number; proxy_count: number }[]
+  >([]);
+  React.useEffect(() => {
+    if (!open || proxyMode !== "pool" || proxyGroups.length > 0) return;
+    api
+      .proxyGroups({ limit: 200 })
+      .then((r) =>
+        setProxyGroups(
+          r.groups.map((g) => ({ id: g.id, name: g.name, alive_count: g.alive_count, proxy_count: g.proxy_count })),
+        ),
+      )
+      .catch(() => setProxyGroups([]));
+  }, [open, proxyMode, proxyGroups.length]);
+
   // load LLM profiles once for the create-task profile picker.
   React.useEffect(() => {
     api
@@ -3077,6 +3288,12 @@ function CreateTaskSheet({
       .then(setCompanies)
       .catch(() => setCompanies([]));
   }, []);
+
+  // 资产主体已锁定时预选该企业:新建任务自动关联它的资产范围(与列表筛选同口径)。
+  React.useEffect(() => {
+    if (lockedCompanyID == null) return;
+    setCompanyIDs((current) => (current.includes(lockedCompanyID) ? current : [...current, lockedCompanyID]));
+  }, [lockedCompanyID]);
 
   // pickFiles uploads the chosen files into this draft's staging dir and appends their
   // absolute paths to the description; the task's agents open them by path via Read/Bash.
@@ -3125,6 +3342,10 @@ function CreateTaskSheet({
         seedFirstIntent,
         planHeartbeatSeconds: heartbeatSec,
         coverageEnabled,
+        stage,
+        // 出网方式:默认跟随全局;选「走代理池」时可指定用哪个组。
+        proxyMode,
+        proxyGroupId: proxyMode === "pool" ? proxyGroupID : 0,
       });
       toast.success("任务已创建");
       setName("");
@@ -3139,6 +3360,8 @@ function CreateTaskSheet({
       setHeartbeatMin("10");
       setSeedFirstIntent(false);
       setCoverageEnabled(true);
+      setProxyMode("");
+      setProxyGroupID(0);
       setUploadCount(0);
       draftIdRef.current = "";
       setOpen(false);
@@ -3351,6 +3574,49 @@ function CreateTaskSheet({
                   <p className="text-muted-foreground text-xs">
                     默认开启：计算并展示测试覆盖度、态势图显示测试进度、自动累积测试范围。关闭后不再计算/展示覆盖度，
                     态势图仅展示资产不显示进度，agent 也不再获得范围类工具。关闭不影响「关联企业资产范围」。
+                  </p>
+                </div>
+                {/* 出网方式:本任务的流量走哪条路。默认跟随全局,可单独覆盖。 */}
+                <div className="grid gap-2">
+                  <Label htmlFor="proxy-mode">出网方式</Label>
+                  <Select
+                    value={proxyMode === "" ? "inherit" : proxyMode}
+                    onValueChange={(v) => setProxyMode(v === "inherit" ? "" : v)}
+                  >
+                    <SelectTrigger id="proxy-mode" className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectGroup>
+                        <SelectItem value="inherit">跟随全局（默认）</SelectItem>
+                        <SelectItem value="direct">强制直连（不走代理池）</SelectItem>
+                        <SelectItem value="pool">走代理池</SelectItem>
+                      </SelectGroup>
+                    </SelectContent>
+                  </Select>
+                  {proxyMode === "pool" ? (
+                    <Select
+                      value={proxyGroupID === 0 ? "auto" : String(proxyGroupID)}
+                      onValueChange={(v) => setProxyGroupID(v === "auto" ? 0 : Number(v))}
+                    >
+                      <SelectTrigger className="w-full">
+                        <SelectValue placeholder="代理组" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectGroup>
+                          <SelectItem value="auto">用全局选中的代理组</SelectItem>
+                          {proxyGroups.map((g) => (
+                            <SelectItem key={g.id} value={String(g.id)}>
+                              {g.name}（可用 {g.alive_count}/{g.proxy_count}）
+                            </SelectItem>
+                          ))}
+                        </SelectGroup>
+                      </SelectContent>
+                    </Select>
+                  ) : null}
+                  <p className="text-muted-foreground text-xs">
+                    本任务的 agent 与信息搜集流水线都按这里出网。选「走代理池」后请求会经代理组按策略轮换出口；
+                    代理池不可用时回落到全局出口而不是静默直连，避免真实 IP 意外暴露。
                   </p>
                 </div>
               </CollapsibleContent>

@@ -30,36 +30,49 @@ func rawString(raw json.RawMessage) string {
 
 // ---- Task (frontend "Task") ---- created_at as RFC3339, plus a derived status.
 type TaskDTO struct {
-	ID                 string        `json:"id"`
-	ExplorationID      int64         `json:"exploration_id"`
-	Name               string        `json:"name"` // 可选任务名称;空=未命名
-	CategoryID         *int64        `json:"category_id,omitempty"`
-	CategoryName       string        `json:"category_name,omitempty"`
-	Pinned             bool          `json:"pinned"`
-	PinnedAt           string        `json:"pinned_at,omitempty"`
-	Description        string        `json:"description"`
-	Goal               string        `json:"goal"`
-	Status             string        `json:"status"` // created | running | paused | done | failed
-	CreatedAt          string        `json:"created_at"`
-	CreatedUnix        int64         `json:"created_unix"`       // created_at as unix seconds (for run-duration calc)
-	CompletedAt        string        `json:"completed_at"`       // RFC3339 finish time (done/failed); "" if unfinished
-	CompletedUnix      int64         `json:"completed_unix"`     // completed_at as unix seconds (0 if unfinished)
-	LastActivity       int64         `json:"last_activity_unix"` // unix seconds of the last activity (0 if none)
-	Paused             bool          `json:"paused"`
-	Queued             bool          `json:"queued"`
-	Tokens             TokenTotalDTO `json:"tokens"` // whole-task token consumption
-	GoalsTotal         int           `json:"goals_total"`
-	GoalsMet           int           `json:"goals_met"`
-	InFlight           int           `json:"in_flight"`                // 运行中 Worker 数（state=running 的意图）
-	LLMProfileID       *int64        `json:"llm_profile_id,omitempty"` // LLM profile used for this task; nil = default
-	LLMProfileIDs      []int64       `json:"llm_profile_ids"`
-	ActiveLLMProfileID *int64        `json:"active_llm_profile_id,omitempty"`
-	LLMFailoverState   string        `json:"llm_failover_state"`
-	LLMFailoverReason  string        `json:"llm_failover_reason,omitempty"`
-	SourceTaskIDs      []string      `json:"source_task_ids"`
-	ArchiveBlockedBy   string        `json:"archive_blocked_by_task_id,omitempty"`
-	CompanyIDs         []int64       `json:"company_ids"`
-	CoverageEnabled    bool          `json:"coverage_enabled"` // 资产覆盖度功能开关(创建时定)
+	ID                 string          `json:"id"`
+	ExplorationID      int64           `json:"exploration_id"`
+	Name               string          `json:"name"` // 可选任务名称;空=未命名
+	CategoryID         *int64          `json:"category_id,omitempty"`
+	CategoryName       string          `json:"category_name,omitempty"`
+	Pinned             bool            `json:"pinned"`
+	PinnedAt           string          `json:"pinned_at,omitempty"`
+	Description        string          `json:"description"`
+	Goal               string          `json:"goal"`
+	Status             string          `json:"status"` // created | running | paused | done | failed
+	CreatedAt          string          `json:"created_at"`
+	CreatedUnix        int64           `json:"created_unix"`       // created_at as unix seconds (for run-duration calc)
+	CompletedAt        string          `json:"completed_at"`       // RFC3339 finish time (done/failed); "" if unfinished
+	CompletedUnix      int64           `json:"completed_unix"`     // completed_at as unix seconds (0 if unfinished)
+	LastActivity       int64           `json:"last_activity_unix"` // unix seconds of the last activity (0 if none)
+	Paused             bool            `json:"paused"`
+	Queued             bool            `json:"queued"`
+	Tokens             TokenTotalDTO   `json:"tokens"` // whole-task token consumption
+	GoalsTotal         int             `json:"goals_total"`
+	GoalsMet           int             `json:"goals_met"`
+	InFlight           int             `json:"in_flight"`                // 运行中 Worker 数（state=running 的意图）
+	LLMProfileID       *int64          `json:"llm_profile_id,omitempty"` // LLM profile used for this task; nil = default
+	LLMProfileIDs      []int64         `json:"llm_profile_ids"`
+	ActiveLLMProfileID *int64          `json:"active_llm_profile_id,omitempty"`
+	LLMFailoverState   string          `json:"llm_failover_state"`
+	LLMFailoverReason  string          `json:"llm_failover_reason,omitempty"`
+	SourceTaskIDs      []string        `json:"source_task_ids"`
+	ArchiveBlockedBy   string          `json:"archive_blocked_by_task_id,omitempty"`
+	CompanyIDs         []int64         `json:"company_ids"`
+	CoverageEnabled    bool            `json:"coverage_enabled"` // 资产覆盖度功能开关(创建时定)
+	Stage              string          `json:"stage"`            // recon|exploit|post(三阶段平台)
+	Kind               string          `json:"kind"`             // agent|pipeline
+	Pipeline           json.RawMessage `json:"pipeline,omitempty"`
+	StepKey            string          `json:"step_key,omitempty"` // recon 单步骤任务:收集器 key
+	StepConfig         json.RawMessage `json:"step_config,omitempty"`
+	// SRC 模式:产出计入 SRC 成果,并按企业 SRC 规范约束 AI 边界。
+	SRCMode      bool  `json:"src_mode,omitempty"`
+	SRCProfileID int64 `json:"src_profile_id,omitempty"`
+	// 出网方式(任务级覆盖):''=跟随全局;direct=强制直连;pool=强制走代理池。
+	ProxyMode    string `json:"proxy_mode,omitempty"`
+	ProxyGroupID int64  `json:"proxy_group_id,omitempty"`
+	// ProxyEgress 是实际生效的出网地址(回显用,便于确认任务真的走了代理池)。
+	ProxyEgress string `json:"proxy_egress,omitempty"`
 }
 
 func applyTaskArchiveBlocker(dto *TaskDTO, blockers map[int64]int64) {
@@ -125,7 +138,29 @@ func taskDTO(t *Task, status string) TaskDTO {
 		SourceTaskIDs:      sourceIDs,
 		CompanyIDs:         lifecycle.CompanyIDs,
 		CoverageEnabled:    t.CoverageEnabled,
+		Stage:              t.Stage,
+		Kind:               t.Kind,
+		Pipeline:           t.Pipeline,
+		StepKey:            t.StepKey,
+		StepConfig:         t.StepConfig,
+		SRCMode:            t.SRCMode,
+		SRCProfileID:       t.SRCProfileID,
+		ProxyMode:          t.ProxyMode,
+		ProxyGroupID:       t.ProxyGroupID,
 	}
+}
+
+// withProxyEgress 补上「本任务实际生效的出网地址」。
+//
+// 单独一个方法而不是塞进 taskDTO:taskDTO 是无状态的纯转换函数(多处调用,
+// 含测试),不该为回显一个派生字段就把 Manager 依赖注进去。
+// 列表接口不必逐条调它(开销无谓),详情/创建返回时调一次即可。
+func (s *Server) withProxyEgress(dto TaskDTO) TaskDTO {
+	if s == nil || s.m == nil {
+		return dto
+	}
+	dto.ProxyEgress = s.m.ProxyAddrForTask(dto.ProxyMode, dto.ProxyGroupID)
+	return dto
 }
 
 // completedRFC renders a unix completion time as RFC3339, or "" when unset (0).
@@ -529,6 +564,7 @@ type AgentDTO struct {
 	Name             string `json:"name"`
 	Description      string `json:"description"`
 	Role             string `json:"role"`
+	Stage            string `json:"stage"` // ''=通用 | recon | exploit | post;阶段分组的对话按此过滤
 	Builtin          bool   `json:"builtin"`
 	Enabled          bool   `json:"enabled"`
 	MaxTurns         int    `json:"max_turns"`
@@ -553,6 +589,7 @@ func agentDTO(a *db.Agent) AgentDTO {
 		Name:               a.Name,
 		Description:        a.Description,
 		Role:               a.Role,
+		Stage:              a.Stage,
 		Builtin:            a.Builtin,
 		Enabled:            a.Enabled,
 		MaxTurns:           a.MaxTurns,

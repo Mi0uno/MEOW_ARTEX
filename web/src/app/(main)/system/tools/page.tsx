@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 import { PlayIcon, PlusIcon, RotateCcwIcon, SaveIcon, SearchIcon, Trash2Icon } from "lucide-react";
 
@@ -15,6 +16,7 @@ import { Separator } from "@/components/ui/separator";
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
   SelectTrigger,
   SelectValue,
@@ -27,6 +29,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import { TablePagination } from "@/components/table-pagination";
 import {
   Sheet,
   SheetContent,
@@ -319,6 +322,11 @@ function ToolGridCard({ tool, onClick }: { tool: Tool; onClick: () => void }) {
     >
       <div className="flex flex-wrap items-center gap-2">
         <span className="font-mono text-sm font-medium">{tool.key}</span>
+        {tool.stage ? (
+          <Badge variant="outline" className="px-1.5 py-0 text-[10px]">
+            {tool.stage === "recon" ? "信息搜集" : tool.stage === "exploit" ? "渗透测试" : tool.stage === "post" ? "后渗透" : tool.stage}
+          </Badge>
+        ) : null}
         {tool.system ? (
           <Badge variant="secondary" className="px-1.5 py-0 text-[10px]">
             系统
@@ -363,7 +371,19 @@ function ToolGridCard({ tool, onClick }: { tool: Tool; onClick: () => void }) {
   );
 }
 
+// 工具统一管理页(本体)。三阶段组侧边栏经 ?stage=recon|exploit|post 锁定阶段复用
+// 同一页面(任务中心同款模式):锁定时阶段筛选隐藏、列表只显本阶段工具。
 export default function ToolsPage() {
+  return (
+    <React.Suspense fallback={null}>
+      <ToolsPageInner />
+    </React.Suspense>
+  );
+}
+
+function ToolsPageInner() {
+  const searchParams = useSearchParams();
+  const lockedStage = searchParams.get("stage");
   const [tools, setTools] = React.useState<Tool[]>([]);
   const [agents, setAgents] = React.useState<Agent[]>([]);
   const [captureOn, setCaptureOn] = React.useState(false);
@@ -380,19 +400,45 @@ export default function ToolsPage() {
   }, [reload]);
 
   const [query, setQuery] = React.useState("");
+  // ?stage= 锁定阶段(三阶段组入口);无参数 = 全部阶段自由筛选。
+  const [stageFilter, setStageFilter] = React.useState<string>(() => {
+    const s = searchParams.get("stage");
+    return s === "recon" || s === "exploit" || s === "post" || s === "report" ? s : "all";
+  });
+  // 列表页标准能力:两个页签各自独立分页(切页签不串页)。
+  const [sysPage, setSysPage] = React.useState(1);
+  const [sysPageSize, setSysPageSize] = React.useState(12);
+  const [cusPage, setCusPage] = React.useState(1);
+  const [cusPageSize, setCusPageSize] = React.useState(12);
 
   const selected = tools.find((t) => t.key === selectedKey) ?? null;
-  const matchTool = React.useCallback((t: Tool) => {
-    const q = query.trim().toLowerCase();
-    if (!q) return true;
-    return (
-      t.key.toLowerCase().includes(q) ||
-      t.description.toLowerCase().includes(q) ||
-      t.agents.some((a) => a.toLowerCase().includes(q))
-    );
-  }, [query]);
-  const systemTools = tools.filter((t) => t.system && matchTool(t));
-  const customTools = tools.filter((t) => !t.system && matchTool(t));
+  const matchTool = React.useCallback(
+    (t: Tool) => {
+      const q = query.trim().toLowerCase();
+      if (!q) return true;
+      return (
+        t.key.toLowerCase().includes(q) ||
+        t.description.toLowerCase().includes(q) ||
+        t.agents.some((a) => a.toLowerCase().includes(q))
+      );
+    },
+    [query],
+  );
+  // 统一管理:可按阶段筛选(''通用 = 跨阶段工具)。三阶段组页面各自只拉本阶段。
+  const matchStage = React.useCallback(
+    (t: Tool) => stageFilter === "all" || (stageFilter === "common" ? !t.stage : t.stage === stageFilter),
+    [stageFilter],
+  );
+  const systemTools = tools.filter((t) => t.system && matchTool(t) && matchStage(t));
+  const customTools = tools.filter((t) => !t.system && matchTool(t) && matchStage(t));
+  const sysPaged = systemTools.slice((sysPage - 1) * sysPageSize, sysPage * sysPageSize);
+  const cusPaged = customTools.slice((cusPage - 1) * cusPageSize, cusPage * cusPageSize);
+  // 搜索/阶段筛选变化时回到第一页,避免停在越界页。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: filters intentionally reset pagination.
+  React.useEffect(() => {
+    setSysPage(1);
+    setCusPage(1);
+  }, [query, stageFilter]);
   const allSystemCount = tools.filter((t) => t.system).length;
   const allCustomCount = tools.filter((t) => !t.system).length;
   // clicking a built-in tool opens the binding drawer; a custom tool opens its full editor.
@@ -414,6 +460,23 @@ export default function ToolsPage() {
             onChange={(e) => setQuery(e.target.value)}
           />
         </div>
+        {!lockedStage && (
+          <Select value={stageFilter} onValueChange={setStageFilter}>
+            <SelectTrigger className="h-8 w-36">
+              <SelectValue placeholder="阶段" />
+            </SelectTrigger>
+            <SelectContent>
+                <SelectGroup>
+                  <SelectItem value="all">全部阶段</SelectItem>
+                  <SelectItem value="recon">信息搜集</SelectItem>
+                  <SelectItem value="exploit">渗透测试</SelectItem>
+                  <SelectItem value="post">后渗透</SelectItem>
+                  <SelectItem value="report">报告中心</SelectItem>
+                  <SelectItem value="common">通用(跨阶段)</SelectItem>
+                </SelectGroup>
+            </SelectContent>
+          </Select>
+        )}
       </div>
 
       <Tabs defaultValue="system">
@@ -432,17 +495,30 @@ export default function ToolsPage() {
                   : `共 ${allSystemCount} 个，点击卡片编辑描述、参数默认值与 Agent 绑定`}
               </CardDescription>
             </CardHeader>
-            <CardContent>
+            <CardContent className="flex flex-col gap-3">
               {systemTools.length === 0 ? (
                 <p className="text-muted-foreground py-6 text-center text-sm">
                   {query.trim() ? "没有匹配的系统工具" : "（暂无系统工具，等待后端 seed）"}
                 </p>
               ) : (
-                <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                  {systemTools.map((t) => (
-                    <ToolGridCard key={t.key} tool={t} onClick={() => openTool(t)} />
-                  ))}
-                </div>
+                <>
+                  <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                    {sysPaged.map((t) => (
+                      <ToolGridCard key={t.key} tool={t} onClick={() => openTool(t)} />
+                    ))}
+                  </div>
+                  <TablePagination
+                    page={sysPage}
+                    pageSize={sysPageSize}
+                    total={systemTools.length}
+                    onPageChange={setSysPage}
+                    onPageSizeChange={(s) => {
+                      setSysPage(1);
+                      setSysPageSize(s);
+                    }}
+                    pageSizeOptions={[12, 24, 48]}
+                  />
+                </>
               )}
             </CardContent>
           </Card>
@@ -471,11 +547,24 @@ export default function ToolsPage() {
                   {query.trim() ? "没有匹配的自定义工具" : "（暂无自定义工具，点击右上角「新建自定义工具」）"}
                 </p>
               ) : (
-                <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                  {customTools.map((t) => (
-                    <ToolGridCard key={t.key} tool={t} onClick={() => openTool(t)} />
-                  ))}
-                </div>
+                <>
+                  <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                    {cusPaged.map((t) => (
+                      <ToolGridCard key={t.key} tool={t} onClick={() => openTool(t)} />
+                    ))}
+                  </div>
+                  <TablePagination
+                    page={cusPage}
+                    pageSize={cusPageSize}
+                    total={customTools.length}
+                    onPageChange={setCusPage}
+                    onPageSizeChange={(s) => {
+                      setCusPage(1);
+                      setCusPageSize(s);
+                    }}
+                    pageSizeOptions={[12, 24, 48]}
+                  />
+                </>
               )}
             </CardContent>
           </Card>

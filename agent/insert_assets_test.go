@@ -12,9 +12,9 @@ import (
 // testDB opens a DB connection, skipping if PG is unavailable.
 func testDB(t *testing.T) *db.DB {
 	t.Helper()
-	dsn, _, err := db.DSN()
+	dsn, err := testDSN()
 	if err != nil {
-		t.Skipf("no database config (%v)", err)
+		t.Skipf("postgres unavailable (%v)", err)
 	}
 	d, err := db.Open(dsn)
 	if err != nil {

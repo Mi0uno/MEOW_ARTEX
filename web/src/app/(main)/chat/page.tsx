@@ -2,6 +2,8 @@
 
 import * as React from "react";
 
+import { useSearchParams } from "next/navigation";
+
 import {
   ArrowUpIcon,
   Bot,
@@ -15,6 +17,7 @@ import {
   PinIcon,
   PinOffIcon,
   PlusIcon,
+  Radar,
   Square,
   Trash2Icon,
   XIcon,
@@ -22,10 +25,10 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { ApprovalExecutionFocus, useApprovalFocus, useApprovalHistory } from "@/components/approval-execution-focus";
 import { MentionTextarea } from "@/components/mention-textarea";
 import { SideQuestionButton, SideQuestionWorkspace } from "@/components/side-question-workspace";
 import { TodoPopover } from "@/components/todo-popover";
-import { ApprovalExecutionFocus, useApprovalFocus, useApprovalHistory } from "@/components/approval-execution-focus";
 import { Transcript } from "@/components/transcript";
 import {
   AlertDialog,
@@ -379,9 +382,11 @@ function DraftChat({
   const [sending, setSending] = React.useState(false);
   const [uploading, setUploading] = React.useState(false);
 
-  // default the agent to Auto once agents load.
+  // default the agent to Auto once agents load; 阶段锁定视图没有 Auto 时退回本阶段第一个 agent。
   React.useEffect(() => {
-    if (!agentKey && agents.some((a) => a.key === "auto")) setAgentKey("auto");
+    if (!agentKey && agents.length > 0) {
+      setAgentKey(agents.find((a) => a.key === "auto")?.key ?? agents[0].key);
+    }
   }, [agentKey, agents]);
 
   const agent = agents.find((a) => a.key === agentKey);
@@ -607,14 +612,23 @@ function ChatView({
     };
   }, [running, conv.id, onTitleMaybeChanged]);
 
-  const loadFocusPage = React.useCallback((before: number) => api.conversationHistory(conv.id, before, HISTORY_PAGE), [conv.id]);
+  const loadFocusPage = React.useCallback(
+    (before: number) => api.conversationHistory(conv.id, before, HISTORY_PAGE),
+    [conv.id],
+  );
   const mergeFocusPage = React.useCallback((page: { items: Activity[]; hasMore: boolean }) => {
     setMessages((prev) => mergeActivities(page.items, prev));
     earliestRef.current = page.items[0]?.seq ?? earliestRef.current;
     hasMoreRef.current = page.hasMore;
     setHasMore(page.hasMore);
   }, []);
-  const focusHistory = useApprovalHistory(approvalFocus.state?.source, historyLoaded, messages, loadFocusPage, mergeFocusPage);
+  const focusHistory = useApprovalHistory(
+    approvalFocus.state?.source,
+    historyLoaded,
+    messages,
+    loadFocusPage,
+    mergeFocusPage,
+  );
 
   // ---- transcript auto-scroll (open → bottom; stick to bottom unless scrolled up) ----
   const contentRef = React.useRef<HTMLDivElement | null>(null);
@@ -804,7 +818,13 @@ function ChatView({
               {hasMore && (
                 <div className="text-muted-foreground/70 pb-2 text-center text-[11px]">向上滚动加载更早的消息…</div>
               )}
-              <Transcript activity={messages} live={running} chat fetchDetail={fetchDetail} focusedSeq={focusHistory.ready ? approvalFocus.state?.source?.seq : undefined} />
+              <Transcript
+                activity={messages}
+                live={running}
+                chat
+                fetchDetail={fetchDetail}
+                focusedSeq={focusHistory.ready ? approvalFocus.state?.source?.seq : undefined}
+              />
             </>
           )}
         </div>
@@ -1042,7 +1062,15 @@ function AgentGroupHeader({
   );
 }
 
-export default function ChatPage() {
+function ChatPageInner() {
+  const searchParams = useSearchParams();
+  // 阶段锁定(?stage=recon|exploit|post):三阶段分组的「对话」入口,只显示本阶段 agent 的会话;
+  // 无参数 = 任务中心视图,全部可见。
+  const stageParam = searchParams.get("stage");
+  const lockedStage =
+    stageParam === "recon" || stageParam === "exploit" || stageParam === "post" || stageParam === "report"
+      ? stageParam
+      : "";
   const [agents, setAgents] = React.useState<Agent[]>([]);
   const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
   const [convs, setConvs] = React.useState<Conversation[]>([]);
@@ -1050,15 +1078,18 @@ export default function ChatPage() {
   const [selectedId, setSelectedId] = React.useState<number | null>(null);
   const [sourceRequested, setSourceRequested] = React.useState(false);
   const [convsLoaded, setConvsLoaded] = React.useState(false);
-  const selectConversation = React.useCallback((id: number | null) => {
-    if (id !== selectedId) {
-      const url = new URL(window.location.href);
-      url.searchParams.delete("approval");
-      setSourceRequested(false);
-      window.history.replaceState(null, "", url);
-    }
-    setSelectedId(id);
-  }, [selectedId]);
+  const selectConversation = React.useCallback(
+    (id: number | null) => {
+      if (id !== selectedId) {
+        const url = new URL(window.location.href);
+        url.searchParams.delete("approval");
+        setSourceRequested(false);
+        window.history.replaceState(null, "", url);
+      }
+      setSelectedId(id);
+    },
+    [selectedId],
+  );
 
   const [renamingId, setRenamingId] = React.useState<number | null>(null);
   const [renameText, setRenameText] = React.useState("");
@@ -1084,12 +1115,21 @@ export default function ChatPage() {
   const reloadConvs = React.useCallback(async () => {
     const seq = ++conversationListSeq.current;
     try {
-      const items = await api.conversations();
-      if (seq === conversationListSeq.current) { setConvs(items); setConvsLoaded(true); }
+      const items = await api.conversations(lockedStage || undefined);
+      if (seq === conversationListSeq.current) {
+        setConvs(items);
+        setConvsLoaded(true);
+      }
     } catch {
       // Preserve the selected transcript and list on a transient poll failure.
     }
-  }, []);
+  }, [lockedStage]);
+
+  // 切换阶段视图时收敛筛选与分页:上一个阶段的 agent 筛选在当前阶段没有意义。
+  React.useEffect(() => {
+    setAgentFilter(null);
+    setVisibleConversationCount(CONVERSATION_LIST_PAGE);
+  }, [lockedStage]);
   React.useEffect(() => {
     api
       .agents()
@@ -1200,7 +1240,11 @@ export default function ChatPage() {
   // conversation agents: custom agents + conversational built-ins (role=assistant,
   // e.g. Auto / 渗透测试). The orchestration built-ins (goals/planner/mainagent/worker)
   // are task-specific and stay hidden from the chat page.
-  const chatAgents = React.useMemo(() => agents.filter((a) => !a.builtin || a.role === "assistant"), [agents]);
+  // 阶段锁定时只保留本阶段 agent:新建对话不会产生「归属别的阶段」的会话。
+  const chatAgents = React.useMemo(
+    () => agents.filter((a) => (!a.builtin || a.role === "assistant") && (!lockedStage || a.stage === lockedStage)),
+    [agents, lockedStage],
+  );
   const agentFilterOptions = React.useMemo(() => {
     const counts = new Map<string, number>();
     for (const conversation of convs) {
@@ -1354,6 +1398,21 @@ export default function ChatPage() {
         {/* left: conversation list */}
         <div className="bg-card flex flex-col overflow-hidden rounded-lg border">
           <div className="flex flex-col gap-2 border-b p-2">
+            {lockedStage && (
+              <div className="flex items-center gap-1.5 px-1">
+                <Badge variant="outline" className="gap-1 border-blue-500/30 px-1.5 py-0 text-[10px] text-blue-600">
+                  <Radar className="size-3" />
+                  {lockedStage === "recon"
+                    ? "信息搜集"
+                    : lockedStage === "exploit"
+                      ? "渗透测试"
+                      : lockedStage === "report"
+                        ? "报告中心"
+                        : "后渗透"}
+                </Badge>
+                <span className="text-muted-foreground text-[11px]">仅显示本阶段 agent 的对话</span>
+              </div>
+            )}
             <Button size="sm" className="w-full" onClick={() => selectConversation(null)}>
               <PlusIcon /> 新建对话
             </Button>
@@ -1565,5 +1624,14 @@ export default function ChatPage() {
         </AlertDialogContent>
       </AlertDialog>
     </div>
+  );
+}
+
+// useSearchParams must sit under a Suspense boundary for static export.
+export default function ChatPage() {
+  return (
+    <React.Suspense fallback={null}>
+      <ChatPageInner />
+    </React.Suspense>
   );
 }

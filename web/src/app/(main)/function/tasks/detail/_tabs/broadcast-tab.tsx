@@ -21,6 +21,7 @@ import {
   TargetIcon,
 } from "lucide-react";
 
+import { FormattedPayload } from "@/components/formatted-payload";
 import { StatusBadge } from "@/components/status-badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardFooter } from "@/components/ui/card";
@@ -420,9 +421,7 @@ function BroadcastRow({
             )}
             <div>
               <div className="mb-1.5 text-xs font-medium text-muted-foreground">payload</div>
-              <pre className="max-h-64 overflow-auto rounded-md border bg-background p-3 font-mono text-xs whitespace-pre-wrap">
-                {prettyPayload(node.payload)}
-              </pre>
+              <FormattedPayload raw={node.payload} maxHeight="max-h-72" />
             </div>
           </div>
         )}

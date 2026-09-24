@@ -169,8 +169,9 @@ func Open(dsn string) (*DB, error) {
 type builtinAgent struct {
 	key, name, role, desc string
 	vars                  []promptVar
-	interactiveShell      bool // 建行时的默认交互式 shell 开关；ON CONFLICT 不覆盖用户后续手动开关
-	runSeconds            *int // 建行时的单次 run 墙钟上限(秒)；nil=用种子默认(1200)，0=不限时
+	interactiveShell      bool   // 建行时的默认交互式 shell 开关；ON CONFLICT 不覆盖用户后续手动开关
+	runSeconds            *int   // 建行时的单次 run 墙钟上限(秒)；nil=用种子默认(1200)，0=不限时
+	stage                 string // 归属阶段:''=通用(只在任务中心的对话可见) | recon | exploit | post
 }
 
 type promptVar struct{ name, desc, example, source string }
@@ -186,35 +187,47 @@ var builtinAgents = []builtinAgent{
 		{"EngagementDescription", "任务描述（测试对象/背景）", "测试 example.com 站点", "exploration"},
 		// Now 是全局 runtime 变量(见 server.globalPromptVars),不再在各 agent 目录里
 		// 重复定义,否则 withGlobalVars 追加时会与全局项撞名。
-	}, false, nil},
+	}, false, nil, ""},
 	{"planner", "规划", "planner", "读取态势、判定目标，只在确有未覆盖的新方向时补充探索意图（每任务一个规划循环）。", []promptVar{
 		{"Goal", "任务总目标", "拿下 example.com 的管理员权限", "exploration"},
 		{"AssetSummary", "资产计数/类型分布摘要(可选)", "domain:3 ip:5 site:2", "distilled"},
-	}, false, nil},
+	}, false, nil, ""},
 	{"mainagent", "主", "main", "人机接口：观察进展，把人的意图落成 hint 或高优先级意图。", []promptVar{
 		{"Goal", "当前任务目标", "拿下 example.com 的管理员权限", "exploration"},
 		{"AssetSummary", "开局态势摘要(可选)", "domain:3 ip:5", "distilled"},
 		{"FindingsSummary", "已确认漏洞摘要(可选)", "high:1 medium:2", "distilled"},
-	}, false, nil},
+	}, false, nil, ""},
 	{"worker", "执行", "worker", "领取一条意图执行，把发现的事实/漏洞写回知识图谱后停止。", []promptVar{
 		{"ProxyAddr", "记录代理地址(驱动 if 双文案)", "127.0.0.1:8080", "runtime"},
 		{"WorkerName", "worker 自我标识(可选)", "worker-1", "runtime"},
-	}, false, nil},
+	}, false, nil, ""},
 	// Auto:内置「平台操作」agent。不参与渗透编排循环,经对话页驱动,用工具操作平台。
-	{"auto", "Auto", "assistant", "平台操作助手：用工具管理任务(建/看/暂停/给提示)与资产，并可创建/修改 skill、自定义工具、MCP。", nil, false, nil},
+	{"auto", "Auto", "assistant", "平台操作助手：用工具管理任务(建/看/暂停/给提示)与资产，并可创建/修改 skill、自定义工具、MCP。", nil, false, nil, ""},
 	// 渗透测试:内置「独立渗透」agent。经对话页驱动,一人从侦察到收尾走完整条渗透链,自己规划自己执行自己验证。默认开启交互式 shell。
-	{"pentest", "渗透测试", "assistant", "独立渗透 agent：一人从侦察→找攻击面→深入利用→验证→收尾走完整条链，自己规划、自己执行、自己对抗式验证。", nil, true, intp(0)},
+	{"pentest", "渗透测试", "assistant", "独立渗透 agent：一人从侦察→找攻击面→深入利用→验证→收尾走完整条链，自己规划、自己执行、自己对抗式验证。", nil, true, intp(0), "exploit"},
+	// 信息搜集:内置「信息搜集」agent。经对话页驱动,专职外部攻击面测绘:多源子域/资产
+	// 查询(16 家外部接口工具)、真实性验证(泛解析/解析/探活)、结构化入库。默认开启交互式 shell。
+	{"recon_worker", "信息搜集", "assistant", "信息搜集 agent：面向授权目标做外部攻击面测绘——多源子域与资产查询、交叉验证、真实性甄别、结构化入库与攻击面汇总。", []promptVar{
+		{"ProxyAddr", "记录代理地址(驱动 if 双文案)", "127.0.0.1:8080", "runtime"},
+	}, true, intp(0), "recon"},
+	// 资产分析:内置「资产分析」agent。对已入库资产做聚类/关联/优先级评估,输出高价值
+	// 目标清单与攻击面结论,不主动发起大量请求。
+	{"recon_analyst", "资产分析", "assistant", "资产分析 agent：对企业已入库资产做聚类关联(同主体/同段/同证书)、攻击面优先级评估,输出高价值目标清单与结论。", nil, false, intp(600), "recon"},
+	// 报告模板工程师:内置「模板工程师」agent(报告中心阶段)。AI 占位模板识别任务的过程
+	// 会话绑在它名下(报告中心→对话 ?stage=report 监看);识别完成后也可在本会话里继续追问改稿。
+	{"template_engineer", "模板工程师", "assistant", "报告模板工程师：把渗透测试报告模板改写为「数据占位版」——保留章节结构与固定文字,数据位置替换为平台内置变量。", nil, false, intp(600), "report"},
 }
 
 // seedBuiltins inserts the fixed built-in agents and their variable catalog (idempotent).
 func (d *DB) seedBuiltins() error {
 	for _, a := range builtinAgents {
 		var agentID int64
+		// stage 只在新插入时写入;存量行的归属由 schema.sql 的回填(仅补空)负责,不在此覆盖。
 		err := d.QueryRow(`
-INSERT INTO agents(key, name, description, role, builtin, enabled, interactive_shell, run_seconds)
-VALUES ($1, $2, NULLIF($3,''), $4, true, true, $5, COALESCE($6, 1200))
+INSERT INTO agents(key, name, description, role, builtin, enabled, interactive_shell, run_seconds, stage)
+VALUES ($1, $2, NULLIF($3,''), $4, true, true, $5, COALESCE($6, 1200), $7)
 ON CONFLICT (key) DO UPDATE SET name = EXCLUDED.name, description = EXCLUDED.description
-RETURNING id`, a.key, a.name, a.desc, a.role, a.interactiveShell, a.runSeconds).Scan(&agentID)
+RETURNING id`, a.key, a.name, a.desc, a.role, a.interactiveShell, a.runSeconds, a.stage).Scan(&agentID)
 		if err != nil {
 			return fmt.Errorf("agent %s: %w", a.key, err)
 		}

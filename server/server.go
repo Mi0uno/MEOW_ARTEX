@@ -7,13 +7,13 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"runtime/debug"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,6 +25,7 @@ import (
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
+	"github.com/Autumn-27/artex/recon"
 	"github.com/Autumn-27/artex/report"
 	"github.com/Autumn-27/norma/llm"
 	actool "github.com/Autumn-27/norma/tool"
@@ -42,6 +43,16 @@ type Server struct {
 	m      *Manager
 	engine *Engine
 	ctx    context.Context
+	// recon 独立驱动信息搜集流水线任务(stage=recon),与 agent 引擎互不干涉。
+	recon *reconRunner
+	// tmplRunner 独立驱动 AI 占位模板识别任务(stage=report);templateMu 串行化
+	// 同一模板的识别启动(一模板同时只允许一个 running 任务)。
+	tmplRunner *templateRunner
+	templateMu sync.Mutex
+	// vulnSync 是 CVE 定时采集器(定时从公开漏洞源拉取情报 + 自动发现 PoC)。
+	vulnSync *vulnSync
+	// apiSecret 外部接口凭据的 AES-GCM 加解密盒(密钥在 dataDir 下)。
+	apiSecret *apiSecretBox
 
 	skillDir string // root directory for skill subdirectories
 	jwtKey   []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
@@ -149,8 +160,29 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
-		provByProfile: map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
+		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
+	s.recon = newReconRunner(s.reconSink)
+	s.tmplRunner = newTemplateRunner()
+	// CVE 定时采集器:后台按配置间隔轮询公开漏洞源(NVD/GitHub Advisory/
+	// Exploit-DB/GitHub PoC),默认 6 小时一轮,可在漏洞库页开关与调整。
+	s.vulnSync = newVulnSync(s)
+	go s.vulnSync.run(s.ctx)
+	// 代理中心:本地代理池监听器 + 源站拉取 + 自动测活。恢复上次的出网模式,
+	// 并把出网地址接进 Manager.ProxyAddr(裸网 ⇄ 代理池的切换落点)。
+	s.initProxyCenter()
+	// report_finding 登记后的联动:漏洞库自动归类 + SRC 成果自动创建。
+	s.wireFindingHooks()
+	// 任务进入终态时自动归档总结报告到报告中心(异步,不阻塞状态写入)。
+	// 识别/信息搜集任务由 autoArchiveTaskReport 内部按 stage 跳过。
+	m.SetTaskTerminalHook(func(taskID int64) {
+		go s.autoArchiveTaskReport(taskID)
+	})
+	if box, err := newAPISecretBox(m.dir); err != nil {
+		log.Printf("[external-apis] 凭据加密盒初始化失败: %v", err)
+	} else {
+		s.apiSecret = box
+	}
 	s.initSideQuestions()
 	// 熔断阈值/冷却是失败路径上的热参数，启动时把全局重试策略推给 Registry 一次；
 	// 之后每次保存策略再推一次（saveLLMRetryPolicy）。
@@ -250,6 +282,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		log.Printf("[engine] no LLM provider configured — engine idle until set via /api/llm or env")
 	}
 	s.restoreTaskRuntimes()
+	// 报告中心自动汇聚的历史回填:必须在任务加载进内存之后——任务总结报告经
+	// renderTaskReport 渲染,而它走内存任务句柄(store/资产快照)。一次性 flag 守卫。
+	s.backfillReportArchive()
 	go s.reconcileConcurrency()
 	s.startTaskArchiveWorker()
 	s.wireInterceptReviewer() // LLM 兜底审批:未命中拦截规则的命令交给模型判定
@@ -264,6 +299,10 @@ func (s *Server) restoreTaskRuntimes() {
 	// restore persisted paused state (so a task paused before restart stays paused).
 	for _, t := range m.LoadExisting() {
 		lifecycle := t.lifecycleSnapshot()
+		// 信息搜集/报告识别任务:无探索图状态要清理,流水线在下面统一重跑。
+		if t.Stage == "recon" || t.Stage == "report" {
+			continue
+		}
 		// clear stale 'running' intents from a prior crash/restart (no live worker
 		// owns them) so they re-claim instead of spinning forever in the UI.
 		if n, _ := t.Store.ResetRunningIntents(); n > 0 {
@@ -285,6 +324,16 @@ func (s *Server) restoreTaskRuntimes() {
 	for _, t := range m.List() {
 		lifecycle := t.lifecycleSnapshot()
 		if !lifecycle.Queued && !isTerminalStatus(lifecycle.Status) {
+			if t.Stage == "recon" {
+				// 重启后重跑流水线(收集器幂等 upsert,产出进新批次)。
+				s.launchReconTask(t)
+				continue
+			}
+			if t.Stage == "report" {
+				// 重启后续跑 AI 识别任务(草稿完成时整体覆盖写入,天然幂等)。
+				s.launchTemplateTask(t)
+				continue
+			}
 			s.engine.Run(s.ctx, t)
 		}
 	}
@@ -717,6 +766,53 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /api/tasks/{id}/constraints/{cid}", s.editConstraint)    // 约束管理:修改约束
 	mux.HandleFunc("DELETE /api/tasks/{id}/constraints/{cid}", s.deleteConstraint) // 约束管理:删除约束
 	mux.HandleFunc("POST /api/tasks/{id}/control", s.control)
+	// ---- 三阶段平台:信息搜集(stage=recon)执行面 ----
+	mux.HandleFunc("GET /api/recon/collectors", s.reconCollectorMeta)
+	mux.HandleFunc("POST /api/recon/plan", s.reconPlanHandler)
+	// ---- 漏洞库 ----
+	mux.HandleFunc("GET /api/vulndb/entries", s.listVulnEntries)
+	mux.HandleFunc("POST /api/vulndb/entries", s.createVulnEntry)
+	mux.HandleFunc("GET /api/vulndb/entries/{id}", s.getVulnEntry)
+	mux.HandleFunc("PUT /api/vulndb/entries/{id}", s.updateVulnEntry)
+	mux.HandleFunc("DELETE /api/vulndb/entries/{id}", s.deleteVulnEntry)
+	mux.HandleFunc("GET /api/vulndb/entries/{id}/pocs", s.listVulnPocs)
+	mux.HandleFunc("POST /api/vulndb/entries/{id}/pocs", s.createVulnPoc)
+	mux.HandleFunc("PUT /api/vulndb/pocs/{id}", s.updateVulnPoc)
+	mux.HandleFunc("DELETE /api/vulndb/pocs/{id}", s.deleteVulnPoc)
+	mux.HandleFunc("GET /api/vulndb/sync", s.vulnDBSyncStatus)
+	mux.HandleFunc("POST /api/vulndb/sync", s.triggerVulnDBSync)
+	mux.HandleFunc("PUT /api/vulndb/sync/config", s.setVulnDBSyncConfig)
+	// ---- SRC 模式 ----
+	mux.HandleFunc("GET /api/src/profiles", s.listSRCProfiles)
+	mux.HandleFunc("POST /api/src/profiles", s.saveSRCProfile)
+	mux.HandleFunc("GET /api/src/profiles/{id}", s.getSRCProfile)
+	mux.HandleFunc("DELETE /api/src/profiles/{id}", s.deleteSRCProfile)
+	mux.HandleFunc("GET /api/src/rewards", s.listSRCRewards)
+	mux.HandleFunc("POST /api/src/rewards", s.createSRCReward)
+	mux.HandleFunc("PUT /api/src/rewards/{id}", s.updateSRCReward)
+	mux.HandleFunc("DELETE /api/src/rewards/{id}", s.deleteSRCReward)
+	mux.HandleFunc("GET /api/src/overview", s.srcOverview)
+	mux.HandleFunc("GET /api/tasks/{id}/collector-runs", s.taskCollectorRuns)
+	mux.HandleFunc("GET /api/tasks/{id}/collector-runs/{runId}/raw", s.taskCollectorRunRaw)
+	mux.HandleFunc("GET /api/tasks/{id}/staged-assets", s.taskStagedAssets)
+	mux.HandleFunc("POST /api/tasks/{id}/staged-assets/decide", s.stagedAssetDecide)
+	mux.HandleFunc("POST /api/tasks/{id}/recon/rerun", s.rerunReconTaskHandler)
+	mux.HandleFunc("POST /api/recon/execute", s.reconExecute)
+	mux.HandleFunc("GET /api/recon/execute", s.reconExecuteList)
+	// ---- 三阶段平台:字典库 ----
+	mux.HandleFunc("GET /api/recon/wordbooks", s.reconWordbookList)
+	mux.HandleFunc("POST /api/recon/wordbooks", s.reconWordbookUpload)
+	mux.HandleFunc("DELETE /api/recon/wordbooks/{id}", s.reconWordbookDelete)
+	mux.HandleFunc("GET /api/recon/wordbooks/{id}/download", s.reconWordbookDownload)
+	mux.HandleFunc("GET /api/recon/wordbooks/{id}/content", s.reconWordbookContent)
+	mux.HandleFunc("PUT /api/recon/wordbooks/{id}/content", s.reconWordbookSaveContent)
+	mux.HandleFunc("GET /api/recon/wordbooks/{id}/preview", s.reconWordbookPreview)
+	// ---- 三阶段平台:外部接口(FOFA/Hunter 配置) ----
+	mux.HandleFunc("GET /api/external-apis", s.listExternalAPIs)
+	mux.HandleFunc("POST /api/external-apis", s.createExternalAPI)
+	mux.HandleFunc("PUT /api/external-apis/{id}", s.updateExternalAPI)
+	mux.HandleFunc("DELETE /api/external-apis/{id}", s.deleteExternalAPI)
+	mux.HandleFunc("POST /api/external-apis/{id}/test", s.testExternalAPI)
 	mux.HandleFunc("PUT /api/tasks/{id}/llm", s.updateTaskLLMProfiles)
 	mux.HandleFunc("GET /api/tasks/{id}/llm/resolution", s.taskLLMResolutionHandler)
 	mux.HandleFunc("POST /api/tasks/{id}/intents/{iid}/control", s.controlIntent)
@@ -750,6 +846,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/exploration/findings/stats", s.findingStats)
 	mux.HandleFunc("GET /api/exploration/findings/export", s.findingsExport)
 	s.registerFindingTraffic(mux)
+	// ---- 代理中心 ----
+	s.registerProxyRoutes(mux)
 	mux.HandleFunc("GET /api/exploration/findings/{id}", s.getFinding)
 	mux.HandleFunc("GET /api/exploration/findings/{id}/lineage", s.findingLineage)
 	mux.HandleFunc("POST /api/exploration/findings/{id}/deepen", s.deepenFinding)
@@ -791,6 +889,22 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/settings", s.putSettings)
 	mux.HandleFunc("POST /api/settings/web-search/test", s.testWebSearch)
 	mux.HandleFunc("GET /api/report", s.getReport)
+	// ---- 报告中心 ----
+	mux.HandleFunc("GET /api/reports", s.listReports)
+	mux.HandleFunc("GET /api/reports/companies", s.listReportCompanies)
+	mux.HandleFunc("POST /api/reports", s.createReport)
+	mux.HandleFunc("POST /api/reports/generate", s.generateReport)
+	mux.HandleFunc("GET /api/reports/{id}", s.getReportDetail)
+	mux.HandleFunc("DELETE /api/reports/{id}", s.deleteReportDetail)
+	mux.HandleFunc("GET /api/reports/{id}/export", s.exportReport)
+	mux.HandleFunc("GET /api/reports/{id}/events", s.listReportEvents)
+	// ---- 报告模板 ----
+	mux.HandleFunc("GET /api/report-templates", s.listReportTemplates)
+	mux.HandleFunc("POST /api/report-templates", s.uploadReportTemplate)
+	mux.HandleFunc("GET /api/report-templates/{id}", s.getReportTemplate)
+	mux.HandleFunc("PUT /api/report-templates/{id}", s.updateReportTemplate)
+	mux.HandleFunc("DELETE /api/report-templates/{id}", s.deleteReportTemplate)
+	mux.HandleFunc("POST /api/report-templates/{id}/analyze", s.analyzeReportTemplate)
 	mux.HandleFunc("GET /api/chat/mentions", s.searchChatMentions)
 	mux.HandleFunc("POST /api/chat", s.chat)
 	mux.HandleFunc("POST /api/chat/upload", s.chatUpload) // 方式1 文件上传:落到会话/任务工作目录 uploads/
@@ -884,6 +998,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/llm/pool", s.pgLLMPoolStatus)
 	mux.HandleFunc("POST /api/llm/pool/reset", s.pgLLMPoolReset)
 	mux.HandleFunc("POST /api/llm/models", s.pgListModels)
+	mux.HandleFunc("GET /api/llm/models-cache", s.llmModelsCacheHandler)
 
 	// 拦截规则管理
 	mux.HandleFunc("GET /api/intercept/rules", s.interceptListRules)
@@ -902,11 +1017,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/intercept/tool-config", s.interceptSetToolConfig)
 	mux.HandleFunc("GET /api/intercept/judge", s.interceptGetJudgeConfig)
 	mux.HandleFunc("PUT /api/intercept/judge", s.interceptSetJudgeConfig)
+	// 决策引擎(前置决策模型)配置:AI管理→Decision 配置;监管&规则→AI监管 编排。
+	mux.HandleFunc("GET /api/decision/engines", s.decisionListEngines)
+	mux.HandleFunc("PUT /api/decision/engines/{key}", s.decisionUpdateEngine)
+	mux.HandleFunc("POST /api/decision/engines/{key}/test", s.decisionTestEngine)
 
-	// /api/* goes through CORS + JWT; everything else is served by the embedded
+	// /api/* goes through CORS + JWT + no-store; everything else is served by the embedded
 	// frontend (public — auth is enforced client-side and on the API). With the
 	// no-embed build the webui handler just 404s (run `next dev` separately).
-	api := cors(s.requireAuth(mux))
+	api := noStore(cors(s.requireAuth(mux)))
 	root := http.NewServeMux()
 	root.Handle("/api/", api)
 	root.Handle("/", s.webuiHandler())
@@ -914,6 +1033,19 @@ func (s *Server) Handler() http.Handler {
 }
 
 // --- handlers ---
+
+// --- handlers ---
+
+// noStore 给所有 /api/* 响应加禁缓存头:平台的列表/数据接口都是动态且含敏感
+// 信息,绝不允许浏览器(或中间层)缓存——否则会出现「刷新后数据回到旧状态」的
+// 诡异现象(模板/报告列表空、删掉的行又出现等)。
+func noStore(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		next.ServeHTTP(w, r)
+	})
+}
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true, "service": "artex", "version": BuildVersion})
@@ -1010,6 +1142,44 @@ func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 		active = t.ID
 	}
 	list := s.m.List()
+	// 可选 stage 筛选(信息搜集页只拉 recon 任务):?stage=recon
+	stageFilter := r.URL.Query().Get("stage")
+	if stageFilter != "" {
+		filtered := make([]*Task, 0, len(list))
+		for _, t := range list {
+			if t.Stage == stageFilter {
+				filtered = append(filtered, t)
+			}
+		}
+		list = filtered
+	}
+	// 可选企业筛选(报告中心/渗透测试按资产主体查看):?company_id=N
+	// 归属取自 task_scope 的 kind='company' 行(Task.CompanyIDs 已由 hydrateTasksContext 载入)。
+	// company_id=0 = 只看未关联任何企业的任务(历史任务多为这种:创建时没选企业)。
+	if raw := r.URL.Query().Get("company_id"); raw != "" {
+		if cid, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			filtered := make([]*Task, 0, len(list))
+			for _, t := range list {
+				if cid == 0 {
+					// 未关联桶:没有任何 company 归属的任务。
+					if len(t.CompanyIDs) == 0 {
+						filtered = append(filtered, t)
+					}
+					continue
+				}
+				if cid < 0 {
+					continue
+				}
+				for _, tc := range t.CompanyIDs {
+					if tc == cid {
+						filtered = append(filtered, t)
+						break
+					}
+				}
+			}
+			list = filtered
+		}
+	}
 	metrics, _ := s.m.PG().TaskListMetricsAll()
 	archiveBlockers, _ := s.m.PG().TaskArchiveBlockers()
 	dtos := make([]TaskDTO, 0, len(list))
@@ -1035,6 +1205,11 @@ func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 func (s *Server) resolvedTaskStatus(t *Task) string {
 	if t == nil {
 		return "created"
+	}
+	// 信息搜集任务:状态由 reconRunner 直接持久化(created/running/done/failed),
+	// 不经引擎推导(引擎的 Ready/Started 语义对流水线无意义)。
+	if t.Stage == "recon" {
+		return t.lifecycleSnapshot().Status
 	}
 	lifecycle := t.lifecycleSnapshot()
 	switch {
@@ -1091,6 +1266,24 @@ func (s *Server) control(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Action != "pause" && req.Action != "resume" {
 		writeErr(w, 400, "action must be pause|resume")
+		return
+	}
+	// 信息搜集任务:流水线不支持暂停/恢复;stop=取消运行,重跑走专用路由。
+	if t.Stage == "recon" {
+		if req.Action == "pause" && s.stopReconTask(t) {
+			writeJSON(w, 200, map[string]any{"id": t.ID, "stopping": true})
+			return
+		}
+		writeErr(w, 409, "信息搜集任务不支持暂停/恢复;运行中可重发 pause 停止,终态后可重跑")
+		return
+	}
+	// AI 识别任务:同流水线语义,pause=取消本次识别(模板行落 failed,可重新发起)。
+	if t.Stage == "report" {
+		if req.Action == "pause" && s.stopTemplateTask(t) {
+			writeJSON(w, 200, map[string]any{"id": t.ID, "stopping": true})
+			return
+		}
+		writeErr(w, 409, "识别任务不支持暂停/恢复;运行中可重发 pause 停止")
 		return
 	}
 	result, err := s.applyTaskControl(t, req.Action)
@@ -1420,6 +1613,19 @@ type createTaskReq struct {
 	PlanHeartbeatSeconds int      `json:"plan_heartbeat_seconds"`      // planner 心跳触发间隔(秒);0/省略=默认600(10min);下限=默认=600,低于自动抬到600
 	SeedFirstIntent      *bool    `json:"seed_first_intent,omitempty"` // 创建时直接下发一条种子意图(内容=描述+目标),让 worker 免等首轮 planner 直接开跑;省略/null=默认关闭,走标准先规划再执行。显式传 true 才开(CTF 常一 work 解决时可省掉开跑前的 planner 轮)。
 	CoverageEnabled      *bool    `json:"coverage_enabled,omitempty"`  // 资产覆盖度功能;省略/null=默认开(true)。false=关闭覆盖度计算/展示/自动累积范围+隐藏 add_task_scope/list_untested_assets。company 关联不受影响。
+	// 三阶段扩展:stage=recon 时任务走信息搜集收集器流水线(无需 LLM 配置)。
+	// 单步骤任务模型:step_key=收集器 key,step_config=该步骤配置(推荐);
+	// pipeline 为兼容保留的多步编排(与新模型互斥,step_key 优先)。
+	Stage string `json:"stage,omitempty"`
+	// SRC 模式:任务产出计入 SRC 成果,并按企业 SRC 规范约束 AI 边界(防越界)。
+	SRCMode    bool            `json:"src_mode,omitempty"`
+	StepKey    string          `json:"step_key,omitempty"`
+	StepConfig json.RawMessage `json:"step_config,omitempty"`
+	Pipeline   json.RawMessage `json:"pipeline,omitempty"`
+	// 出网方式(任务级覆盖):省略/""=跟随全局;direct=强制直连;pool=强制走代理池。
+	// proxy_group_id 仅在 pool 时有效(0/省略=用全局选中的代理组)。
+	ProxyMode    string `json:"proxy_mode,omitempty"`
+	ProxyGroupID int64  `json:"proxy_group_id,omitempty"`
 }
 
 func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
@@ -1428,15 +1634,40 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}
+	req.Stage = strings.ToLower(strings.TrimSpace(req.Stage))
+	if req.Stage == "" {
+		req.Stage = "exploit"
+	}
+	isRecon := req.Stage == "recon"
+	if req.Stage != "exploit" && req.Stage != "recon" && req.Stage != "post" {
+		writeErr(w, 400, "stage 必须为 recon|exploit|post")
+		return
+	}
+	if isRecon {
+		// 信息搜集:至少关联一个企业作为目标;无 LLM 依赖。
+		// step_key 可选——不指定时自动跑全部已注册收集器(被动优先)。
+		req.StepKey = strings.TrimSpace(req.StepKey)
+		if req.StepKey != "" && recon.Get(req.StepKey) == nil {
+			writeErr(w, 400, "未知收集步骤: "+req.StepKey)
+			return
+		}
+		if len(req.CompanyIDs) == 0 {
+			writeErr(w, 400, "信息搜集任务至少关联一个企业作为目标")
+			return
+		}
+	} else if err := s.validateTaskProfileIDs(req.LLMProfileIDs); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	if strings.TrimSpace(req.Description) == "" {
 		req.Description = "未命名任务"
 	}
 	if len(req.LLMProfileIDs) == 0 && req.LLMProfileID != nil {
 		req.LLMProfileIDs = []int64{*req.LLMProfileID}
 	}
-	if err := s.validateTaskProfileIDs(req.LLMProfileIDs); err != nil {
-		writeErr(w, 400, err.Error())
-		return
+	if isRecon {
+		// 流水线任务无 LLM 依赖:清空配置,让创建路径零假设。
+		req.LLMProfileIDs = nil
 	}
 	if req.TimeoutSeconds < 0 {
 		req.TimeoutSeconds = 0
@@ -1444,6 +1675,22 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	if len(req.SourceTaskIDs) > db.MaxTaskSourceCount {
 		writeErr(w, 400, fmt.Sprintf("关联任务最多选择 %d 个", db.MaxTaskSourceCount))
 		return
+	}
+	// 出网方式:空=跟随全局;direct=强制直连;pool=强制走代理池(需有可用组)。
+	req.ProxyMode = strings.ToLower(strings.TrimSpace(req.ProxyMode))
+	if !db.ValidTaskProxyMode(req.ProxyMode) {
+		writeErr(w, 400, "proxy_mode 必须是空、direct 或 pool")
+		return
+	}
+	if req.ProxyMode == db.TaskProxyModePool && req.ProxyGroupID > 0 {
+		// 指定了组就校验它真实存在,避免任务建好后出网静默回落到全局。
+		if g, err := s.m.PG().GetProxyGroup(req.ProxyGroupID); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		} else if g == nil {
+			writeErr(w, 400, "指定的代理组不存在")
+			return
+		}
 	}
 	sourceIDs := make([]int64, 0, len(req.SourceTaskIDs))
 	seenSources := map[int64]bool{}
@@ -1471,6 +1718,11 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		SourceTaskIDs: sourceIDs, CompanyIDs: req.CompanyIDs, LLMProfileIDs: req.LLMProfileIDs,
 		TimeoutSeconds: req.TimeoutSeconds, PlanHeartbeatSeconds: req.PlanHeartbeatSeconds,
 		CoverageEnabled: req.CoverageEnabled,
+		Stage:           req.Stage, Pipeline: req.Pipeline,
+		StepKey: req.StepKey, StepConfig: req.StepConfig,
+		SRCMode: req.SRCMode,
+		// 出网方式(任务级覆盖):建任务时就定下来,agent 与流水线都按它取出口。
+		ProxyMode: req.ProxyMode, ProxyGroupID: req.ProxyGroupID,
 	})
 	if err != nil {
 		if errors.Is(err, db.ErrTaskCategoryInvalid) || errors.Is(err, db.ErrTaskCategoryNotFound) {
@@ -1485,10 +1737,15 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("[task] 新建任务 #%s «%s» 目标: %s", t.ID, req.Description, req.Goal)
+	// SRC 模式:把企业 SRC 规范转成任务约束(防 AI 越界),再启动任务。
+	// 必须在 launchTask 之前写:约束要赶在首轮 Planner 之前就位。
+	if req.SRCMode && len(req.CompanyIDs) > 0 {
+		s.applySRCConstraints(t, req.CompanyIDs[0])
+	}
 	// 共享的建后流程(seed + 种子意图 + 后台目标分解 + engine.Run),与 spawn_task 复用同一段。
 	// launchTask 内部异步,不阻塞 UI —— 目标分解在后台可见地进行。
 	s.launchTask(t, req.Description+" "+req.Goal, req.SeedFirstIntent != nil && *req.SeedFirstIntent)
-	writeJSON(w, 201, taskDTO(t, s.resolvedTaskStatus(t)))
+	writeJSON(w, 201, s.withProxyEgress(taskDTO(t, s.resolvedTaskStatus(t))))
 }
 
 func (s *Server) validateTaskProfileIDs(ids []int64) error {
@@ -1688,7 +1945,7 @@ func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "task not found")
 		return
 	}
-	dto := taskDTO(t, s.resolvedTaskStatus(t))
+	dto := s.withProxyEgress(taskDTO(t, s.resolvedTaskStatus(t)))
 	archiveBlockers, _ := s.m.PG().TaskArchiveBlockers()
 	applyTaskArchiveBlocker(&dto, archiveBlockers)
 	writeJSON(w, 200, dto)
@@ -3234,7 +3491,40 @@ func (s *Server) settingsPayload() map[string]any {
 		// 实验功能:noa 模型驱动上下文压缩(默认关)。开启后平台接入的四类 agent 由 noa
 		// 接管上下文压缩,取代内置 compaction;每 run 读一次,对之后启动的 run 生效。
 		"noa_compaction": s.m.NoaCompactionEnabled(),
+		// 代理中心:出网模式(direct=本地裸网 / pool=代理池)与选中的组。
+		// 经代理池时 agent 出网指向本进程的本地监听地址(proxy_listen_addr)。
+		"proxy_egress_mode":     s.proxyEgressModeSetting(),
+		"proxy_active_group_id": s.proxyActiveGroupSetting(),
+		"proxy_listen_addr":     s.proxyListenAddrSetting(),
 	}
+}
+
+// proxyEgressModeSetting 读当前出网模式(默认 direct)。
+func (s *Server) proxyEgressModeSetting() string {
+	if pc := s.m.ProxyCenter(); pc != nil {
+		if mode, _ := pc.EgressMode(); mode != "" {
+			return mode
+		}
+	}
+	return "direct"
+}
+
+// proxyActiveGroupSetting 读代理池模式下选中的组 id。
+func (s *Server) proxyActiveGroupSetting() int64 {
+	if pc := s.m.ProxyCenter(); pc != nil {
+		if _, gid := pc.EgressMode(); gid > 0 {
+			return gid
+		}
+	}
+	return 0
+}
+
+// proxyListenAddrSetting 读当前本地监听地址(仅代理池模式非空)。
+func (s *Server) proxyListenAddrSetting() string {
+	if pc := s.m.ProxyCenter(); pc != nil {
+		return pc.ActiveProxyAddr()
+	}
+	return ""
 }
 
 // pgDetectPython re-runs interpreter detection, stores + returns it.
@@ -3714,6 +4004,15 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "no active task")
 		return
 	}
+	_, _, md := s.renderTaskReport(t)
+	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+	w.WriteHeader(200)
+	_, _ = w.Write([]byte(md))
+}
+
+// renderTaskReport 从探索图渲染任务总结报告(Markdown),即时查看(GET /api/report)
+// 与报告中心归档(POST /api/reports/generate)共用同一份渲染。
+func (s *Server) renderTaskReport(t *Task) (title, summary, md string) {
 	findings, _ := t.Store.ListByKind(db.KindFinding, 1000) // 纯漏洞（事实是独立的 KindFact，不进报告）
 	counts := map[string]int{}
 	for _, ty := range []string{"root_domain", "ip", "subdomain", "app", "service", "endpoint"} {
@@ -3722,13 +4021,16 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 			counts[ty] = len(ns)
 		}
 	}
-	md := report.Markdown(report.Input{
+	md = report.Markdown(report.Input{
 		Title: t.Description, Goal: t.Goal, GeneratedAt: time.Now(),
 		AssetCounts: counts, Findings: findings,
 	})
-	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
-	w.WriteHeader(200)
-	_, _ = w.Write([]byte(md))
+	title = strings.TrimSpace(t.Description)
+	if title == "" {
+		title = fmt.Sprintf("任务 #%s 渗透测试报告", t.ID)
+	}
+	summary = fmt.Sprintf("确认发现 %d 个 · 资产 %d 类", len(findings), len(counts))
+	return title, summary, md
 }
 
 func (s *Server) getAudit(w http.ResponseWriter, r *http.Request) {

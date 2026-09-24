@@ -21,6 +21,7 @@ type ToolSeed struct {
 	Desc   string         // 顶层描述（可在 UI 覆盖）
 	Schema map[string]any // 参数 JSON-Schema（结构只读，description/default 可在 UI 改）
 	Agents []string       // 默认绑定的 agent key（worker/planner/mainagent）
+	Stage  string         // 归属阶段：''=通用 | recon | exploit | post（三阶段工具页各自管理）
 }
 
 // builtinToolsByAgent 用一个「只读空壳」ToolSet（nil stores）构造每个执行 agent 的
@@ -46,6 +47,11 @@ func builtinToolsByAgent() map[string][]actool.CoreTool {
 		// pentest（独立渗透 agent）默认绑：查资产 / 插资产 / 报漏洞 / 查漏洞 / 查企业。
 		// 新库由此 seed 写入；老库由 seedPentestDefaultBindings 迁移。
 		"pentest": {ts.listAssets(), ts.insertAssets(), ts.addFinding(), ts.listFindings(), ts.listCompanies()},
+		// recon_worker（信息搜集 agent）默认绑：查资产 / 插资产（查重后入库）。
+		// 16 家外部数据源查询工具由 server 侧 seed（stage=recon）并同步绑定。
+		"recon_worker": {ts.listAssets(), ts.insertAssets()},
+		// recon_analyst（资产分析 agent）只读：看资产，不给写入口。
+		"recon_analyst": {ts.listAssets()},
 	}
 }
 
@@ -60,13 +66,20 @@ var defaultUnbound = map[string]bool{"goal_met": true}
 
 // BuiltinToolSeeds 把各 agent 的内置工具集去重合并成 seed 列表：同名工具（如 list_assets
 // 多个 agent 都有）合成一条，Agents 取并集；defaultUnbound 里的工具则强制绑定为空。
+// Stage 按主要用途打标（同名工具多 agent 归属时 exploit 优先于通用）。
 func BuiltinToolSeeds() []ToolSeed {
 	byAgent := builtinToolsByAgent()
-	order := []string{"mainagent", "goals", "planner", "worker", "auto", "pentest"}
+	order := []string{"mainagent", "goals", "planner", "worker", "auto", "pentest", "recon_worker", "recon_analyst"}
+	stageByAgent := map[string]string{
+		"worker": "exploit", "pentest": "exploit", "auto": "exploit",
+		"recon_worker": "recon", "recon_analyst": "recon",
+		"mainagent": "", "planner": "", "goals": "",
+	}
 
 	type acc struct {
 		tool   actool.CoreTool
 		agents []string
+		stage  string
 	}
 	m := map[string]*acc{}
 	var keys []string
@@ -74,11 +87,15 @@ func BuiltinToolSeeds() []ToolSeed {
 		for _, t := range byAgent[ak] {
 			a, ok := m[t.Name()]
 			if !ok {
-				a = &acc{tool: t}
+				a = &acc{tool: t, stage: stageByAgent[ak]}
 				m[t.Name()] = a
 				keys = append(keys, t.Name())
 			}
 			a.agents = append(a.agents, ak)
+			// 同名工具归属取第一个非通用阶段（exploit 优先于通用）。
+			if a.stage == "" {
+				a.stage = stageByAgent[ak]
+			}
 		}
 	}
 
@@ -94,6 +111,7 @@ func BuiltinToolSeeds() []ToolSeed {
 			Desc:   a.tool.Description(),
 			Schema: a.tool.InputSchema(),
 			Agents: agents,
+			Stage:  a.stage,
 		})
 	}
 	return out

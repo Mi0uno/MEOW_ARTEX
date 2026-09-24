@@ -50,6 +50,38 @@ type Task struct {
 	// list_untested_assets、态势里不注入 coverage 块(scope 字段仍保留)。company 关联
 	// (task_scope kind=company)与此开关无关，永不受影响。见 db/task_scope.go。
 	CoverageEnabled bool `json:"coverage_enabled"`
+	// 三阶段平台字段(创建后不变)。Stage: recon/exploit/post，存量任务=exploit；
+	// Kind: agent(现有引擎)/pipeline(确定性收集器流水线，当前仅 recon)；
+	// Pipeline: 兼容保留的多步编排 JSON；StepKey/StepConfig: 单步骤任务模型
+	// (recon 的每个细分步骤一条任务，StepKey=收集器 key)。
+	Stage      string          `json:"stage"`
+	Kind       string          `json:"kind"`
+	Pipeline   json.RawMessage `json:"pipeline,omitempty"`
+	StepKey    string          `json:"step_key"`
+	StepConfig json.RawMessage `json:"step_config,omitempty"`
+	// SRC 模式:任务产出计入 SRC 成果,并按企业 SRC 规范约束 AI 边界。
+	SRCMode      bool  `json:"src_mode"`
+	SRCProfileID int64 `json:"src_profile_id"`
+	// 出网方式(任务级覆盖):''=跟随全局;direct=强制直连;pool=强制走代理池。
+	// ProxyGroupID 仅在 pool 时有效(0=用全局选中的代理组)。
+	ProxyMode    string `json:"proxy_mode"`
+	ProxyGroupID int64  `json:"proxy_group_id"`
+}
+
+// 任务级出网模式取值(与 settings 的全局模式同一套语义,外加 ”=跟随全局)。
+const (
+	TaskProxyModeInherit = ""       // 跟随全局出网模式(默认,保持既有行为)
+	TaskProxyModeDirect  = "direct" // 本任务强制直连(本地裸网)
+	TaskProxyModePool    = "pool"   // 本任务强制走代理池
+)
+
+// ValidTaskProxyMode 校验任务级出网模式。
+func ValidTaskProxyMode(m string) bool {
+	switch m {
+	case TaskProxyModeInherit, TaskProxyModeDirect, TaskProxyModePool:
+		return true
+	}
+	return false
 }
 
 // TaskDeleteResult reports optional related-data cleanup performed in the same
@@ -154,6 +186,19 @@ type TaskCreateOptions struct {
 	// CoverageEnabled 是「资产覆盖度功能」开关;nil=默认开(true)，让不关心该开关的创建
 	// 路径(编排 spawn、老 API)沿用原行为。仅 web 创建任务时可显式传 false 关闭。
 	CoverageEnabled *bool
+	// 三阶段字段：Stage(默认 exploit)/Kind(默认 agent)/Pipeline(兼容多步编排)/
+	// StepKey+StepConfig(单步骤任务，recon 每个细分步骤一条任务)。
+	Stage      string
+	Kind       string
+	Pipeline   json.RawMessage
+	StepKey    string
+	StepConfig json.RawMessage
+	// SRC 模式:任务产出计入 SRC 成果,并按企业 SRC 规范约束 AI 边界。
+	SRCMode      bool
+	SRCProfileID int64
+	// 出网方式(任务级覆盖):''=跟随全局;direct=强制直连;pool=强制走代理池。
+	ProxyMode    string
+	ProxyGroupID int64
 }
 
 // CreateTaskWithOptions creates an exploration, task, direct source relations,
@@ -208,6 +253,26 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 			return nil, err
 		}
 	}
+	// 三阶段+报告归一：空值回退默认 exploit/agent；recon 任务缺省走流水线 kind;
+	// report 阶段(AI 识别任务)同为确定性流水线形态,由 server 侧 runner 驱动。
+	switch opts.Stage {
+	case "":
+		opts.Stage = "exploit"
+	case "recon", "exploit", "post", "report":
+	default:
+		return nil, fmt.Errorf("invalid task stage %q", opts.Stage)
+	}
+	switch opts.Kind {
+	case "":
+		if opts.Stage == "recon" || opts.Stage == "report" {
+			opts.Kind = "pipeline"
+		} else {
+			opts.Kind = "agent"
+		}
+	case "agent", "pipeline":
+	default:
+		return nil, fmt.Errorf("invalid task kind %q", opts.Kind)
+	}
 	var active *int64
 	if len(opts.LLMProfileIDs) > 0 {
 		id := opts.LLMProfileIDs[0]
@@ -222,11 +287,15 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 		CompanyIDs:     append([]int64(nil), opts.CompanyIDs...),
 		TimeoutSeconds: opts.TimeoutSeconds, PlanHeartbeatSeconds: opts.PlanHeartbeatSeconds,
 		CoverageEnabled: coverageEnabled,
+		Stage:           opts.Stage, Kind: opts.Kind, Pipeline: append(json.RawMessage(nil), opts.Pipeline...),
+		StepKey: opts.StepKey, StepConfig: append(json.RawMessage(nil), opts.StepConfig...),
+		SRCMode: opts.SRCMode, SRCProfileID: opts.SRCProfileID,
+		ProxyMode: opts.ProxyMode, ProxyGroupID: opts.ProxyGroupID,
 	}
 	if err := tx.QueryRow(`
-INSERT INTO tasks(name, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled)
-VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9)
-RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
+INSERT INTO tasks(name, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled, stage, kind, pipeline, step_key, step_config, src_mode, src_profile_id, proxy_mode, proxy_group_id)
+VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NULLIF($16,0),$17,NULLIF($18,0))
+RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled, opts.Stage, opts.Kind, opts.Pipeline, opts.StepKey, opts.StepConfig, opts.SRCMode, opts.SRCProfileID, opts.ProxyMode, opts.ProxyGroupID).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
 		return nil, err
 	}
 	if err := insertTaskRelations(tx, t.ID, opts.SourceTaskIDs); err != nil {
@@ -339,12 +408,20 @@ func insertTaskLLMProfiles(tx *sql.Tx, taskID int64, profileIDs []int64) error {
 
 const taskCols = `id, COALESCE(name,''), category_id,
 COALESCE((SELECT category.name FROM task_categories category WHERE category.id=tasks.category_id),''),
-description, goal, exploration_id, status, paused, queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), first_run_at, deadline_at`
+description, goal, exploration_id, status, paused, queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), first_run_at, deadline_at, COALESCE(stage,'exploit'), COALESCE(kind,'agent'), pipeline, COALESCE(step_key,''), step_config, COALESCE(src_mode,false), COALESCE(src_profile_id,0), COALESCE(proxy_mode,''), COALESCE(proxy_group_id,0)`
 
 func scanTask(sc interface{ Scan(...any) error }) (*Task, error) {
 	var t Task
-	if err := sc.Scan(&t.ID, &t.Name, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.FirstRunAt, &t.DeadlineAt); err != nil {
+	// pipeline/step_config 可空(NULL=未配置):经 []byte 中转,空值保持 nil RawMessage。
+	var pipeline, stepConfig []byte
+	if err := sc.Scan(&t.ID, &t.Name, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.FirstRunAt, &t.DeadlineAt, &t.Stage, &t.Kind, &pipeline, &t.StepKey, &stepConfig, &t.SRCMode, &t.SRCProfileID, &t.ProxyMode, &t.ProxyGroupID); err != nil {
 		return nil, err
+	}
+	if len(pipeline) > 0 {
+		t.Pipeline = json.RawMessage(pipeline)
+	}
+	if len(stepConfig) > 0 {
+		t.StepConfig = json.RawMessage(stepConfig)
 	}
 	t.Pinned = t.PinnedAt != nil
 	return &t, nil

@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/guard"
@@ -27,8 +29,39 @@ func (s *Server) chatGuard() *guard.Guard {
 // judge runs only on tool calls that matched no rule (see intercept.Judge). It
 // resolves the configured judge profile (0 → active/default), builds a provider,
 // runs a one-shot JSON classification with an explanation for every verdict.
+//
+// Jev 前置分类器：当 jev_guard_enabled 且 jev_api_key 已配置时，Jev 在 LLM
+// 兜底之前先做快速结构化安全分类。高置信(block/allow)直接返回，低置信或
+// Jev 不可用则降级到 LLM 兜底裁判。
 func (s *Server) wireInterceptReviewer() {
-	s.m.interceptor.SetReviewer(func(ctx context.Context, profileID int64, prompt string, input intercept.ReviewInput) (intercept.Decision, error) {
+	inner := func(ctx context.Context, profileID int64, prompt string, input intercept.ReviewInput) (intercept.Decision, error) {
+		// ── Jev 前置分类 ──
+		if s.jevGuardEnabled() && s.jevAPIKey() != "" {
+			jevCtx, jevCancel := context.WithTimeout(ctx, 15*time.Second)
+			defer jevCancel()
+			verdict, jevErr := s.jevGuardReview(jevCtx, input.Tool, "", string(input.Arguments))
+			if jevErr == nil && verdict != nil {
+				switch {
+				case verdict.Action == "block":
+					log.Printf("[jev] 直接禁止: %s (confidence=%.2f)", verdict.Reason, verdict.Confidence)
+					return intercept.Decision{
+						Action:  "deny",
+						Message: fmt.Sprintf("Jev 门限禁止: %s", verdict.Reason),
+					}, nil
+				case verdict.Action == "allow" && verdict.Confidence >= 0.8:
+					log.Printf("[jev] 直接放行: %s (confidence=%.2f)", verdict.Reason, verdict.Confidence)
+					return intercept.Decision{
+						Action:  "allow",
+						Message: fmt.Sprintf("Jev 门限放行: %s", verdict.Reason),
+					}, nil
+				default:
+					// 低置信或 review → 降级到 LLM 兜底
+				}
+			}
+			// Jev 不可用或分类不确定 → 继续 LLM 兜底
+		}
+
+		// ── LLM 兜底裁判(原有逻辑) ──
 		if profileID == 0 {
 			if p, err := s.m.pg.ActiveProfile(); err == nil && p != nil {
 				profileID = p.ID
@@ -50,7 +83,8 @@ func (s *Server) wireInterceptReviewer() {
 			return intercept.Decision{ProfileID: profileID}, fmt.Errorf("模型裁决格式无效，必须包含裁决、实际操作、成功后的后果和命中规则")
 		}
 		return intercept.Decision{Action: v.Action, Message: v.Reason, ProfileID: profileID}, nil
-	})
+	}
+	s.m.interceptor.SetReviewer(inner)
 }
 
 func reviewCompletion(ctx context.Context, prov llm.Provider, prompt string, input intercept.ReviewInput) (string, error) {

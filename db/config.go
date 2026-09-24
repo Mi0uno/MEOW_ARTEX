@@ -443,6 +443,7 @@ type Agent struct {
 	Name             string `json:"name"`
 	Description      string `json:"description"`
 	Role             string `json:"role"`
+	Stage            string `json:"stage"` // 归属阶段:''=通用(跨阶段) | recon | exploit | post;阶段分组的对话按此过滤
 	Builtin          bool   `json:"builtin"`
 	Enabled          bool   `json:"enabled"`
 	LLMProfileID     *int64 `json:"llm_profile_id"`    // 绑定的 LLM 配置;nil=跟随任务/会话 pin,再回退全局激活
@@ -464,12 +465,12 @@ type Agent struct {
 	TriggerMaxParallel int    `json:"trigger_max_parallel"`
 }
 
-const agentCols = `id,key,name,COALESCE(description,''),role,builtin,enabled,COALESCE(max_turns,0),COALESCE(run_seconds,600),COALESCE(web_search,false),COALESCE(interactive_shell,false),COALESCE(wrapup_prompt,''),COALESCE(wrapup_max_turns,0),COALESCE(task_timeout_wrapup_prompt,''),COALESCE(task_timeout_wrapup_max_turns,0),COALESCE(trigger_run_mode,'serial'),COALESCE(trigger_merge_mode,'all'),COALESCE(trigger_max_parallel,5),llm_profile_id`
+const agentCols = `id,key,name,COALESCE(description,''),role,COALESCE(stage,''),builtin,enabled,COALESCE(max_turns,0),COALESCE(run_seconds,600),COALESCE(web_search,false),COALESCE(interactive_shell,false),COALESCE(wrapup_prompt,''),COALESCE(wrapup_max_turns,0),COALESCE(task_timeout_wrapup_prompt,''),COALESCE(task_timeout_wrapup_max_turns,0),COALESCE(trigger_run_mode,'serial'),COALESCE(trigger_merge_mode,'all'),COALESCE(trigger_max_parallel,5),llm_profile_id`
 
 func scanAgent(sc interface{ Scan(...any) error }) (*Agent, error) {
 	var a Agent
 	var prof sql.NullInt64 // llm_profile_id 可空:未绑定时为 NULL
-	err := sc.Scan(&a.ID, &a.Key, &a.Name, &a.Description, &a.Role, &a.Builtin, &a.Enabled, &a.MaxTurns, &a.RunSecs, &a.WebSearch, &a.InteractiveShell, &a.WrapupPrompt, &a.WrapupMaxTurns, &a.TaskTimeoutWrapupPrompt, &a.TaskTimeoutWrapupMaxTurns, &a.TriggerRunMode, &a.TriggerMergeMode, &a.TriggerMaxParallel, &prof)
+	err := sc.Scan(&a.ID, &a.Key, &a.Name, &a.Description, &a.Role, &a.Stage, &a.Builtin, &a.Enabled, &a.MaxTurns, &a.RunSecs, &a.WebSearch, &a.InteractiveShell, &a.WrapupPrompt, &a.WrapupMaxTurns, &a.TaskTimeoutWrapupPrompt, &a.TaskTimeoutWrapupMaxTurns, &a.TriggerRunMode, &a.TriggerMergeMode, &a.TriggerMaxParallel, &prof)
 	if err == nil && prof.Valid {
 		v := prof.Int64
 		a.LLMProfileID = &v
@@ -553,17 +554,30 @@ func (d *DB) AgentBindingCounts() (mcp map[int64]int, skill map[int64]int, tools
 }
 
 // CreateAgent inserts a custom (builtin=false) conversational agent with role
-// 'assistant'. Returns the new row. Callers validate key/name upstream; the DB
-// enforces key charset + uniqueness and the role check constraint.
-func (d *DB) CreateAgent(key, name, description string) (*Agent, error) {
+// 'assistant'. Returns the new row. Callers validate key/name/stage upstream; the
+// DB enforces key charset + uniqueness, the role check constraint and the stage
+// check constraint.
+func (d *DB) CreateAgent(key, name, description, stage string) (*Agent, error) {
 	a, err := scanAgent(d.QueryRow(`
-INSERT INTO agents(key, name, description, role, builtin, enabled)
-VALUES ($1, $2, NULLIF($3,''), 'assistant', false, true)
-RETURNING `+agentCols, key, name, description))
+INSERT INTO agents(key, name, description, role, stage, builtin, enabled)
+VALUES ($1, $2, NULLIF($3,''), 'assistant', $4, false, true)
+RETURNING `+agentCols, key, name, description, stage))
 	if err != nil {
 		return nil, err
 	}
 	return a, nil
+}
+
+// SetAgentStage reassigns an agent's stage (”=通用跨阶段 | recon | exploit | post | report).
+// 内置与自定义 agent 都可改;schema.sql 的内置回填只补空,不会覆盖这里的修改。
+func (d *DB) SetAgentStage(key, stage string) error {
+	switch stage {
+	case "", "recon", "exploit", "post", "report":
+	default:
+		return fmt.Errorf("stage 必须为 recon|exploit|post|report 或空")
+	}
+	_, err := d.Exec(`UPDATE agents SET stage=$2 WHERE key=$1`, key, stage)
+	return err
 }
 
 // UpdateAgentMeta updates a custom agent's display name + description. Built-in
@@ -815,7 +829,7 @@ type MCPServer struct {
 	Env       json.RawMessage `json:"env"`
 	URL       string          `json:"url,omitempty"`
 	Enabled   bool            `json:"enabled"`
-	Insecure  bool            `json:"insecure"` // http: skip TLS cert verification (self-signed servers, issue #108)
+	Insecure  bool            `json:"insecure"`        // http: skip TLS cert verification (self-signed servers, issue #108)
 	Tools     []string        `json:"tools,omitempty"` // cached tool names (mcp_tools_cache)
 }
 
