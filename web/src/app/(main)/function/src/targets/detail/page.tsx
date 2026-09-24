@@ -17,10 +17,10 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { CreateSRCTaskDialog } from "@/components/src-create-task-dialog";
 import { api } from "@/lib/api";
 import type { SRCPlatform, SRCTarget, SRCTargetLink } from "@/lib/types";
 
-import { CreateSRCTaskDialog } from "../../_components/create-task-dialog";
 import { AssetsTab } from "../_components/assets-tab";
 import { OverviewTab } from "../_components/overview-tab";
 import { RewardsTab } from "../_components/rewards-tab";

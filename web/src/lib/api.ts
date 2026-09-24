@@ -296,8 +296,12 @@ export const api = {
     post<{ ok: boolean }>("/auth/change-password", { old_password: oldPassword, new_password: newPassword }),
 
   // ---- tasks ----
-  tasks: () =>
-    get<{ tasks: Task[]; active: string }>("/tasks").then((r) => ({ tasks: arr(r.tasks), active: r.active ?? "" })),
+  // src=true 只拉 SRC 模式任务(src_mode 标记),SRC 模式任务页用。
+  tasks: (input?: { src?: boolean }) =>
+    get<{ tasks: Task[]; active: string }>(`/tasks${input?.src ? "?src=1" : ""}`).then((r) => ({
+      tasks: arr(r.tasks),
+      active: r.active ?? "",
+    })),
   task: (id: string) => get<Task>(`/tasks/${encodeURIComponent(id)}`),
   createTask: (input: {
     name?: string;

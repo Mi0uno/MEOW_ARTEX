@@ -1207,6 +1207,18 @@ func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 			list = filtered
 		}
 	}
+	// 可选 SRC 筛选(SRC 模式任务页只拉 SRC 任务):?src=1
+	// 判据是 src_mode 标记而非「有平台归属」——只给了平台的 SRC 任务同样算 SRC 任务,
+	// 用归属过滤会漏掉它们。
+	if r.URL.Query().Get("src") == "1" {
+		filtered := make([]*Task, 0, len(list))
+		for _, t := range list {
+			if t.SRCMode {
+				filtered = append(filtered, t)
+			}
+		}
+		list = filtered
+	}
 	metrics, _ := s.m.PG().TaskListMetricsAll()
 	archiveBlockers, _ := s.m.PG().TaskArchiveBlockers()
 	dtos := make([]TaskDTO, 0, len(list))

@@ -125,6 +125,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { CreateSRCTaskDialog } from "@/components/src-create-task-dialog";
 import { api } from "@/lib/api";
 import { getLocalStorageValue, setLocalStorageValue } from "@/lib/local-storage.client";
 import { type SortDirection, useStoredSortPreference } from "@/lib/sort-preference";
@@ -323,6 +324,11 @@ function TasksPageInner() {
   const searchParams = useSearchParams();
   const router = useRouter();
   const lockedStage = searchParams.get("stage");
+  // SRC 模式任务页(?src=1):只看 src_mode 任务,并把新建任务默认按 SRC 模式创建。
+  // 用 URL 而非局部 state,这样「平台批量」跳过来、刷新、后退都保持一致。
+  const srcOnly = searchParams.get("src") === "1";
+  // SRC 专属建任务对话框的开关(通用抽屉在 SRC 视图下被替换掉)。
+  const [srcCreateOpen, setSrcCreateOpen] = React.useState(false);
   // 资产主体(企业):URL 是唯一事实来源,?company=all|unassigned|<id>。
   // 缺省 = 还没选 → 渲染选择页(先进入选择资产的页面,再看该主体的任务)。
   // 「全部资产主体」与「未关联企业」在选择页顶部是固定出口——历史任务大多没有企业
@@ -510,7 +516,7 @@ function TasksPageInner() {
 
   const load = React.useCallback(() => {
     api
-      .tasks()
+      .tasks({ src: srcOnly })
       .then((r) => {
         const next = r.tasks.map((t) => (t.id === r.active ? { ...t, active: true } : t));
         const sig = JSON.stringify(next);
@@ -521,7 +527,7 @@ function TasksPageInner() {
       .catch(() => {
         // Polling is best-effort; the next interval retries automatically.
       });
-  }, []);
+  }, [srcOnly]);
 
   const loadCategories = React.useCallback(() => {
     api
@@ -854,7 +860,11 @@ function TasksPageInner() {
   // 未选资产主体时先进入选择页(先进入选择资产的页面,再看该主体下的任务)。
   // 顶部固定提供「全部资产主体」「未关联企业」——历史任务大多没有企业归属,
   // 这两个出口保证用户永远能看到全部任务,不会被筛选藏起来。
-  if (companyID === null) {
+  //
+  // 例外:SRC 模式任务页(?src=1)直接展示全部 SRC 任务,不进选择页。SRC 的归属维度是
+  // 「平台×目标」而不是企业,把企业选择做成进入条件会让用户以为 SRC 任务丢了;
+  // 侧边栏点进来就该直接看到任务列表。
+  if (companyID === null && !srcOnly) {
     const unassignedCount = tasks.filter((t) => (t.company_ids ?? []).length === 0).length;
     // 阶段锁定时在选择页标题里点明,否则用户从「信息搜集 → 任务」进来会不知道
     // 这一步是在为哪个阶段挑资产主体(阶段会经 switchCompany 原样保留)。
@@ -896,6 +906,17 @@ function TasksPageInner() {
   // (2026-09-24 实锤的回归);选择页顶部的合成行就是为此保留的固定出口。
   return (
     <Tabs value={activeTab} onValueChange={setActiveTab} className="gap-4">
+      {/* SRC 视图补一个页面标题:本页是通用任务页的锁定视图,没有标题时用户看不出
+          自己在 SRC 任务页(和「任务中心 → 任务」长得一样)。 */}
+      {srcOnly && (
+        <div className="mx-4 mt-4 lg:mx-6">
+          <h1 className="font-semibold text-xl">SRC 模式 · 任务</h1>
+          <p className="text-muted-foreground text-sm">
+            只显示 SRC 模式任务;本页「新建任务」创建的任务同样标记为 SRC,产出计入 SRC 成果。
+            要绑定平台与目标(注入授权边界)请从目标详情页的「建 SRC 任务」创建。
+          </p>
+        </div>
+      )}
       <TabsList className="mx-4 lg:mx-6">
         <TabsTrigger value="current">当前任务</TabsTrigger>
         <TabsTrigger value="archived">已归档</TabsTrigger>
@@ -939,9 +960,16 @@ function TasksPageInner() {
                 </SelectContent>
               </Select>
               {/* 资产主体快速切换:主入口是进入页的选择列表,这里保留一个下拉做快速切换。
-                  含「全部」「未关联企业」两个出口,任何时候都能看到全部任务。 */}
+                  含「全部」「未关联企业」两个出口,任何时候都能看到全部任务。
+                  SRC 视图下 companyID 为 null(没走选择页),兜底显示「全部」。 */}
               <Select
-                value={companyID === 0 ? "all" : companyID === -1 ? "unassigned" : String(companyID)}
+                value={
+                  companyID === null || companyID === 0
+                    ? "all"
+                    : companyID === -1
+                      ? "unassigned"
+                      : String(companyID)
+                }
                 onValueChange={switchCompany}
               >
                 <SelectTrigger className="w-44">
@@ -959,10 +987,13 @@ function TasksPageInner() {
                   </SelectGroup>
                 </SelectContent>
               </Select>
-              <Button variant="outline" size="sm" onClick={() => router.push("/function/tasks")}>
-                <Building2Icon className="size-4" />
-                切换资产主体
-              </Button>
+              {/* SRC 视图不显示「切换资产主体」:那会跳到不带 ?src=1 的页面,丢掉 SRC 过滤。 */}
+              {!srcOnly && (
+                <Button variant="outline" size="sm" onClick={() => router.push("/function/tasks")}>
+                  <Building2Icon className="size-4" />
+                  切换资产主体
+                </Button>
+              )}
               {!lockedStage && (
                 <Select value={stageFilter} onValueChange={(v) => setStageFilter(v as TaskStage | "all")}>
                   <SelectTrigger className="w-36">
@@ -1068,6 +1099,11 @@ function TasksPageInner() {
                     <PlusIcon /> 新建步骤任务
                   </Link>
                 </Button>
+              ) : srcOnly ? (
+                /* SRC 视图:主按钮开专属对话框(强制选齐平台×目标)。 */
+                <Button size="sm" onClick={() => setSrcCreateOpen(true)}>
+                  <PlusIcon /> 新建 SRC 任务
+                </Button>
               ) : lockedStage === "report" ? (
                 // 报告中心:识别任务由系统在模板上传/手动识别时自动创建,不提供手工新建。
                 <Button size="sm" variant="outline" asChild>
@@ -1085,6 +1121,16 @@ function TasksPageInner() {
                   // 只有具体企业(>0)才锁定到新建任务;0=全部、-1=未关联都不是真实企业 id,
                   // 传下去会把新任务错误关联到一个不存在的企业。
                   lockedCompanyID={companyID != null && companyID > 0 ? companyID : undefined}
+                />
+              )}
+              {/* SRC 专属建任务对话框:必须与上面的按钮三元链分开渲染——它不是按钮的替代品,
+                  而是按钮点击后的弹层。放进同一条三元链会与「新建 SRC 任务」按钮互斥,
+                  srcOnly 时永远先命中按钮分支,对话框分支变成死代码(实测踩过)。 */}
+              {srcOnly && (
+                <CreateSRCTaskDialog
+                  open={srcCreateOpen}
+                  onOpenChange={setSrcCreateOpen}
+                  onCreated={refreshCategoriesAndTasks}
                 />
               )}
             </div>

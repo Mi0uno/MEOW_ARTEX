@@ -14,6 +14,7 @@ import { ArrowRightIcon, PlusIcon, RocketIcon, SearchIcon, TargetIcon, Trash2Ico
 import { toast } from "sonner";
 
 import { TablePagination } from "@/components/table-pagination";
+import { CreateSRCTaskDialog } from "@/components/src-create-task-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -32,7 +33,6 @@ import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
 import type { Company, SRCPlatform, SRCTarget } from "@/lib/types";
 
-import { CreateSRCTaskDialog } from "../../_components/create-task-dialog";
 import { Field, fmtTime } from "./platform-shared";
 
 const PAGE_SIZE = 50;
