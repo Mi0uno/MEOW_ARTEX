@@ -133,6 +133,34 @@ func (s *Server) getSettingFloat(key string, def float64) float64 {
 	return f
 }
 
+// ---- 门限阈值 API ----
+
+// jevThresholdsDTO 是阈值的对外视图(附默认值,便于前端提示"恢复默认")。
+type jevThresholdsDTO struct {
+	jevThresholds
+	Defaults jevThresholds `json:"defaults"`
+}
+
+// jevGetThresholds GET /api/decision/engines/jev/thresholds
+func (s *Server) jevGetThresholds(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, 200, jevThresholdsDTO{jevThresholds: s.jevThresholds(), Defaults: defaultJevThresholds()})
+}
+
+// jevSetThresholds PUT /api/decision/engines/jev/thresholds
+// 越界值直接 400:门限被调成"永不拦截"或"全拦"都是安全事故。
+func (s *Server) jevSetThresholds(w http.ResponseWriter, r *http.Request) {
+	var req jevThresholds
+	if err := decode(r, &req); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	if err := s.SetJevThresholds(req); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	writeJSON(w, 200, jevThresholdsDTO{jevThresholds: s.jevThresholds(), Defaults: defaultJevThresholds()})
+}
+
 // ---- settings helpers ----
 
 func (s *Server) jevAPIKey() string {
