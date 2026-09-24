@@ -1,74 +1,103 @@
 "use client";
 
+// MCP 列表页:外部 MCP 工具服务器的总览与检索。
+//
+// 这一页只负责「找得到、看得懂、快速开关」:完整字段编辑、工具清单与按 Agent 的
+// 可见性授权都收在详情页(点名称进入 /system/mcp/detail?id=)。列表里保留一个
+// 快速编辑抽屉与刷新工具按钮,是为了不打断「顺手改个参数」的动线。
+
 import * as React from "react";
+
+import Link from "next/link";
+
+import { ArrowRightIcon, PencilIcon, PlusIcon, RefreshCwIcon, SearchIcon, ServerIcon, Trash2Icon } from "lucide-react";
 import { toast } from "sonner";
-import { PlusIcon, RefreshCwIcon, SearchIcon, ServerIcon, Trash2Icon } from "lucide-react";
 
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Textarea } from "@/components/ui/textarea";
-import { Badge } from "@/components/ui/badge";
-import { Switch } from "@/components/ui/switch";
-import { Checkbox } from "@/components/ui/checkbox";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { TablePagination } from "@/components/table-pagination";
-import {
-  Sheet,
-  SheetContent,
-  SheetHeader,
-  SheetTitle,
-  SheetDescription,
-} from "@/components/ui/sheet";
-import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
-import type { MCPServer, MCPTool, Agent } from "@/lib/types";
+import type { MCPServer } from "@/lib/types";
 
-type Transport = "stdio" | "http" | "sse";
-type FormState = {
-  name: string;
-  transport: Transport;
-  command: string;
-  args: string;
-  url: string;
-  env: string;
-  insecure: boolean;
-};
-const emptyForm: FormState = {
-  name: "",
-  transport: "stdio",
-  command: "",
-  args: "",
-  url: "",
-  env: "",
-  insecure: false,
-};
+import {
+  emptyMcpForm,
+  formFromServer,
+  formToPayload,
+  McpFormFields,
+  type McpFormState,
+  TRANSPORT_OPTIONS,
+  transportMeta,
+  validateMcpForm,
+} from "./_components/mcp-form";
+import { McpToolsPanel } from "./_components/mcp-tools";
+
+const PAGE_SIZE = 20;
+
+// 一行里给用户看「它到底连的是什么」:stdio 看命令+参数,远程看 URL。
+function endpointText(s: MCPServer): string {
+  if (s.transport === "stdio") {
+    // args 声明为非可选数组,但库里是 jsonb 列,脏数据可能是 null——用 Array.isArray 兜住。
+    const args = Array.isArray(s.args) ? s.args : [];
+    return [s.command, ...args].filter(Boolean).join(" ");
+  }
+  return s.url ?? "";
+}
 
 export default function MCPPage() {
   const [servers, setServers] = React.useState<MCPServer[]>([]);
-  const [agents, setAgents] = React.useState<Agent[]>([]);
-  const [visibility, setVisibility] = React.useState<Record<number, string[]>>({});
+  const [loading, setLoading] = React.useState(true);
 
-  const [open, setOpen] = React.useState(false);
-  const [editing, setEditing] = React.useState<MCPServer | null>(null); // null = add mode
-  const [tab, setTab] = React.useState<"config" | "tools">("config");
-  const [form, setForm] = React.useState<FormState>(emptyForm);
-  const [saving, setSaving] = React.useState(false);
-  const [tools, setTools] = React.useState<MCPTool[]>([]);
-  const [toolsLoading, setToolsLoading] = React.useState(false);
-  const [refreshing, setRefreshing] = React.useState(false);
-  // 列表页标准能力:搜索 / 状态筛选 / 分页(服务器数量有限,客户端处理即可)。
+  // 分类器(启用状态)与筛选器(传输方式)是两个正交维度:
+  // 分类器给出「有几台在跑」的整体分布,筛选器再按接入方式收窄。
+  const [statusKind, setStatusKind] = React.useState("all");
+  const [transportFilter, setTransportFilter] = React.useState("all");
   const [query, setQuery] = React.useState("");
-  const [statusFilter, setStatusFilter] = React.useState("all");
   const [page, setPage] = React.useState(1);
-  const [pageSize, setPageSize] = React.useState(12);
+  const [pageSize, setPageSize] = React.useState(PAGE_SIZE);
+
+  const [sheetOpen, setSheetOpen] = React.useState(false);
+  const [editing, setEditing] = React.useState<MCPServer | null>(null); // null = 新建
+  const [sheetTab, setSheetTab] = React.useState("config");
+  const [form, setForm] = React.useState<McpFormState>(emptyMcpForm);
+  const [saving, setSaving] = React.useState(false);
+  const [refreshingId, setRefreshingId] = React.useState<number | null>(null);
+
+  const load = React.useCallback(() => {
+    setLoading(true);
+    api
+      .mcpServers()
+      .then(setServers)
+      .catch((e) => toast.error(`加载 MCP 服务器失败:${(e as Error).message}`))
+      .finally(() => setLoading(false));
+  }, []);
+
+  React.useEffect(() => {
+    load();
+  }, [load]);
+
+  // 计数必须来自未过滤全量:否则选中「已启用」后「已停用」的计数会归零,
+  // 用户就再也切不回去了。
+  const counts = React.useMemo(
+    () => ({
+      all: servers.length,
+      enabled: servers.filter((s) => s.enabled).length,
+      disabled: servers.filter((s) => !s.enabled).length,
+    }),
+    [servers],
+  );
 
   const filtered = React.useMemo(() => {
     const q = query.trim().toLowerCase();
     return servers.filter((s) => {
-      if (statusFilter === "enabled" && !s.enabled) return false;
-      if (statusFilter === "disabled" && s.enabled) return false;
+      if (statusKind === "enabled" && !s.enabled) return false;
+      if (statusKind === "disabled" && s.enabled) return false;
+      if (transportFilter !== "all" && s.transport !== transportFilter) return false;
       if (!q) return true;
       return (
         s.name.toLowerCase().includes(q) ||
@@ -76,476 +105,331 @@ export default function MCPPage() {
         (s.url ?? "").toLowerCase().includes(q)
       );
     });
-  }, [servers, query, statusFilter]);
+  }, [servers, query, statusKind, transportFilter]);
 
-  const paged = React.useMemo(
-    () => filtered.slice((page - 1) * pageSize, page * pageSize),
-    [filtered, page, pageSize],
-  );
+  // 分页按客户端切片:服务器数量有限,整表拉回来比来回请求更省。
+  const paged = React.useMemo(() => filtered.slice((page - 1) * pageSize, page * pageSize), [filtered, page, pageSize]);
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: filters intentionally reset pagination.
-  React.useEffect(() => {
-    setPage(1);
-  }, [query, statusFilter]);
-
-  const load = React.useCallback(() => {
-    api.agents().then(setAgents).catch(() => {});
-    api
-      .mcpServers()
-      .then((ss) => {
-        setServers(ss);
-        ss.forEach((s) =>
-          api
-            .resourceVisibility("mcp", s.id)
-            .then((ids) => setVisibility((v) => ({ ...v, [s.id]: ids })))
-            .catch(() => {}),
-        );
-      })
-      .catch(() => {});
-  }, []);
-  React.useEffect(() => {
-    load();
-  }, [load]);
-
-  function setF(patch: Partial<FormState>) {
-    setForm((f) => ({ ...f, ...patch }));
-  }
-
-  function parseEnv(text: string): Record<string, string> {
-    const out: Record<string, string> = {};
-    for (const line of text.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      const idx = trimmed.indexOf("=");
-      if (idx > 0) {
-        const key = trimmed.slice(0, idx).trim();
-        if (key) out[key] = trimmed.slice(idx + 1).trim();
-      }
-    }
-    return out;
-  }
-  function envToText(env: Record<string, string> | undefined): string {
-    return Object.entries(env ?? {})
-      .map(([k, v]) => `${k}=${v}`)
-      .join("\n");
-  }
+  const search = () => setPage(1);
 
   function openAdd() {
     setEditing(null);
-    setForm(emptyForm);
-    setTools([]);
-    setTab("config");
-    setOpen(true);
+    setForm(emptyMcpForm);
+    setSheetTab("config");
+    setSheetOpen(true);
   }
 
   function openEdit(s: MCPServer) {
     setEditing(s);
-    setForm({
-      name: s.name,
-      transport: s.transport,
-      command: s.command ?? "",
-      args: (s.args ?? []).join(" "),
-      url: s.url ?? "",
-      env: envToText(s.env),
-      insecure: s.insecure ?? false,
-    });
-    setTab("config");
-    setOpen(true);
-    loadTools(s.id);
-  }
-
-  async function loadTools(id: number) {
-    setToolsLoading(true);
-    try {
-      setTools(await api.mcpTools(id));
-    } catch {
-      setTools([]);
-    } finally {
-      setToolsLoading(false);
-    }
+    setForm(formFromServer(s));
+    setSheetTab("config");
+    setSheetOpen(true);
   }
 
   async function saveForm() {
-    if (!form.name.trim()) {
-      toast.error("请填写名称");
-      return;
-    }
-    if (form.transport === "stdio" && !form.command.trim()) {
-      toast.error("请填写命令");
-      return;
-    }
-    if (form.transport !== "stdio" && !form.url.trim()) {
-      toast.error("请填写远程 URL");
+    const invalid = validateMcpForm(form);
+    if (invalid) {
+      toast.error(invalid);
       return;
     }
     setSaving(true);
     try {
-      const base =
-        form.transport !== "stdio"
-          ? {
-              transport: form.transport,
-              url: form.url.trim(),
-              command: "",
-              args: [] as string[],
-              env: parseEnv(form.env), // 远程模式下 env 即请求头
-              insecure: form.insecure,
-            }
-          : {
-              transport: "stdio" as const,
-              command: form.command.trim(),
-              args: form.args.trim() ? form.args.trim().split(/\s+/) : [],
-              env: parseEnv(form.env),
-              insecure: false,
-            };
-      await api.saveMcpServer({
-        ...(editing ? { id: editing.id } : {}),
-        name: form.name.trim(),
-        enabled: editing ? editing.enabled : true,
-        ...base,
-      });
+      await api.saveMcpServer(formToPayload(form, editing?.id));
       toast.success(editing ? "已保存" : "已添加 MCP 服务器");
-      if (!editing) setOpen(false);
+      setSheetOpen(false);
       load();
     } catch (e) {
-      toast.error("保存失败：" + (e as Error).message);
+      toast.error(`保存失败:${(e as Error).message}`);
     } finally {
       setSaving(false);
-    }
-  }
-
-  async function refreshTools() {
-    if (!editing) return;
-    setRefreshing(true);
-    try {
-      const t = await api.refreshMcpServer(editing.id);
-      setTools(t);
-      toast.success(`发现 ${t.length} 个工具`);
-      load();
-    } catch (e) {
-      toast.error("刷新失败：" + (e as Error).message);
-    } finally {
-      setRefreshing(false);
-    }
-  }
-
-  async function removeServer(s: MCPServer) {
-    try {
-      await api.deleteMcpServer(s.id);
-      toast.success(`已删除：${s.name}`);
-      setOpen(false);
-      load();
-    } catch (e) {
-      toast.error("删除失败：" + (e as Error).message);
     }
   }
 
   async function toggleEnabled(s: MCPServer) {
     try {
       await api.saveMcpServer({ ...s, enabled: !s.enabled });
+      toast.success(s.enabled ? `已停用:${s.name}` : `已启用:${s.name}`);
       load();
     } catch (e) {
-      toast.error("操作失败：" + (e as Error).message);
+      toast.error(`操作失败:${(e as Error).message}`);
     }
   }
 
-  async function toggleVisibility(serverId: number, agentId: string, agentName: string) {
-    const on = (visibility[serverId] ?? []).includes(agentId);
+  // 刷新工具列表:重新连一次服务器并回写缓存,失败原因(连不上/命令写错)原样透出。
+  async function refreshTools(s: MCPServer) {
+    setRefreshingId(s.id);
     try {
-      await api.toggleVisibility(agentId, "mcp", serverId, !on);
-      toast.success(`${on ? "取消" : "授予"}「${agentName}」可见`);
+      const t = await api.refreshMcpServer(s.id);
+      toast.success(`「${s.name}」发现 ${t.length} 个工具`);
       load();
     } catch (e) {
-      toast.error("操作失败：" + (e as Error).message);
+      toast.error(`刷新失败:${(e as Error).message}`);
+    } finally {
+      setRefreshingId(null);
     }
   }
 
-  function renderForm() {
-    return (
-      <div className="grid gap-4 py-4">
-        <div className="grid gap-2">
-          <Label>传输方式</Label>
-          <div className="flex gap-2">
-            <Button
-              type="button"
-              variant={form.transport === "stdio" ? "default" : "outline"}
-              onClick={() => setF({ transport: "stdio" })}
-            >
-              stdio（本地）
-            </Button>
-            <Button
-              type="button"
-              variant={form.transport === "http" ? "default" : "outline"}
-              onClick={() => setF({ transport: "http" })}
-            >
-              http（远程）
-            </Button>
-            <Button
-              type="button"
-              variant={form.transport === "sse" ? "default" : "outline"}
-              onClick={() => setF({ transport: "sse" })}
-            >
-              sse（旧版）
-            </Button>
-          </div>
-        </div>
-        <div className="grid gap-2">
-          <Label htmlFor="m-name">名称</Label>
-          <Input
-            id="m-name"
-            placeholder="filesystem"
-            value={form.name}
-            onChange={(e) => setF({ name: e.target.value })}
-          />
-        </div>
-        {form.transport === "stdio" ? (
-          <>
-            <div className="grid gap-2">
-              <Label htmlFor="m-cmd">命令</Label>
-              <Input
-                id="m-cmd"
-                className="font-mono"
-                placeholder="npx"
-                value={form.command}
-                onChange={(e) => setF({ command: e.target.value })}
-              />
-            </div>
-            <div className="grid gap-2">
-              <Label htmlFor="m-args">参数（空格分隔）</Label>
-              <Input
-                id="m-args"
-                className="font-mono"
-                placeholder="-y @modelcontextprotocol/server-filesystem /data"
-                value={form.args}
-                onChange={(e) => setF({ args: e.target.value })}
-              />
-            </div>
-          </>
-        ) : (
-          <div className="grid gap-2">
-            <Label htmlFor="m-url">远程 URL</Label>
-            <Input
-              id="m-url"
-              className="font-mono"
-              placeholder="https://mcp.example.com/mcp"
-              value={form.url}
-              onChange={(e) => setF({ url: e.target.value })}
-            />
-            <label className="flex items-center gap-2 text-sm">
-              <Checkbox
-                checked={form.insecure}
-                onCheckedChange={(v) => setF({ insecure: v === true })}
-              />
-              跳过 TLS 证书校验（自签证书）
-            </label>
-          </div>
-        )}
-        <div className="grid gap-2">
-          <Label htmlFor="m-env">
-            {form.transport !== "stdio"
-              ? "请求头（每行 KEY=VALUE，如 Authorization=Bearer xxx）"
-              : "环境变量（每行 KEY=VALUE）"}
-          </Label>
-          <Textarea
-            id="m-env"
-            className="font-mono"
-            placeholder={
-              form.transport !== "stdio" ? "Authorization=Bearer xxxx" : "API_KEY=xxxx\nFOO=bar"
-            }
-            value={form.env}
-            onChange={(e) => setF({ env: e.target.value })}
-          />
-        </div>
-      </div>
-    );
+  async function removeServer(s: MCPServer) {
+    if (!window.confirm(`删除 MCP 服务器「${s.name}」?该服务器的工具与按 Agent 的授权一并移除,不可恢复。`)) return;
+    try {
+      await api.deleteMcpServer(s.id);
+      toast.success(`已删除:${s.name}`);
+      load();
+    } catch (e) {
+      toast.error(`删除失败:${(e as Error).message}`);
+    }
   }
 
-  function renderTools() {
-    return (
-      <div className="flex flex-col gap-3 py-4">
-        <div className="flex items-center justify-between">
-          <span className="text-muted-foreground text-sm">{tools.length} 个工具</span>
-          <Button size="sm" variant="outline" disabled={refreshing} onClick={refreshTools}>
-            <RefreshCwIcon className={refreshing ? "animate-spin" : ""} /> 刷新
-          </Button>
-        </div>
-        {toolsLoading ? (
-          <p className="text-muted-foreground text-sm">加载中…</p>
-        ) : tools.length === 0 ? (
-          <p className="text-muted-foreground text-sm">尚未发现工具，点击刷新重新获取。</p>
-        ) : (
-          <div className="flex flex-col divide-y">
-            {tools.map((t) => (
-              <div key={t.name} className="py-2.5">
-                <code className="font-mono text-sm">{t.name}</code>
-                {t.description && (
-                  <p className="text-muted-foreground mt-0.5 text-xs leading-relaxed">
-                    {t.description}
-                  </p>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
+  let body: React.ReactNode;
+  if (loading && servers.length === 0) {
+    body = <p className="text-muted-foreground py-16 text-center text-sm">加载中…</p>;
+  } else if (servers.length === 0) {
+    body = (
+      <div className="text-muted-foreground flex flex-col items-center gap-2 py-16 text-center text-sm">
+        <ServerIcon className="size-8 opacity-40" />
+        <span>还没有 MCP 服务器。点右上角「新建 MCP」接入本地 stdio 或远程 HTTP 服务器。</span>
       </div>
     );
-  }
-
-  return (
-    <div className="flex flex-1 flex-col gap-4 md:gap-6">
-      <div>
-        <h1 className="text-xl font-semibold tracking-tight">MCP</h1>
-        <p className="text-muted-foreground text-sm">外部 MCP 工具服务器 · 按 Agent 授权可见</p>
+  } else if (filtered.length === 0) {
+    body = (
+      <div className="text-muted-foreground flex flex-col items-center gap-2 py-16 text-center text-sm">
+        <ServerIcon className="size-8 opacity-40" />
+        <span>没有匹配的 MCP 服务器</span>
       </div>
-
-      <div className="flex flex-wrap items-center gap-2">
-        <div className="relative w-full sm:max-w-xs">
-          <SearchIcon className="text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2" />
-          <Input
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="搜索名称 / 命令 / URL"
-            className="pl-8"
-          />
-        </div>
-        <Select value={statusFilter} onValueChange={setStatusFilter}>
-          <SelectTrigger className="w-32">
-            <SelectValue placeholder="状态" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectGroup>
-              <SelectItem value="all">全部状态</SelectItem>
-              <SelectItem value="enabled">已启用</SelectItem>
-              <SelectItem value="disabled">已停用</SelectItem>
-            </SelectGroup>
-          </SelectContent>
-        </Select>
-        <span className="text-muted-foreground ml-auto text-xs tabular-nums">
-          {filtered.length}/{servers.length} 个
-        </span>
-      </div>
-
-      {filtered.length === 0 && servers.length > 0 ? (
-        <p className="text-muted-foreground py-12 text-center text-sm">没有匹配的 MCP 服务器</p>
-      ) : (
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          <button
-            type="button"
-            onClick={openAdd}
-            className="text-foreground/70 border-foreground/70 hover:bg-muted/60 hover:shadow-sm flex min-h-[116px] flex-col items-center justify-center gap-2 rounded-xl border border-dashed transition"
-          >
-            <PlusIcon className="size-6" />
-            <span className="text-sm">添加 MCP</span>
-          </button>
-
-          {paged.map((s) => (
-          <Card
-            key={s.id}
-            onClick={() => openEdit(s)}
-            className="hover:border-primary/60 cursor-pointer gap-3 transition hover:shadow-sm"
-          >
-            <CardHeader>
-              <div className="flex items-center gap-2">
-                <ServerIcon className="text-muted-foreground size-4 shrink-0" />
-                <CardTitle className="truncate text-base">{s.name}</CardTitle>
-                <Badge variant="outline" className="uppercase">
-                  {s.transport}
-                </Badge>
-                <div className="ml-auto flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
-                  <Switch
-                    checked={s.enabled}
-                    onCheckedChange={() => toggleEnabled(s)}
-                    aria-label="启用"
-                  />
-                  <Button
-                    size="icon"
-                    variant="outline"
-                    aria-label="删除"
-                    onClick={() => removeServer(s)}
-                  >
-                    <Trash2Icon className="text-destructive" />
-                  </Button>
-                </div>
-              </div>
-            </CardHeader>
-            <CardContent className="grid gap-3">
-              <p className="text-muted-foreground text-sm">
-                {s.tools && s.tools.length > 0 ? `${s.tools.length} 个工具` : "尚未发现工具"}
-              </p>
-              <div className="grid gap-2" onClick={(e) => e.stopPropagation()}>
-                <span className="text-muted-foreground text-xs">可见性（按 Agent 授权）</span>
-                <div className="flex flex-wrap gap-x-4 gap-y-2">
-                  {agents.map((a) => (
-                    <label key={a.key} className="flex items-center gap-2 text-sm">
-                      <Checkbox
-                        checked={(visibility[s.id] ?? []).includes(a.id)}
-                        onCheckedChange={() => toggleVisibility(s.id, a.id, a.name)}
-                      />
-                      {a.name}
-                    </label>
-                  ))}
-                </div>
-              </div>
-            </CardContent>
-          </Card>
-        ))}
-        </div>
-      )}
-
-      {filtered.length > 0 && (
+    );
+  } else {
+    body = (
+      <>
+        <Table className="table-fixed">
+          <TableHeader>
+            <TableRow className="hover:bg-transparent">
+              {/* 名称列不设宽度:table-fixed 下自动吃掉余量(设 w-full 会挤掉后面的列)。
+                  其余固定列宽度之和 608px 明显小于 1280 视口下的内容区(~897px),
+                  名称列仍有 ~289px 可读宽度。操作列按 4 个 icon-xs(24px)+间距给
+                  w-32(128px,扣掉单元格 p-2 后 112px ≥ 102px),w-20 会撑出横向滚动条。 */}
+              <TableHead>名称</TableHead>
+              <TableHead className="w-24">传输方式</TableHead>
+              <TableHead className="w-56">命令 / URL</TableHead>
+              <TableHead className="w-20">工具数</TableHead>
+              <TableHead className="w-20">启用状态</TableHead>
+              <TableHead className="w-32">操作</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {paged.map((s) => {
+              const tm = transportMeta(s.transport);
+              const endpoint = endpointText(s);
+              const toolCount = s.tools?.length ?? 0;
+              return (
+                <TableRow key={s.id}>
+                  <TableCell className="min-w-0">
+                    <Link
+                      href={`/system/mcp/detail?id=${s.id}`}
+                      className="block w-full truncate text-left font-medium hover:underline"
+                      title={s.name}
+                    >
+                      {s.name}
+                    </Link>
+                  </TableCell>
+                  <TableCell>
+                    <Badge variant="outline" className={tm.badgeClass}>
+                      {tm.label}
+                    </Badge>
+                  </TableCell>
+                  <TableCell className="min-w-0">
+                    <span
+                      className="text-muted-foreground block truncate font-mono text-xs"
+                      title={endpoint || undefined}
+                    >
+                      {endpoint || "—"}
+                    </span>
+                  </TableCell>
+                  <TableCell className="tabular-nums">
+                    {toolCount > 0 ? toolCount : <span className="text-muted-foreground">未发现</span>}
+                  </TableCell>
+                  <TableCell>
+                    {/* 徽标本身就是开关:原来卡片上的 Switch 一键启停不能因为改成表格而丢掉。 */}
+                    <button type="button" onClick={() => void toggleEnabled(s)} title="点击启用 / 停用">
+                      <Badge
+                        variant="outline"
+                        className={
+                          s.enabled
+                            ? "bg-emerald-500/15 text-emerald-600 border-emerald-500/30"
+                            : "bg-muted text-muted-foreground"
+                        }
+                      >
+                        {s.enabled ? "启用" : "停用"}
+                      </Badge>
+                    </button>
+                  </TableCell>
+                  <TableCell>
+                    <div className="flex items-center gap-0.5">
+                      <Button variant="ghost" size="icon-xs" onClick={() => openEdit(s)} title="快速编辑">
+                        <PencilIcon className="size-3.5" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        disabled={refreshingId === s.id}
+                        onClick={() => void refreshTools(s)}
+                        title="刷新工具列表"
+                      >
+                        <RefreshCwIcon className={`size-3.5 ${refreshingId === s.id ? "animate-spin" : ""}`} />
+                      </Button>
+                      <Button variant="ghost" size="icon-xs" onClick={() => void removeServer(s)} title="删除">
+                        <Trash2Icon className="text-muted-foreground size-3.5" />
+                      </Button>
+                      <Button variant="ghost" size="icon-xs" asChild title="进入详情">
+                        <Link href={`/system/mcp/detail?id=${s.id}`} aria-label="进入详情">
+                          <ArrowRightIcon className="size-3.5" />
+                        </Link>
+                      </Button>
+                    </div>
+                  </TableCell>
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
         <TablePagination
           page={page}
           pageSize={pageSize}
           total={filtered.length}
           onPageChange={setPage}
-          onPageSizeChange={(s) => {
+          onPageSizeChange={(size) => {
             setPage(1);
-            setPageSize(s);
+            setPageSize(size);
           }}
-          pageSizeOptions={[12, 24, 48]}
         />
-      )}
+      </>
+    );
+  }
 
-      <Sheet open={open} onOpenChange={setOpen}>
-        <SheetContent
-          side="right"
-          className="w-full data-[side=right]:sm:max-w-lg"
-        >
+  return (
+    <div className="flex flex-1 flex-col gap-4 md:gap-6">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h1 className="font-semibold text-xl">MCP</h1>
+          <p className="text-muted-foreground text-sm">外部 MCP 工具服务器 · 按 Agent 授权可见</p>
+        </div>
+        <Button size="sm" onClick={openAdd}>
+          <PlusIcon className="size-4" />
+          新建 MCP
+        </Button>
+      </div>
+
+      <Card>
+        <CardContent className="px-0 pt-4">
+          <div className="flex flex-wrap items-center gap-2 px-4 pb-3 lg:px-6">
+            <div className="relative w-full sm:max-w-xs">
+              <SearchIcon className="text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2" />
+              <Input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && search()}
+                placeholder="搜索名称 / 命令 / URL"
+                className="pl-8"
+              />
+            </div>
+            <Button variant="outline" size="sm" onClick={search}>
+              搜索
+            </Button>
+            <Select
+              value={transportFilter}
+              onValueChange={(v) => {
+                setPage(1);
+                setTransportFilter(v);
+              }}
+            >
+              <SelectTrigger className="w-32">
+                <SelectValue placeholder="传输方式" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectItem value="all">全部传输方式</SelectItem>
+                  {TRANSPORT_OPTIONS.map((t) => (
+                    <SelectItem key={t.value} value={t.value}>
+                      {t.value}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+            <Tabs
+              value={statusKind}
+              onValueChange={(v) => {
+                setPage(1);
+                setStatusKind(v);
+              }}
+            >
+              <TabsList>
+                <TabsTrigger value="all">全部 {counts.all}</TabsTrigger>
+                <TabsTrigger value="enabled">已启用 {counts.enabled}</TabsTrigger>
+                <TabsTrigger value="disabled">已停用 {counts.disabled}</TabsTrigger>
+              </TabsList>
+            </Tabs>
+            <span className="text-muted-foreground ml-auto text-xs tabular-nums">
+              {query || transportFilter !== "all" || statusKind !== "all" ? `命中 ${filtered.length} / ` : ""}共{" "}
+              {counts.all} 个
+            </span>
+          </div>
+
+          {body}
+        </CardContent>
+      </Card>
+
+      <Sheet
+        open={sheetOpen}
+        onOpenChange={(o) => {
+          setSheetOpen(o);
+          if (!o) setEditing(null);
+        }}
+      >
+        <SheetContent side="right" className="w-full data-[side=right]:sm:max-w-lg">
           <SheetHeader>
-            <SheetTitle>{editing ? editing.name : "添加 MCP 服务器"}</SheetTitle>
+            <SheetTitle>{editing ? editing.name : "新建 MCP 服务器"}</SheetTitle>
             <SheetDescription>
-              stdio（本地起进程）或 http（远程 Streamable HTTP）
+              stdio（本地起进程）或 http（远程 Streamable HTTP）;完整编辑与工具清单在详情页。
             </SheetDescription>
           </SheetHeader>
 
           {editing ? (
-            <Tabs
-              value={tab}
-              onValueChange={(v) => setTab(v as "config" | "tools")}
-              className="flex min-h-0 flex-1 flex-col px-4"
-            >
+            <Tabs value={sheetTab} onValueChange={setSheetTab} className="flex min-h-0 flex-1 flex-col px-4">
               <TabsList>
                 <TabsTrigger value="config">配置</TabsTrigger>
-                <TabsTrigger value="tools">
-                  工具列表{tools.length ? `（${tools.length}）` : ""}
-                </TabsTrigger>
+                <TabsTrigger value="tools">工具列表</TabsTrigger>
               </TabsList>
               <TabsContent value="config" className="min-h-0 flex-1 overflow-y-auto">
-                {renderForm()}
+                <div className="py-4">
+                  <McpFormFields
+                    form={form}
+                    onPatch={(patch) => setForm((f) => ({ ...f, ...patch }))}
+                    idPrefix="mcp-sheet"
+                  />
+                </div>
                 <div className="flex gap-2 pt-2 pb-6">
-                  <Button onClick={saveForm} disabled={saving}>
+                  <Button onClick={() => void saveForm()} disabled={saving}>
                     保存
                   </Button>
                 </div>
               </TabsContent>
               <TabsContent value="tools" className="min-h-0 flex-1 overflow-y-auto">
-                {renderTools()}
+                <div className="py-4">
+                  <McpToolsPanel serverId={editing.id} serverName={editing.name} onRefreshed={load} />
+                </div>
               </TabsContent>
             </Tabs>
           ) : (
             <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-4">
-              {renderForm()}
+              <div className="py-4">
+                <McpFormFields
+                  form={form}
+                  onPatch={(patch) => setForm((f) => ({ ...f, ...patch }))}
+                  idPrefix="mcp-sheet"
+                />
+              </div>
               <div className="pt-2 pb-6">
-                <Button onClick={saveForm} disabled={saving}>
+                <Button onClick={() => void saveForm()} disabled={saving}>
                   <PlusIcon /> 添加
                 </Button>
               </div>

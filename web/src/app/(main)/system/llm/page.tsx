@@ -1,916 +1,68 @@
 "use client";
 
+// LLM:全 Agent 共享的模型配置列表。
+//
+// 这一页只做「找到某条配置」与轻量操作(设为激活 / 快速改 / 删除);每条配置的完整
+// 编辑(拉模型列表、代理、思考参数、重试覆盖、运行时熔断状态)收在详情页(点名称进入)。
+// 轮询(故障转移)是全局状态而非单条属性,所以那个抽屉留在这一页。
+
 import * as React from "react";
 
-import {
-  Loader2Icon,
-  PlugZapIcon,
-  PlusIcon,
-  RefreshCwIcon,
-  RotateCcwIcon,
-  SaveIcon,
-  SearchIcon,
-  StarIcon,
-  Trash2Icon,
-  ZapIcon,
-} from "lucide-react";
+import Link from "next/link";
+
+import { ArrowRightIcon, PencilIcon, PlusIcon, SearchIcon, StarIcon, Trash2Icon, ZapIcon } from "lucide-react";
 import { toast } from "sonner";
 
+import { TablePagination } from "@/components/table-pagination";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import {
-  Select,
-  SelectContent,
-  SelectGroup,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { TablePagination } from "@/components/table-pagination";
-import { Separator } from "@/components/ui/separator";
-import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
-import { Switch } from "@/components/ui/switch";
+import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
-import type { LLMPoolMember, LLMPoolStatus, LLMProfile, LLMRetryOverride } from "@/lib/types";
+import type { LLMPoolMember, LLMPoolStatus, LLMProfile } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
-import { ProfileRetryFields, RetryPolicyPanel, ZERO_OVERRIDE } from "./_components/retry";
+import {
+  contextWindowIsDefault,
+  contextWindowText,
+  FORMAT_LABEL_LONG,
+  FORMAT_LABEL_SHORT,
+  formatBadgeClass,
+  healthOf,
+  isTripped,
+  LLM_FORMATS,
+} from "./_components/llm-shared";
+import { PoolSheet } from "./_components/pool-sheet";
+import { ProfileSheet } from "./_components/profile-sheet";
+import { RetryPolicyPanel } from "./_components/retry";
 
-// 思考开关(thinking.type)与思考强度(reasoning_effort)是两个【互相独立】的字段，
-// 各自单独设置——有些接口没有 thinking 字段、只靠强度参数就能激活思考，故需解耦。
-// 存库空字符串 = 该字段【不发送】；Radix Select 不接受空 value，故 UI 用 "none"
-// 哨兵表示不发送，存取时与 "" 互转（NONE / fromStore / toStore）。
-const NONE = "none";
-const fromStore = (v?: string) => (v ? v : NONE);
-const toStore = (v: string) => (v === NONE ? "" : v);
-const THINKING_TYPES: { value: string; label: string }[] = [
-  { value: NONE, label: "不发送（默认）" },
-  { value: "disabled", label: "关闭" },
-  { value: "enabled", label: "开启" },
+const PAGE_SIZE = 20;
+
+/** 状态筛选。熔断状态依赖轮询数据，轮询关着时不会有熔断记录。 */
+const STATUS_OPTIONS = [
+  { value: "all", label: "全部状态" },
+  { value: "active", label: "已激活" },
+  { value: "tripped", label: "熔断中" },
 ];
-// 输出上限用哪个请求字段名（仅 openai 格式有意义）。NONE ↔ "" 走同一套哨兵转换。
-const MAX_TOKENS_FIELDS: { value: string; label: string }[] = [
-  { value: NONE, label: "max_tokens（默认）" },
-  { value: "max_completion_tokens", label: "max_completion_tokens" },
-];
-// 另外两种格式各自定死了字段名，选项对它们无意义，说明文案里直接讲清楚。
-const MAX_TOKENS_FIELD_HINTS: Record<string, string> = {
-  openai:
-    "上限发哪个键。max_tokens 是默认，绝大多数兼容网关只认它；OpenAI 官方推理模型（o 系列 / GPT-5）反过来只认 max_completion_tokens，收到 max_tokens 会直接报 unsupported_parameter。",
-  anthropic: "仅 openai 格式可选。Anthropic 的字段名固定为 max_tokens。",
-  "openai-responses": "仅 openai 格式可选。Responses API 的字段名固定为 max_output_tokens。",
-};
-// 按 format 的 Base URL 占位与常用端点预设(一键填充)。
-// 注意契约差异:anthropic 的 base 不带 /v1(SDK 自己拼 /v1/messages);
-// openai / openai-responses 的 base 带 /v1(SDK 拼 /chat/completions 或 /responses)。
-const BASE_URL_PRESETS: Record<
-  string,
-  { placeholder: string; presets: { label: string; url: string }[] }
-> = {
-  anthropic: {
-    placeholder: "留空 = 官方 https://api.anthropic.com（不带 /v1）",
-    presets: [
-      { label: "官方 Anthropic", url: "" },
-      { label: "网关转发(Gateway)", url: "https://your-gateway.example.com/anthropic" },
-    ],
-  },
-  openai: {
-    placeholder: "留空 = 官方 https://api.openai.com/v1；兼容网关一般填到 /v1",
-    presets: [
-      { label: "官方 OpenAI", url: "" },
-      { label: "Ollama", url: "http://127.0.0.1:11434/v1" },
-      { label: "vLLM", url: "http://127.0.0.1:8000/v1" },
-      { label: "LM Studio", url: "http://127.0.0.1:1234/v1" },
-      { label: "DeepSeek", url: "https://api.deepseek.com/v1" },
-      { label: "Gemini 兼容", url: "https://generativelanguage.googleapis.com/v1beta/openai" },
-      { label: "one-api/new-api", url: "http://127.0.0.1:3000/v1" },
-    ],
-  },
-  "openai-responses": {
-    placeholder: "留空 = 官方 https://api.openai.com/v1",
-    presets: [{ label: "官方 OpenAI", url: "" }],
-  },
-};
-
-const EFFORT_LEVELS: { value: string; label: string }[] = [
-  { value: NONE, label: "不发送（默认）" },
-  { value: "low", label: "low" },  { value: "medium", label: "medium" },
-  { value: "high", label: "high" },
-  { value: "xhigh", label: "xhigh" },
-  { value: "max", label: "max" },
-];
-
-function cooldownText(secs: number) {
-  if (secs <= 0) return "";
-  if (secs < 60) return `${secs}s`;
-  return `${Math.ceil(secs / 60)}min`;
-}
-
-// 一个配置在卡片上显示的「是否正常」。没填 Key 的配置根本发不出请求，比熔断更该先说；
-// 其余状态来自轮询的熔断记录（轮询关着时不会产生新记录，此时「正常」= 没有已知故障）。
-type Health = { label: string; cls: string; hint?: string };
-function healthOf(p: LLMProfile, m?: LLMPoolMember): Health {
-  if (!p.api_key_hint) {
-    return {
-      label: "未配置 Key",
-      cls: "border-muted-foreground/40 text-muted-foreground",
-      hint: "未填 API Key，无法调用",
-    };
-  }
-  if (m?.state === "tripped") {
-    return {
-      label: m.cooldown_secs > 0 ? `已熔断 · ${cooldownText(m.cooldown_secs)}` : "已熔断",
-      cls: "border-destructive/50 text-destructive",
-      hint: m.last_error,
-    };
-  }
-  if (m?.state === "degraded") {
-    return {
-      label: `异常 · 失败 ${m.fails} 次`,
-      cls: "border-amber-500/50 text-amber-600 dark:text-amber-400",
-      hint: m.last_error,
-    };
-  }
-  return { label: "正常", cls: "border-emerald-500/50 text-emerald-600 dark:text-emerald-400" };
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 轮询配置抽屉
-// ─────────────────────────────────────────────────────────────────────────────
-
-function PoolSheet({
-  open,
-  onOpenChange,
-  pool,
-  onReload,
-}: {
-  open: boolean;
-  onOpenChange: (o: boolean) => void;
-  pool: LLMPoolStatus | null;
-  onReload: () => Promise<void>;
-}) {
-  const [busy, setBusy] = React.useState(false);
-
-  // 冷却倒计时是后端算出的剩余秒数——抽屉开着且有配置不正常时才定时拉，让它走起来。
-  React.useEffect(() => {
-    if (!open || !pool?.enabled || !pool.chain.some((m) => m.state !== "ok")) return;
-    const t = setInterval(() => void onReload(), 10_000);
-    return () => clearInterval(t);
-  }, [open, pool, onReload]);
-
-  async function toggle(patch: { llm_pool_enabled?: boolean; llm_pool_bind_fallback?: boolean }) {
-    if (busy) return;
-    setBusy(true);
-    try {
-      await api.setSettings(patch);
-      await onReload();
-      if (patch.llm_pool_enabled !== undefined) {
-        toast.success(patch.llm_pool_enabled ? "已开启 LLM 轮询" : "已关闭 LLM 轮询");
-      } else {
-        toast.success("已更新兜底设置");
-      }
-    } catch (e) {
-      toast.error(`设置失败：${(e as Error).message}`);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function recover(id?: string) {
-    try {
-      await api.resetLLMPool(id);
-      await onReload();
-      toast.success(id ? "已恢复该配置" : "已恢复全部配置");
-    } catch (e) {
-      toast.error(`恢复失败：${(e as Error).message}`);
-    }
-  }
-
-  const enabled = pool?.enabled ?? false;
-  const chain = pool?.chain ?? [];
-  // 参与轮询的成员（排除被标记「不参与轮询」的），顺序即后端实际的尝试顺序。
-  const inChain = chain.filter((m) => m.active || !m.excluded);
-  const tripped = chain.filter((m) => m.state === "tripped");
-
-  return (
-    <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent side="right" className="flex flex-col gap-0 p-0 data-[side=right]:sm:max-w-lg">
-        <SheetHeader className="px-4">
-          <SheetTitle className="flex items-center gap-2">
-            <ZapIcon className="size-4" /> LLM 轮询 · 故障转移
-          </SheetTitle>
-          <SheetDescription>
-            开启后，<b>未指定模型</b>的 Agent 在当前配置不可用（余额不足 / Key 失效 / 限流 /
-            服务异常）时自动切到下一个配置。
-          </SheetDescription>
-        </SheetHeader>
-
-        <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 pb-6">
-          <div className="flex items-center justify-between gap-4 rounded-lg border p-3">
-            <div className="grid gap-0.5">
-              <Label className="text-sm">启用轮询</Label>
-              <p className="text-muted-foreground text-xs">默认关闭。关闭时始终只用激活配置，失败即失败。</p>
-            </div>
-            <Switch
-              checked={enabled}
-              disabled={busy}
-              onCheckedChange={(v) => void toggle({ llm_pool_enabled: v })}
-              aria-label="LLM 轮询开关"
-            />
-          </div>
-
-          {enabled && (
-            <>
-              <div className="flex items-center justify-between gap-4 rounded-lg border p-3">
-                <div className="grid gap-0.5">
-                  <Label className="text-sm">指定模型失败时也兜底</Label>
-                  <p className="text-muted-foreground text-xs">
-                    默认关闭：Agent 或任务指定了某个配置就只用它，失败即失败（不会悄悄换成别的模型）。
-                    开启后，指定的配置失败时也会回落到下面的轮询链。
-                  </p>
-                </div>
-                <Switch
-                  checked={pool?.bind_fallback ?? false}
-                  disabled={busy}
-                  onCheckedChange={(v) => void toggle({ llm_pool_bind_fallback: v })}
-                  aria-label="绑定配置失败兜底开关"
-                />
-              </div>
-
-              <Separator />
-
-              <div className="grid gap-2">
-                <div className="flex items-center justify-between">
-                  <Label className="text-sm">轮询顺序</Label>
-                  {tripped.length > 0 && (
-                    <Button size="sm" variant="ghost" onClick={() => void recover()}>
-                      <RotateCcwIcon /> 全部恢复
-                    </Button>
-                  )}
-                </div>
-                {inChain.length < 2 && (
-                  <p className="text-muted-foreground text-xs">
-                    当前只有 {inChain.length} 个可用配置，轮询不会生效——至少需要 2 个已填 API Key 且参与轮询的配置。
-                  </p>
-                )}
-                {chain.map((m) => {
-                  const excluded = m.excluded && !m.active;
-                  const order = excluded ? null : inChain.findIndex((x) => x.profile_id === m.profile_id) + 1;
-                  return (
-                    <div
-                      key={m.profile_id}
-                      className={cn(
-                        "grid gap-1 rounded-lg border p-2.5 text-sm",
-                        excluded && "opacity-55",
-                        m.state === "tripped" && "border-destructive/40",
-                      )}
-                    >
-                      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                        <span className="w-5 shrink-0 text-center font-mono text-muted-foreground text-xs">
-                          {order ?? "—"}
-                        </span>
-                        <span className="font-medium">{m.name}</span>
-                        {m.active && (
-                          <Badge variant="outline" className="border-amber-400/50 text-amber-500">
-                            激活
-                          </Badge>
-                        )}
-                        {excluded && <Badge variant="outline">不参与轮询</Badge>}
-                        <div className="ml-auto flex items-center gap-2">
-                          {m.state === "tripped" && m.cooldown_secs > 0 && (
-                            <span className="text-muted-foreground text-xs">冷却 {cooldownText(m.cooldown_secs)}</span>
-                          )}
-                          {m.state === "degraded" && (
-                            <span className="text-muted-foreground text-xs">连续失败 {m.fails} 次</span>
-                          )}
-                          {m.state !== "ok" && (
-                            <Button
-                              size="icon"
-                              variant="ghost"
-                              className="size-7"
-                              aria-label="立即恢复"
-                              title="立即恢复：清除熔断，下次调用重试该配置"
-                              onClick={() => void recover(m.profile_id)}
-                            >
-                              <RotateCcwIcon className="size-3.5" />
-                            </Button>
-                          )}
-                        </div>
-                      </div>
-                      <div className="flex flex-wrap items-center gap-x-3 pl-7 text-muted-foreground text-xs">
-                        <code className="truncate font-mono">{m.model}</code>
-                        {!m.active && <span>优先级 {m.priority}</span>}
-                      </div>
-                      {m.last_error && (
-                        <p className="truncate pl-7 font-mono text-muted-foreground text-xs" title={m.last_error}>
-                          {m.last_error}
-                        </p>
-                      )}
-                    </div>
-                  );
-                })}
-                {chain.length === 0 && (
-                  <div className="rounded-lg border border-dashed p-4 text-center text-muted-foreground text-sm">
-                    暂无配置
-                  </div>
-                )}
-              </div>
-
-              <div className="rounded-lg border border-dashed p-3 text-muted-foreground text-xs leading-relaxed">
-                激活配置恒为第 1 顺位，其余按优先级从高到低（在各配置里设置）。某个配置失败后进入冷却 （60s → 5min →
-                30min），冷却期内被跳过，恢复后自动切回。上下文窗口装不下当前请求的配置会被跳过。 指定了模型的 Agent
-                与任务默认不参与轮询。
-              </div>
-            </>
-          )}
-        </div>
-      </SheetContent>
-    </Sheet>
-  );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 模型配置抽屉（新建 / 编辑共用同一套表单）
-// ─────────────────────────────────────────────────────────────────────────────
-
-function ProfileSheet({
-  profile,
-  open,
-  onOpenChange,
-  onSaved,
-}: {
-  profile: LLMProfile | null; // null = 新建
-  open: boolean;
-  onOpenChange: (o: boolean) => void;
-  onSaved: (id: string) => void;
-}) {
-  const isNew = !profile;
-  const [name, setName] = React.useState("");
-  const [format, setFormat] = React.useState<"anthropic" | "openai" | "openai-responses">("anthropic");
-  const [model, setModel] = React.useState("");
-  const [baseUrl, setBaseUrl] = React.useState("");
-  const [proxy, setProxy] = React.useState("");
-  const [apiKey, setApiKey] = React.useState("");
-  const [keyHint, setKeyHint] = React.useState("");
-  const [rps, setRps] = React.useState("0");
-  const [rpm, setRpm] = React.useState("0");
-  const [cw, setCw] = React.useState("0"); // 上下文窗口(K tokens);0=默认200K
-  const [thinkingType, setThinkingType] = React.useState(NONE);
-  const [effort, setEffort] = React.useState(NONE);
-  const [priority, setPriority] = React.useState("0"); // 轮询顺位;越大越先
-  const [poolExclude, setPoolExclude] = React.useState(false);
-  const [streaming, setStreaming] = React.useState(true); // true=流式(默认);false=非流式
-  const [maxTokens, setMaxTokens] = React.useState("0"); // 单次回复输出上限;0=不发送
-  const [maxTokensField, setMaxTokensField] = React.useState(NONE); // 上限用哪个字段名;NONE=max_tokens
-  const [sessionHeaderKey, setSessionHeaderKey] = React.useState(""); // 自定义会话头名;空=不发送
-  const [retry, setRetry] = React.useState<LLMRetryOverride>(ZERO_OVERRIDE); // 本配置的重试覆盖;全 0=跟随全局
-  const [testing, setTesting] = React.useState(false);
-  const [saving, setSaving] = React.useState(false);
-  const [models, setModels] = React.useState<string[]>([]);
-  const [loadingModels, setLoadingModels] = React.useState(false);
-  const [modelsOpen, setModelsOpen] = React.useState(false);
-  // 侧栏弹出卡顿修复:滑入动画(200ms)期间不同步挂载整棵长表单,动画结束后再挂载,
-  // 动画帧只画骨架 → 不掉帧。所有侧栏抽屉通用此模式。
-  const [sheetReady, setSheetReady] = React.useState(false);
-  React.useEffect(() => {
-    if (!open) {
-      setSheetReady(false);
-      return;
-    }
-    const t = setTimeout(() => setSheetReady(true), 240);
-    return () => clearTimeout(t);
-  }, [open]);
-
-  // 每次打开时从传入的 profile 灌一遍表单（新建则重置为默认值）。抽屉关掉再打开
-  // 就是一次干净的开始，不会留下上一个配置的残影。
-  React.useEffect(() => {
-    if (!open) return;
-    setName(profile?.name ?? "");
-    setFormat(profile?.format === "openai" || profile?.format === "openai-responses" ? profile.format : "anthropic");
-    setModel(profile?.model ?? "");
-    setBaseUrl(profile?.base_url ?? "");
-    setProxy(profile?.proxy ?? "");
-    setRps(String(profile?.rate_per_second ?? 0));
-    setRpm(String(profile?.rate_per_minute ?? 0));
-    setCw(String(profile?.context_window_k ?? 0));
-    setThinkingType(fromStore(profile?.thinking_type));
-    setEffort(fromStore(profile?.reasoning_effort));
-    setPriority(String(profile?.priority ?? 0));
-    setPoolExclude(profile?.pool_exclude ?? false);
-    setStreaming(profile?.streaming ?? true);
-    setMaxTokens(String(profile?.max_tokens ?? 0));
-    setMaxTokensField(fromStore(profile?.max_tokens_field));
-    setSessionHeaderKey(profile?.session_header_key ?? "");
-    setRetry(profile?.retry ?? ZERO_OVERRIDE);
-    setApiKey("");
-    setKeyHint(profile?.api_key_hint ?? "");
-    setModels([]);
-    setModelsOpen(false);
-    // 固化的模型列表:编辑已存端点时,回填最近一次成功拉取的列表(可直接选用)。
-    const pid = profile ? Number(profile.id) : NaN;
-    if (Number.isFinite(pid) && pid > 0) {
-      api
-        .llmModelsCache(pid)
-        .then(setModels)
-        .catch(() => undefined);
-    }
-  }, [open, profile]);
-
-  const profileId = profile ? Number(profile.id) : undefined;
-
-  async function loadModels() {
-    if (loadingModels) return;
-    setLoadingModels(true);
-    setModels([]);
-    try {
-      const r = await api.fetchLLMModels(format, baseUrl, apiKey, proxy, profileId);
-      if (r.ok && r.models && r.models.length > 0) {
-        setModels(r.models);
-        setModelsOpen(true);
-        toast.success(`已加载 ${r.models.length} 个模型`);
-      } else {
-        toast.error(`加载模型失败：${r.error ?? "未获取到模型"}`);
-      }
-    } catch (e) {
-      toast.error(`加载模型出错：${(e as Error).message}`);
-    } finally {
-      setLoadingModels(false);
-    }
-  }
-
-  async function testConnection() {
-    if (testing) return;
-    setTesting(true);
-    try {
-      // 用配置实际会跑的思考参数来测，这样不支持该字段的模型在这里就失败，
-      // 而不是等到跑任务时才炸。传 profile id：Key 输入框留空时用已存的 Key。
-      const r = await api.testLLM(
-        format,
-        model,
-        baseUrl,
-        apiKey,
-        proxy,
-        toStore(thinkingType),
-        toStore(effort),
-        profileId,
-        streaming,
-        sessionHeaderKey.trim(),
-      );
-      // 回复内容一并展示：看得见模型确实说了话，才算和会话里跑通是一回事。
-      if (r.ok)
-        toast.success(`连接成功 · ${r.latency_ms ?? "?"}ms · ${r.model ?? model}`, {
-          description: r.reply ? `回复：${r.reply}` : undefined,
-        });
-      else toast.error(`连接失败：${r.error ?? "未知"}`);
-    } catch (e) {
-      toast.error(`测试出错：${(e as Error).message}`);
-    } finally {
-      setTesting(false);
-    }
-  }
-
-  async function save() {
-    if (!name.trim() || !model.trim()) {
-      toast.error("请填写名称与模型");
-      return;
-    }
-    if (saving) return;
-    setSaving(true);
-    try {
-      const { id } = await api.saveLLMProfile({
-        ...(profile ? { id: Number(profile.id) } : {}),
-        name: name.trim(),
-        format,
-        model: model.trim(),
-        base_url: baseUrl.trim(),
-        proxy: proxy.trim(),
-        api_key: apiKey,
-        rate_per_second: Number(rps) || 0,
-        rate_per_minute: Number(rpm) || 0,
-        context_window_k: Number(cw) || 0,
-        thinking_type: toStore(thinkingType),
-        reasoning_effort: toStore(effort),
-        priority: Number(priority) || 0,
-        pool_exclude: poolExclude,
-        streaming,
-        max_tokens: Math.max(0, Number(maxTokens) || 0),
-        // 字段名开关只对 openai(Chat Completions) 有意义，其它格式一律回落到默认；
-        // 后端也会再做一次同样的归一化，这里只是别让 UI 送出自相矛盾的值。
-        max_tokens_field: format === "openai" ? toStore(maxTokensField) : "",
-        session_header_key: sessionHeaderKey.trim(),
-        retry,
-      });
-      if (isNew) toast.success(`已新建：${name.trim()}（在卡片上「设为激活」以启用）`);
-      else toast.success(profile?.is_default ? "已保存，激活配置即时生效，无需重启" : "已保存");
-      onSaved(String(id));
-      onOpenChange(false);
-    } catch (e) {
-      toast.error(`保存失败：${(e as Error).message}`);
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  return (
-    <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent
-        side="right"
-        className="flex flex-col gap-0 p-0 data-[side=right]:min-w-[420px] data-[side=right]:sm:max-w-xl"
-      >
-        <SheetHeader className="px-4">
-          <SheetTitle className="flex items-center gap-2">
-            {isNew ? "新建模型配置" : `编辑：${profile?.name}`}
-            {profile?.is_default && (
-              <Badge variant="outline" className="border-amber-400/50 text-amber-500">
-                激活中
-              </Badge>
-            )}
-          </SheetTitle>
-          <SheetDescription>
-            {isNew
-              ? "新建后不会自动激活，请在卡片上「设为激活」以启用。"
-              : "修改后点击保存；激活配置保存后对全部 Agent 立即生效。"}
-          </SheetDescription>
-        </SheetHeader>
-
-        {/* 侧栏弹出卡顿修复:滑入动画帧里只画骨架,动画结束后再挂载整棵表单 */}
-        {!sheetReady ? (
-          <div className="flex min-h-0 flex-1 flex-col gap-3 px-4 py-4">
-            {[0, 1, 2, 3, 4, 5, 6, 7].map((i) => (
-              <div
-                key={i}
-                className="h-9 animate-pulse rounded-md bg-muted/60"
-                style={{ width: `${90 - (i % 3) * 10}%` }}
-              />
-            ))}
-          </div>
-        ) : (
-          <>
-        <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 pb-4">
-          <div className="grid gap-4 sm:grid-cols-2">
-            <div className="grid gap-2">
-              <Label htmlFor="p-name">名称</Label>
-              <Input
-                id="p-name"
-                placeholder="例如：OpenAI 生产"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-              />
-            </div>
-            <div className="grid gap-2">
-              <Label>格式</Label>
-              <Select value={format} onValueChange={(v) => setFormat(v as "anthropic" | "openai" | "openai-responses")}>
-                <SelectTrigger>
-                  <SelectValue placeholder="选择格式" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="anthropic">Anthropic</SelectItem>
-                  <SelectItem value="openai">OpenAI (Chat Completions)</SelectItem>
-                  <SelectItem value="openai-responses">OpenAI (Responses API)</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
-
-          <div className="grid gap-2">
-            <Label htmlFor="p-model">模型</Label>
-            <div className="flex gap-2">
-              <Input
-                id="p-model"
-                className="font-mono"
-                placeholder="claude-opus-4-8"
-                value={model}
-                onChange={(e) => setModel(e.target.value)}
-              />
-              {/* modal: 这个 Popover 的内容被 portal 到 <body>，在 Sheet 的滚动锁之外，
-                  不加 modal 时列表能渲染却滚不动。modal 让它自己持有最上层滚动锁。 */}
-              <Popover open={modelsOpen} onOpenChange={setModelsOpen} modal>
-                <PopoverTrigger asChild>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="icon"
-                    className="shrink-0"
-                    disabled={loadingModels}
-                    onClick={loadModels}
-                    title="从 API 加载可用模型"
-                  >
-                    {loadingModels ? <Loader2Icon className="animate-spin" /> : <RefreshCwIcon />}
-                  </Button>
-                </PopoverTrigger>
-                {models.length > 0 && (
-                  <PopoverContent className="max-h-72 w-72 gap-0 overflow-y-auto overscroll-contain p-1" align="end">
-                    <div className="text-muted-foreground sticky top-0 bg-popover px-2 py-1 text-xs">
-                      共 {models.length} 个模型 · 点击选用
-                    </div>
-                    {models.map((m) => (
-                      <button
-                        key={m}
-                        type="button"
-                        className={`w-full shrink-0 rounded-md px-2 py-1.5 text-left font-mono text-xs hover:bg-accent hover:text-accent-foreground ${
-                          m === model ? "bg-accent text-accent-foreground" : ""
-                        }`}
-                        onClick={() => {
-                          setModel(m);
-                          setModelsOpen(false);
-                        }}
-                      >
-                        {m}
-                      </button>
-                    ))}
-                  </PopoverContent>
-                )}
-              </Popover>
-            </div>
-          </div>
-
-          <div className="grid gap-2">
-            <Label htmlFor="p-base-url">Base URL（可选，留空 = 该格式官方地址）</Label>
-            <Input
-              id="p-base-url"
-              className="font-mono"
-              placeholder={BASE_URL_PRESETS[format]?.placeholder ?? "https://"}
-              value={baseUrl}
-              onChange={(e) => setBaseUrl(e.target.value)}
-            />
-            {/* 常用端点预设:一键填充;粘贴完整补全路径(…/chat/completions)保存时会自动剥掉 */}
-            <div className="flex flex-wrap items-center gap-1.5">
-              <span className="text-muted-foreground text-xs">常用:</span>
-              {(BASE_URL_PRESETS[format]?.presets ?? []).map((preset) => (
-                <button
-                  key={preset.url}
-                  type="button"
-                  onClick={() => setBaseUrl(preset.url)}
-                  className="rounded-full border px-2.5 py-0.5 text-xs transition-colors hover:bg-muted"
-                  title={preset.url}
-                >
-                  {preset.label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="grid gap-2">
-            <Label htmlFor="p-proxy">代理（可选）</Label>
-            <Input
-              id="p-proxy"
-              className="font-mono"
-              placeholder="socks5://user:pass@127.0.0.1:1080 · http://127.0.0.1:8080"
-              value={proxy}
-              onChange={(e) => setProxy(e.target.value)}
-            />
-            <p className="text-muted-foreground text-xs">
-              仅 LLM 出站请求走此代理，支持 http/https/socks5，可带账号密码（如
-              socks5://user:pass@host:port，密码含特殊字符需 URL 编码）；留空表示不使用代理（直连）。
-            </p>
-          </div>
-
-          <div className="grid gap-2">
-            <Label htmlFor="p-session-header">自定义会话头（可选）</Label>
-            <Input
-              id="p-session-header"
-              className="font-mono"
-              placeholder="如 x-session-id（留空=不发送）"
-              value={sessionHeaderKey}
-              onChange={(e) => setSessionHeaderKey(e.target.value)}
-            />
-            <p className="text-muted-foreground text-xs">
-              填写头名后，每次请求都会带上这个 HTTP 头，头值自动填为 <b>当前会话的 session id</b>（chat 会话如
-              conv-12、worker 如 exp3-worker-i87）。用于按 session-id 头做提示缓存 /
-              粘性路由的网关；同一会话多轮稳定、不同会话互不相同。留空则不发送。
-            </p>
-          </div>
-
-          <div className="grid gap-2">
-            <Label htmlFor="p-api-key">API Key</Label>
-            <Input
-              id="p-api-key"
-              type="password"
-              placeholder={keyHint ? `已设置（${keyHint}），留空保持不变` : "sk-…"}
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-            />
-          </div>
-
-          <div className="grid gap-4 sm:grid-cols-3">
-            <div className="grid gap-2">
-              <Label htmlFor="p-rps">每秒限速</Label>
-              <Input id="p-rps" type="number" min={0} value={rps} onChange={(e) => setRps(e.target.value)} />
-            </div>
-            <div className="grid gap-2">
-              <Label htmlFor="p-rpm">每分钟限速</Label>
-              <Input id="p-rpm" type="number" min={0} value={rpm} onChange={(e) => setRpm(e.target.value)} />
-            </div>
-            <div className="grid gap-2">
-              <Label htmlFor="p-cw">上下文窗口(K)</Label>
-              <Input
-                id="p-cw"
-                type="number"
-                min={0}
-                max={1000}
-                value={cw}
-                onChange={(e) => setCw(e.target.value)}
-                placeholder="200"
-              />
-            </div>
-          </div>
-          <p className="-mt-2 text-muted-foreground text-xs">
-            限速 0 = 不限，全 Agent 共享。上下文窗口单位 K（千 token），0 = 默认 200K，上限 1000（即
-            1M）；设太高会导致压缩不触发。
-          </p>
-
-          <div className="grid gap-3 rounded-lg border p-3">
-            <div className="flex items-center justify-between gap-4">
-              <div className="grid gap-0.5">
-                <Label htmlFor="p-priority" className="text-sm">
-                  轮询优先级
-                </Label>
-                <p className="text-muted-foreground text-xs">
-                  数字越大越先被选中；激活配置恒为第 1 顺位，与本值无关。相同优先级的配置会轮流打头，天然分摊额度。
-                </p>
-              </div>
-              <Input
-                id="p-priority"
-                type="number"
-                className="w-24 shrink-0"
-                value={priority}
-                onChange={(e) => setPriority(e.target.value)}
-              />
-            </div>
-            <div className="flex items-center justify-between gap-4 border-t pt-3">
-              <div className="grid gap-0.5">
-                <Label className="text-sm">不参与轮询</Label>
-                <p className="text-muted-foreground text-xs">
-                  开启后不会被当作故障转移目标（仍可被 Agent / 任务显式指定使用）。 适合「只给某个 Agent
-                  专用、不希望别人失败时烧掉」的昂贵配置。
-                </p>
-              </div>
-              <Switch checked={poolExclude} onCheckedChange={setPoolExclude} aria-label="不参与轮询" />
-            </div>
-            <div className="flex items-center justify-between gap-4 border-t pt-3">
-              <div className="grid gap-0.5">
-                <Label className="text-sm">流式输出 · streaming</Label>
-                <p className="text-muted-foreground text-xs">
-                  开启（默认）走流式 SSE，有运行中实时进度与实时 token 计数。 关闭则走真·非流式（stream:false，
-                  一次性返回完整响应）——可绕开部分网关糟糕的 SSE 实现（空帧 / 思考字段丢帧），
-                  代价是失去运行中的实时进度。
-                </p>
-              </div>
-              <Switch checked={streaming} onCheckedChange={setStreaming} aria-label="流式输出" />
-            </div>
-          </div>
-
-          <div className="grid gap-3 rounded-lg border p-3">
-            <div className="flex items-center justify-between gap-4">
-              <div className="grid gap-0.5">
-                <Label htmlFor="p-max-tokens" className="text-sm">
-                  输出上限 · max tokens
-                </Label>
-                <p className="text-muted-foreground text-xs">
-                  单次回复最多生成多少 token，随每次请求发出。0（默认）= 不发送该字段，由服务端默认值决定。
-                  这与上面的「上下文窗口」是两回事：那是模型总容量，只在本地用来算压缩阈值。
-                  设太小会让推理模型在思考阶段就被截断，一个字答案都出不来。
-                </p>
-              </div>
-              <Input
-                id="p-max-tokens"
-                type="number"
-                min={0}
-                className="w-28 shrink-0"
-                value={maxTokens}
-                onChange={(e) => setMaxTokens(e.target.value)}
-                placeholder="0"
-              />
-            </div>
-            <div className="flex items-center justify-between gap-4 border-t pt-3">
-              <div className="grid gap-0.5">
-                <Label className="text-sm">上限字段名</Label>
-                <p className="text-muted-foreground text-xs">{MAX_TOKENS_FIELD_HINTS[format]}</p>
-              </div>
-              <Select
-                value={format === "openai" ? maxTokensField : NONE}
-                onValueChange={setMaxTokensField}
-                disabled={format !== "openai"}
-              >
-                <SelectTrigger className="w-56 shrink-0">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {MAX_TOKENS_FIELDS.map((o) => (
-                    <SelectItem key={o.value} value={o.value}>
-                      {o.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
-
-          <div className="grid gap-3 rounded-lg border p-3">
-            <div className="flex items-center justify-between gap-4">
-              <div className="grid gap-0.5">
-                <Label className="text-sm">思考开关 · thinking.type</Label>
-                <p className="text-muted-foreground text-xs">
-                  控制是否发送 thinking 字段。不发送=不带该字段（兼容 MiniMax 等不支持 的模型）；关闭=发
-                  disabled；开启=发 enabled。与下面的强度互相独立。
-                </p>
-              </div>
-              <Select value={thinkingType} onValueChange={setThinkingType}>
-                <SelectTrigger className="w-32 shrink-0">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {THINKING_TYPES.map((o) => (
-                    <SelectItem key={o.value} value={o.value}>
-                      {o.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="flex items-center justify-between gap-4 border-t pt-3">
-              <div className="grid gap-0.5">
-                <Label className="text-sm">思考强度 · reasoning_effort</Label>
-                <p className="text-muted-foreground text-xs">
-                  独立的强度档位（OpenAI reasoning_effort / Anthropic output_config.effort）。 有些接口没有 thinking
-                  字段、只靠强度即可激活思考，故可单独设置、不发送思考开关。
-                </p>
-              </div>
-              <Select value={effort} onValueChange={setEffort}>
-                <SelectTrigger className="w-32 shrink-0">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {EFFORT_LEVELS.map((o) => (
-                    <SelectItem key={o.value} value={o.value}>
-                      {o.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
-
-          <ProfileRetryFields value={retry} onChange={setRetry} />
-        </div>
-
-        <div className="flex gap-2 border-t px-4 py-3">
-          <Button variant="outline" onClick={testConnection} disabled={testing}>
-            {testing ? <Loader2Icon className="animate-spin" /> : <PlugZapIcon />}
-            {testing ? "测试中…" : "测试连接"}
-          </Button>
-          <Button onClick={save} disabled={saving} className="flex-1">
-            {saving && <Loader2Icon className="animate-spin" />}
-            {!saving && (isNew ? <PlusIcon /> : <SaveIcon />)}
-            {isNew ? "新建" : "保存"}
-          </Button>
-        </div>
-          </>
-        )}
-      </SheetContent>
-    </Sheet>
-  );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 
 export default function LLMPage() {
   const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
   const [pool, setPool] = React.useState<LLMPoolStatus | null>(null);
   const [poolOpen, setPoolOpen] = React.useState(false);
-  // 列表页标准能力:搜索 / 格式筛选 / 分页。
+  const [loading, setLoading] = React.useState(true);
+  // 搜索走 query + Enter 触发：appliedQuery 才是真正参与过滤的值，免得每敲一个字
+  // 就重排整张表。
   const [query, setQuery] = React.useState("");
-  const [formatFilter, setFormatFilter] = React.useState("all");
+  const [appliedQuery, setAppliedQuery] = React.useState("");
+  // 分类器维度 = 协议格式；筛选器另有状态一维。两者都作用于同一份列表。
+  const [formatKind, setFormatKind] = React.useState("all");
+  const [statusKind, setStatusKind] = React.useState("all");
   const [page, setPage] = React.useState(1);
-  const [pageSize, setPageSize] = React.useState(12);
+  const [pageSize, setPageSize] = React.useState(PAGE_SIZE);
 
-  const filtered = React.useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return profiles.filter((p) => {
-      if (formatFilter !== "all" && (p.format ?? "") !== formatFilter) return false;
-      if (!q) return true;
-      return (
-        p.name.toLowerCase().includes(q) ||
-        (p.model ?? "").toLowerCase().includes(q) ||
-        (p.base_url ?? "").toLowerCase().includes(q)
-      );
-    });
-  }, [profiles, query, formatFilter]);
-
-  const paged = React.useMemo(
-    () => filtered.slice((page - 1) * pageSize, page * pageSize),
-    [filtered, page, pageSize],
-  );
-
-  // biome-ignore lint/correctness/useExhaustiveDependencies: filters intentionally reset pagination.
-  React.useEffect(() => {
-    setPage(1);
-  }, [query, formatFilter]);
   // 抽屉的开关和内容分开存：关闭时 editing 保持不变，否则关闭动画期间标题会从
   // 「编辑 X」闪成「新建」。editing = null 表示新建。
   const [editOpen, setEditOpen] = React.useState(false);
@@ -924,15 +76,17 @@ export default function LLMPage() {
     try {
       setPool(await api.llmPool());
     } catch {
-      /* ignore */
+      /* 轮询状态拿不到不该挡住配置列表 */
     }
   }, []);
 
   const load = React.useCallback(async () => {
     try {
       setProfiles(await api.llmProfiles());
-    } catch {
-      /* ignore */
+    } catch (e) {
+      toast.error(`加载模型配置失败：${(e as Error).message}`);
+    } finally {
+      setLoading(false);
     }
     await loadPool();
   }, [loadPool]);
@@ -941,12 +95,59 @@ export default function LLMPage() {
     void load();
   }, [load]);
 
-  // 卡片上的健康徽章按 profile id 取轮询状态。
+  // 健康徽章按 profile id 取轮询状态。
   const health = React.useMemo(() => {
     const m = new Map<string, LLMPoolMember>();
     for (const c of pool?.chain ?? []) m.set(c.profile_id, c);
     return m;
   }, [pool]);
+
+  // 分类器计数必须来自【未过滤的全量数据】：若跟着当前分类走，选中 anthropic 后
+  // 其他格式的计数会全变 0，用户就再也没法从页签上看出还有多少条别的格式。
+  const formatCounts = React.useMemo(() => {
+    const c: Record<string, number> = { all: profiles.length };
+    for (const f of LLM_FORMATS) c[f] = 0;
+    for (const p of profiles) {
+      const f = p.format ?? "";
+      c[f] = (c[f] ?? 0) + 1;
+    }
+    return c;
+  }, [profiles]);
+
+  const filtered = React.useMemo(() => {
+    const q = appliedQuery.trim().toLowerCase();
+    return profiles.filter((p) => {
+      if (formatKind !== "all" && (p.format ?? "") !== formatKind) return false;
+      if (statusKind === "active" && !p.is_default) return false;
+      if (statusKind === "tripped" && !isTripped(p, health.get(p.id))) return false;
+      if (!q) return true;
+      return (
+        p.name.toLowerCase().includes(q) ||
+        (p.model ?? "").toLowerCase().includes(q) ||
+        (p.base_url ?? "").toLowerCase().includes(q)
+      );
+    });
+  }, [profiles, appliedQuery, formatKind, statusKind, health]);
+
+  const paged = React.useMemo(() => filtered.slice((page - 1) * pageSize, page * pageSize), [filtered, page, pageSize]);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: 筛选条件一变就回到第 1 页。
+  React.useEffect(() => {
+    setPage(1);
+  }, [appliedQuery, formatKind, statusKind]);
+
+  const search = () => {
+    setPage(1);
+    setAppliedQuery(query);
+  };
+
+  const filtersActive = !!appliedQuery || formatKind !== "all" || statusKind !== "all";
+  const clearFilters = () => {
+    setQuery("");
+    setAppliedQuery("");
+    setFormatKind("all");
+    setStatusKind("all");
+  };
 
   async function activate(id: string, name: string) {
     try {
@@ -963,6 +164,7 @@ export default function LLMPage() {
       toast.error("无法删除当前激活的配置");
       return;
     }
+    if (!window.confirm(`删除模型配置「${p.name}」？该操作不可恢复。`)) return;
     try {
       await api.deleteLLMProfile(p.id);
       toast.success(`已删除：${p.name}`);
@@ -975,172 +177,280 @@ export default function LLMPage() {
   const poolOn = pool?.enabled ?? false;
 
   return (
-    <div className="flex flex-1 flex-col gap-4 md:gap-6">
-      <div className="flex flex-wrap items-start justify-between gap-3">
+    <div className="p-4 md:p-6">
+      <div className="mb-4 flex flex-wrap items-start justify-between gap-2">
         <div>
-          <h1 className="font-semibold text-xl tracking-tight">LLM</h1>
+          <h1 className="font-semibold text-xl">LLM</h1>
           <p className="text-muted-foreground text-sm">
-            全 Agent 共享的格式 / 模型 / 限速配置。点击卡片编辑，星标为当前激活配置。
+            全 Agent 共享的格式 / 模型 / 限速配置。点名称进入详情页编辑；带星标的为当前激活配置。
           </p>
         </div>
         <div className="flex items-center gap-2">
           <Button size="sm" variant="outline" onClick={() => setPoolOpen(true)}>
-            <ZapIcon /> 轮询配置
+            <ZapIcon className="size-4" /> 轮询配置
             {poolOn && (
               <Badge variant="outline" className="ml-1 border-emerald-500/50 text-emerald-600 dark:text-emerald-400">
                 已开启
               </Badge>
             )}
           </Button>
-          <Button size="sm" variant="outline" onClick={() => openEditor(null)}>
-            <PlusIcon /> 新建
+          <Button size="sm" onClick={() => openEditor(null)}>
+            <PlusIcon className="size-4" />
+            新建配置
           </Button>
         </div>
       </div>
 
-      <Tabs defaultValue="profiles" className="flex-1">
+      <Tabs defaultValue="profiles">
         <TabsList>
           <TabsTrigger value="profiles">模型配置</TabsTrigger>
           <TabsTrigger value="retry">重试与退避</TabsTrigger>
         </TabsList>
 
         <TabsContent value="profiles" className="mt-4">
-          <div className="mb-3 flex flex-wrap items-center gap-2">
-            <div className="relative w-full sm:max-w-xs">
-              <SearchIcon className="text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2" />
-              <Input
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="搜索名称 / 模型 / 地址"
-                className="pl-8"
-              />
-            </div>
-            <Select value={formatFilter} onValueChange={setFormatFilter}>
-              <SelectTrigger className="w-48">
-                <SelectValue placeholder="协议格式" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectGroup>
-                  <SelectItem value="all">全部格式</SelectItem>
-                  <SelectItem value="openai">OpenAI (Chat)</SelectItem>
-                  <SelectItem value="openai-responses">OpenAI (Responses)</SelectItem>
-                  <SelectItem value="anthropic">Anthropic</SelectItem>
-                </SelectGroup>
-              </SelectContent>
-            </Select>
-            <span className="text-muted-foreground ml-auto text-xs tabular-nums">
-              {filtered.length}/{profiles.length} 个
-            </span>
-          </div>
-          {filtered.length === 0 ? (
-            <p className="text-muted-foreground py-12 text-center text-sm">
-              {profiles.length === 0 ? "还没有模型配置,点右上角「新建」添加" : "没有匹配的配置"}
-            </p>
-          ) : (
-            <>
-              <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-                {paged.map((p) => {
-              const h = healthOf(p, health.get(p.id));
-              return (
-                // biome-ignore lint/a11y/useSemanticElements: 卡片内含自己的操作按钮，用原生 <button> 会造成按钮嵌套（非法 HTML）
-                <Card
-                  key={p.id}
-                  role="button"
-                  tabIndex={0}
-                  onClick={() => openEditor(p)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" || e.key === " ") {
-                      e.preventDefault();
-                      openEditor(p);
-                    }
-                  }}
-                  className={cn(
-                    "cursor-pointer gap-0 py-4 outline-none transition-colors hover:border-foreground/30",
-                    p.is_default && "border-amber-400/50 bg-amber-400/5",
-                  )}
-                >
-                  <CardContent className="grid gap-2 px-4">
-                    <div className="flex items-start gap-2">
-                      <StarIcon
-                        className={cn(
-                          "mt-0.5 size-4 shrink-0",
-                          p.is_default ? "fill-amber-400 text-amber-400" : "text-muted-foreground",
-                        )}
-                      />
-                      <div className="min-w-0 flex-1">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <span className="truncate font-medium text-sm">{p.name}</span>
-                          <Badge variant="outline" className="uppercase">
-                            {p.format}
-                          </Badge>
-                          <Badge variant="outline" className={cn("ml-auto", h.cls)} title={h.hint}>
-                            {h.label}
-                          </Badge>
-                        </div>
-                        <code className="mt-1 block truncate font-mono text-muted-foreground text-xs">{p.model}</code>
-                      </div>
-                    </div>
-
-                    <div className="flex flex-wrap gap-x-3 gap-y-0.5 pl-6 text-muted-foreground text-xs">
-                      {p.api_key_hint && <span>{p.api_key_hint}</span>}
-                      <span>
-                        {p.rate_per_second}/s · {p.rate_per_minute}/min
-                      </span>
-                      {p.proxy && <span className="truncate">代理 {p.proxy}</span>}
-                      {p.reasoning_effort && (
-                        <span>思考 {p.reasoning_effort === "off" ? "关" : p.reasoning_effort}</span>
-                      )}
-                      {/* 轮询相关的两个字段只在轮询开着时才有意义，关着时不占版面 */}
-                      {poolOn &&
-                        !p.is_default &&
-                        (p.pool_exclude ? <span>不参与轮询</span> : <span>优先级 {p.priority ?? 0}</span>)}
-                    </div>
-
-                    <div className="mt-1 flex gap-2">
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        className="flex-1"
-                        disabled={p.is_default}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          void activate(p.id, p.name);
-                        }}
-                      >
-                        {p.is_default ? "已激活" : "设为激活"}
-                      </Button>
-                      <Button
-                        size="icon"
-                        variant="outline"
-                        aria-label="删除配置"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          void remove(p);
-                        }}
-                      >
-                        <Trash2Icon className="text-destructive" />
-                      </Button>
-                    </div>
-                  </CardContent>
-                </Card>
-              );
-            })}
+          <Card>
+            <CardContent className="px-0 pt-4">
+              {/* 第一行：搜索 + 总数 */}
+              <div className="flex flex-wrap items-center gap-2 px-4 pb-3 lg:px-6">
+                <div className="relative w-full sm:max-w-xs">
+                  <SearchIcon className="text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2" />
+                  <Input
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && search()}
+                    placeholder="搜索名称 / 模型 / 地址"
+                    className="pl-8"
+                  />
+                </div>
+                <Button variant="outline" size="sm" onClick={search}>
+                  搜索
+                </Button>
+                <span className="text-muted-foreground ml-auto text-xs tabular-nums">
+                  {appliedQuery ? `命中 ${filtered.length} / ` : ""}共 {profiles.length} 条
+                </span>
               </div>
-              <TablePagination
-                page={page}
-                pageSize={pageSize}
-                total={filtered.length}
-                onPageChange={setPage}
-                onPageSizeChange={(s) => {
-                  setPage(1);
-                  setPageSize(s);
-                }}
-                pageSizeOptions={[12, 24, 48]}
-              />
-            </>
-          )}
+
+              {/* 第二行：分类器（可点页签，计数取自全量）+ 筛选器 */}
+              <div className="flex flex-wrap items-center gap-2 px-4 pb-3 lg:px-6">
+                <Tabs
+                  value={formatKind}
+                  onValueChange={(v) => {
+                    setPage(1);
+                    setFormatKind(v);
+                  }}
+                >
+                  <TabsList>
+                    <TabsTrigger value="all">全部 {formatCounts.all ?? 0}</TabsTrigger>
+                    {LLM_FORMATS.map((f) => (
+                      <TabsTrigger key={f} value={f} title={FORMAT_LABEL_LONG[f]}>
+                        {FORMAT_LABEL_SHORT[f]} {formatCounts[f] ?? 0}
+                      </TabsTrigger>
+                    ))}
+                  </TabsList>
+                </Tabs>
+                <div className="ml-auto flex flex-wrap items-center gap-2">
+                  {/* 与上面的页签共用同一个 state（两个入口、同一份筛选），故永不失同步。 */}
+                  <Select
+                    value={formatKind}
+                    onValueChange={(v) => {
+                      setPage(1);
+                      setFormatKind(v);
+                    }}
+                  >
+                    <SelectTrigger className="w-36">
+                      <SelectValue placeholder="协议格式" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectGroup>
+                        <SelectItem value="all">全部格式</SelectItem>
+                        {LLM_FORMATS.map((f) => (
+                          <SelectItem key={f} value={f}>
+                            {FORMAT_LABEL_SHORT[f]}
+                          </SelectItem>
+                        ))}
+                      </SelectGroup>
+                    </SelectContent>
+                  </Select>
+                  <Select
+                    value={statusKind}
+                    onValueChange={(v) => {
+                      setPage(1);
+                      setStatusKind(v);
+                    }}
+                  >
+                    <SelectTrigger className="w-32">
+                      <SelectValue placeholder="状态" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectGroup>
+                        {STATUS_OPTIONS.map((o) => (
+                          <SelectItem key={o.value} value={o.value}>
+                            {o.label}
+                          </SelectItem>
+                        ))}
+                      </SelectGroup>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+
+              {loading && profiles.length === 0 ? (
+                <p className="text-muted-foreground py-16 text-center text-sm">加载中…</p>
+              ) : filtered.length === 0 ? (
+                <div className="text-muted-foreground flex flex-col items-center gap-2 py-16 text-center text-sm">
+                  <ZapIcon className="size-8 opacity-40" />
+                  <span>{profiles.length === 0 ? "还没有模型配置，点右上角「新建配置」添加" : "没有匹配的配置"}</span>
+                  {filtersActive && (
+                    <Button variant="outline" size="sm" onClick={clearFilters}>
+                      清除筛选
+                    </Button>
+                  )}
+                </div>
+              ) : (
+                <>
+                  {/* 列宽铁律：名称列不设宽度（table-fixed 下自动吃掉余量，设 w-full 会挤掉
+                      后面的列），其余列按最小可读值给固定宽度。固定列之和 592px 明显小于
+                      1280 视口下的 ~897px 容器，名称列仍有 ~300px，不会撑出横向滚动条。
+                      状态列给 w-28 是因为「已熔断 · 5min」要完整显示——按 w-24 会被截成
+                      「已熔断 · 5mi…」，恰恰把最关键的信息切掉了。 */}
+                  <Table className="table-fixed">
+                    <TableHeader>
+                      <TableRow className="hover:bg-transparent">
+                        <TableHead>名称</TableHead>
+                        <TableHead className="w-24">协议格式</TableHead>
+                        <TableHead className="w-40">模型</TableHead>
+                        <TableHead className="w-20">上下文窗口</TableHead>
+                        <TableHead className="w-28">状态</TableHead>
+                        <TableHead className="w-16">优先级</TableHead>
+                        <TableHead className="w-24">操作</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {paged.map((p) => {
+                        const h = healthOf(p, health.get(p.id));
+                        return (
+                          <TableRow key={p.id} className={p.is_default ? "bg-amber-400/5" : undefined}>
+                            {/* 名称即入口：点击进入详情页做完整编辑。 */}
+                            <TableCell className="min-w-0">
+                              <div className="flex min-w-0 items-center gap-1.5">
+                                {p.is_default && (
+                                  <StarIcon
+                                    className="size-3.5 shrink-0 fill-amber-400 text-amber-400"
+                                    aria-label="当前激活配置"
+                                  />
+                                )}
+                                <Link
+                                  href={`/system/llm/detail?id=${p.id}`}
+                                  className="block w-full truncate text-left font-medium hover:underline"
+                                  title={p.name}
+                                >
+                                  {p.name}
+                                </Link>
+                              </div>
+                            </TableCell>
+                            <TableCell>
+                              <Badge
+                                variant="outline"
+                                className={cn("max-w-full", formatBadgeClass(p.format))}
+                                title={FORMAT_LABEL_LONG[p.format] ?? p.format}
+                              >
+                                <span className="truncate">{FORMAT_LABEL_SHORT[p.format] ?? p.format}</span>
+                              </Badge>
+                            </TableCell>
+                            <TableCell className="min-w-0">
+                              <code className="text-muted-foreground block truncate font-mono text-xs" title={p.model}>
+                                {p.model}
+                              </code>
+                            </TableCell>
+                            <TableCell
+                              className={cn(
+                                "tabular-nums",
+                                contextWindowIsDefault(p.context_window_k) && "text-muted-foreground",
+                              )}
+                              title={contextWindowIsDefault(p.context_window_k) ? "未设置，按默认 200K" : undefined}
+                            >
+                              {contextWindowText(p.context_window_k)}
+                            </TableCell>
+                            <TableCell>
+                              <div className="flex flex-col items-start gap-1">
+                                <Badge variant="outline" className={cn("max-w-full", h.cls)} title={h.hint}>
+                                  <span className="truncate">{h.label}</span>
+                                </Badge>
+                                {p.is_default ? (
+                                  <span className="font-medium text-[10px] text-amber-600 dark:text-amber-400">
+                                    激活配置
+                                  </span>
+                                ) : (
+                                  <Button
+                                    variant="ghost"
+                                    size="xs"
+                                    className="h-5 px-1 text-[10px]"
+                                    title="设为激活：激活后全 Agent 立即改用这一条"
+                                    onClick={() => void activate(p.id, p.name)}
+                                  >
+                                    设为激活
+                                  </Button>
+                                )}
+                              </div>
+                            </TableCell>
+                            <TableCell className="text-muted-foreground tabular-nums">
+                              {p.pool_exclude ? (
+                                <span title="不参与轮询：不会被当作故障转移目标，仍可被 Agent / 任务显式指定">
+                                  不参与
+                                </span>
+                              ) : (
+                                (p.priority ?? 0)
+                              )}
+                            </TableCell>
+                            <TableCell>
+                              <div className="flex items-center gap-0.5">
+                                <Button
+                                  variant="ghost"
+                                  size="icon-xs"
+                                  onClick={() => openEditor(p)}
+                                  title="快速编辑（抽屉）"
+                                  aria-label="快速编辑"
+                                >
+                                  <PencilIcon className="size-3.5" />
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon-xs"
+                                  onClick={() => void remove(p)}
+                                  title="删除该配置"
+                                  aria-label="删除"
+                                >
+                                  <Trash2Icon className="text-muted-foreground size-3.5" />
+                                </Button>
+                                <Button variant="ghost" size="icon-xs" asChild title="进入详情页">
+                                  <Link href={`/system/llm/detail?id=${p.id}`} aria-label="进入详情页">
+                                    <ArrowRightIcon className="size-3.5" />
+                                  </Link>
+                                </Button>
+                              </div>
+                            </TableCell>
+                          </TableRow>
+                        );
+                      })}
+                    </TableBody>
+                  </Table>
+                  <TablePagination
+                    page={page}
+                    pageSize={pageSize}
+                    total={filtered.length}
+                    onPageChange={setPage}
+                    onPageSizeChange={(s) => {
+                      setPage(1);
+                      setPageSize(s);
+                    }}
+                  />
+                </>
+              )}
+            </CardContent>
+          </Card>
         </TabsContent>
 
+        {/* 重试与退避：五层重试的全局默认值。每个配置的三层覆盖在详情页里调。 */}
         <TabsContent value="retry" className="mt-4">
           <RetryPolicyPanel />
         </TabsContent>

@@ -1,18 +1,24 @@
 "use client";
 
-import * as React from "react";
-import {
-  RadioIcon,
-  SearchIcon,
-  ChevronLeftIcon,
-  ChevronRightIcon,
-  Loader2Icon,
-  XIcon,
-  Trash2Icon,
-  CopyIcon,
-  CheckIcon,
-} from "lucide-react";
+// LLM 录制:LLM 调用记录列表。
+//
+// 这一页只负责「找到那条记录」——分类、筛选、搜索、分页;单条记录的完整请求 /
+// 响应原文收在详情页(/function/llm-records/detail?id=)。原先的内联 split 面板
+// 之所以撤掉,是因为它把列表挤成半屏、又要同时承担检索与阅读两件事。
+//
+// 关于分类计数(重要):后端 GET /llm/records 只支持 model / session / task 三个
+// 筛选参数,不返回按状态聚合的计数。因此状态分类的计数取自「当前页返回的原始
+// 数据」(未按状态过滤),它不受选中的分类影响(切到「失败」不会让「成功」归零),
+// 但也不是全量数字。界面上以「本页」措辞标明范围,不冒充全量。
 
+import * as React from "react";
+
+import Link from "next/link";
+
+import { ArrowRightIcon, CopyIcon, Loader2Icon, RadioIcon, SearchIcon, SearchXIcon, Trash2Icon } from "lucide-react";
+import { toast } from "sonner";
+
+import { TablePagination } from "@/components/table-pagination";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -23,153 +29,77 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-
-import { Card } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { cn } from "@/lib/utils";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
-import type { LLMRecordItem, LLMRecordDetail, LLMTask } from "@/lib/types";
+import type { LLMRecordItem, LLMTask } from "@/lib/types";
+import { cn, copyText } from "@/lib/utils";
 
-function fmtTime(ts: string) {
-  return new Date(ts).toLocaleString("zh-CN", {
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
-}
-
-function fmtLatency(ms: number) {
-  if (ms < 1000) return `${ms}ms`;
-  return `${(ms / 1000).toFixed(1)}s`;
-}
-
-function fmtTokens(n: number) {
-  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
-  return String(n);
-}
-
-function tryFormatJSON(s: string): string {
-  try {
-    return JSON.stringify(JSON.parse(s), null, 2);
-  } catch {
-    return s;
-  }
-}
-
-// 复制当前框内文本的小按钮。复制成功后短暂显示对勾。text 为空/仅占位符时禁用。
-function CopyButton({ text }: { text: string }) {
-  const [copied, setCopied] = React.useState(false);
-  const timer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
-  React.useEffect(() => () => { if (timer.current) clearTimeout(timer.current); }, []);
-
-  const disabled = !text;
-  const copy = async () => {
-    if (disabled) return;
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch {
-      // navigator.clipboard 在非安全上下文(如 http 局域网)不可用，回退到 execCommand。
-      const ta = document.createElement("textarea");
-      ta.value = text;
-      ta.style.position = "fixed";
-      ta.style.opacity = "0";
-      document.body.appendChild(ta);
-      ta.select();
-      try { document.execCommand("copy"); } catch { /* 忽略：不支持则静默 */ }
-      document.body.removeChild(ta);
-    }
-    setCopied(true);
-    if (timer.current) clearTimeout(timer.current);
-    timer.current = setTimeout(() => setCopied(false), 1500);
-  };
-
-  return (
-    <Button
-      variant="ghost"
-      size="icon"
-      className="size-5 shrink-0"
-      disabled={disabled}
-      title={copied ? "已复制" : "复制内容"}
-      onClick={copy}
-    >
-      {copied ? <CheckIcon className="size-3 text-emerald-600" /> : <CopyIcon className="size-3" />}
-    </Button>
-  );
-}
+import { fmtLatency, fmtTime, fmtTokens, isOk, isSlow, StatusBadge } from "./_components/llm-record-shared";
 
 const PAGE_SIZES = [25, 50, 100];
 
+// 状态分类的取值:all 表示不按状态过滤。
+type StatusFilter = "all" | "ok" | "error";
+
+// 行内「任务 / 会话」列的展示文本:两者都有时用 · 连接,超长由 truncate 收尾。
+function taskSessionText(rec: LLMRecordItem): string {
+  const parts: string[] = [];
+  if (rec.task_id) parts.push(`#${rec.task_id}`);
+  if (rec.session_id) parts.push(rec.session_id);
+  return parts.join(" · ") || "—";
+}
+
 export default function LLMRecordsPage() {
-  const [page, setPage] = React.useState(0);
-  const [size, setSize] = React.useState(50);
+  // 分页:TablePagination 是 1-based,后端 api.llmRecords 的 page 是 0-based,
+  // 转换只发生在调用处(见下方注释),这里统一用 1-based 以便与组件对齐。
+  const [page, setPage] = React.useState(1);
+  const [pageSize, setPageSize] = React.useState(50);
+
+  const [keyword, setKeyword] = React.useState("");
+  // keywordQ 是「按下 Enter / 点搜索」后才生效的关键字,避免每敲一个字就重排列表。
+  const [keywordQ, setKeywordQ] = React.useState("");
   const [session, setSession] = React.useState("");
   const [sessionQ, setSessionQ] = React.useState("");
   const [model, setModel] = React.useState("");
+  const [modelQ, setModelQ] = React.useState("");
+  const [task, setTask] = React.useState("");
+  const [status, setStatus] = React.useState<StatusFilter>("all");
 
   const [records, setRecords] = React.useState<LLMRecordItem[]>([]);
   const [total, setTotal] = React.useState(0);
-  const [loading, setLoading] = React.useState(false);
+  const [loading, setLoading] = React.useState(true);
+  const [reloadTick, setReloadTick] = React.useState(0); // 手动重新拉取(删除后)
 
-  // Recording on/off toggle (settings.llm_record; default off). When off the
-  // backend records nothing.
+  // 录制开关(settings.llm_record,默认关闭)。关闭后后端不再写入新记录,已有记录保留。
   const [recEnabled, setRecEnabled] = React.useState(false);
   const [recBusy, setRecBusy] = React.useState(false);
 
-  // Inline detail panel (Burp-style split, not a dialog)
-  const [selected, setSelected] = React.useState<LLMRecordItem | null>(null);
-  const [detail, setDetail] = React.useState<LLMRecordDetail | null>(null);
-  const [detailLoading, setDetailLoading] = React.useState(false);
-  // 归一化视图 / HTTP 原文视图。原文是排查 provider 侧问题的唯一依据：归一化视图
-  // 不含工具 schema，响应里也没有 tool_use 块。
-  const [rawView, setRawView] = React.useState(false);
-
-  const hasRaw = !!(detail?.raw_request || detail?.raw_response);
-  // 开关保持用户选择，但切到一条无原文的旧记录时自动落回解析视图，而不是显示空白。
-  const showRaw = rawView && hasRaw;
-  // 原文请求体是 JSON，pretty-print 只改排版不改语义，便于阅读；原文响应是 SSE
-  // 帧，tryFormatJSON 解析失败会原样返回，故两边共用一个函数即可。
-  const reqText = showRaw
-    ? detail?.raw_request && tryFormatJSON(detail.raw_request)
-    : detail?.request_body && tryFormatJSON(detail.request_body);
-  const respText = showRaw
-    ? detail?.raw_response
-    : detail?.response_body && tryFormatJSON(detail.response_body);
-
-  // Per-task delete (task picker + confirm dialog)
+  // 按任务删除:deleteTarget 可能是工具栏选中的任务,也可能是行内点删除的那条记录的任务。
   const [tasks, setTasks] = React.useState<LLMTask[]>([]);
-  const [pickedTask, setPickedTask] = React.useState("");
+  const [deleteTarget, setDeleteTarget] = React.useState("");
   const [deleteOpen, setDeleteOpen] = React.useState(false);
   const [deleting, setDeleting] = React.useState(false);
-  const [reloadTick, setReloadTick] = React.useState(0); // manual refetch trigger
 
   // Load recording toggle state on mount.
   React.useEffect(() => {
     let alive = true;
     api
       .settings()
-      .then((s) => { if (alive) setRecEnabled(!!s.llm_record); })
-      .catch(() => {});
-    return () => { alive = false; };
+      .then((s) => {
+        if (alive) setRecEnabled(!!s.llm_record);
+      })
+      .catch(() => {
+        // 开关状态读不到不影响记录浏览,静默按「已关闭」显示。
+      });
+    return () => {
+      alive = false;
+    };
   }, []);
 
   const toggleRecording = async (on: boolean) => {
@@ -178,155 +108,283 @@ export default function LLMRecordsPage() {
     try {
       const s = await api.setSettings({ llm_record: on });
       setRecEnabled(!!s.llm_record);
-    } catch {
+      toast.success(on ? "已开启录制" : "已关闭录制");
+    } catch (e) {
       setRecEnabled(!on); // revert on failure
+      toast.error(`切换录制开关失败:${(e as Error).message}`);
     } finally {
       setRecBusy(false);
     }
   };
 
-  // Debounce session filter.
+  // 会话 / 模型是服务端筛选(会话走 ILIKE 子串,模型走精确匹配),输入防抖后再查,
+  // 避免每敲一个字符打一次库;筛选变化必须回到第 1 页,否则可能停在一个空页。
   React.useEffect(() => {
-    const t = setTimeout(() => setSessionQ(session.trim()), 300);
+    const t = setTimeout(() => {
+      setSessionQ(session.trim());
+      setPage(1);
+    }, 300);
     return () => clearTimeout(t);
   }, [session]);
 
-  // Reset page on filter change.
   React.useEffect(() => {
-    setPage(0);
-  }, [sessionQ, model, size, pickedTask]);
+    const t = setTimeout(() => {
+      setModelQ(model.trim());
+      setPage(1);
+    }, 300);
+    return () => clearTimeout(t);
+  }, [model]);
 
   // Load list.
   React.useEffect(() => {
     let alive = true;
     setLoading(true);
     api
-      .llmRecords({ model: model || undefined, session: sessionQ || undefined, task: pickedTask || undefined, page, size })
+      .llmRecords({
+        model: modelQ || undefined,
+        session: sessionQ || undefined,
+        task: task || undefined,
+        // ⚠️ off-by-one:TablePagination 的 page 是 1-based,而后端 ListLLMRecords
+        // 用 `offset := page * size` 算偏移,即 0-based。这里必须减 1,否则第 1 页
+        // 会直接请求到第 2 页的数据(而且第一页永远看不到)。
+        page: page - 1,
+        size: pageSize,
+      })
       .then((r) => {
         if (!alive) return;
         setRecords(r.records ?? []);
         setTotal(r.total ?? 0);
       })
-      .catch(() => {})
-      .finally(() => alive && setLoading(false));
+      .catch((e) => {
+        if (alive) toast.error(`加载 LLM 记录失败:${(e as Error).message}`);
+      })
+      .finally(() => {
+        if (alive) setLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [page, pageSize, sessionQ, modelQ, task, reloadTick]);
+
+  // 任务清单(带每条任务的全量记录数),用于筛选下拉与删除影响面提示。
+  React.useEffect(() => {
+    let alive = true;
     api
       .llmTasks()
-      .then((r) => { if (alive) setTasks(r.tasks ?? []); })
-      .catch(() => {});
-    return () => { alive = false; };
-  }, [page, size, sessionQ, model, pickedTask, reloadTick]);
+      .then((r) => {
+        if (alive) setTasks(r.tasks ?? []);
+      })
+      .catch(() => {
+        // 任务下拉拉不到时仍可用其余筛选,静默降级为「暂无任务记录」。
+      });
+    return () => {
+      alive = false;
+    };
+  }, [reloadTick]);
 
-  // Delete every LLM record for the picked task, then refetch.
+  // 状态分类计数:取自当前页的原始数据(未按状态过滤),所以切分类不会让别的分类归零。
+  const statusCounts = React.useMemo(() => {
+    let ok = 0;
+    for (const r of records) if (isOk(r.status)) ok++;
+    return { all: records.length, ok, error: records.length - ok };
+  }, [records]);
+
+  // 状态与关键字是「当前页内」的过滤:后端没有 status 参数,也没有跨字段关键字参数。
+  // 全量检索请用上面的会话 / 模型 / 任务筛选(它们是服务端过滤)。
+  const shown = React.useMemo(() => {
+    const kw = keywordQ.trim().toLowerCase();
+    return records.filter((r) => {
+      if (status === "ok" && !isOk(r.status)) return false;
+      if (status === "error" && isOk(r.status)) return false;
+      if (!kw) return true;
+      return [r.model, r.session_id, r.task_id].some((v) => (v ?? "").toLowerCase().includes(kw));
+    });
+  }, [records, status, keywordQ]);
+
+  const serverFiltered = !!(sessionQ || modelQ || task);
+  const clientFiltered = status !== "all" || !!keywordQ;
+
+  const runSearch = () => {
+    setKeywordQ(keyword.trim());
+    setPage(1);
+  };
+
+  const removeTaskRecords = (taskID: string) => {
+    if (!taskID) return;
+    setDeleteTarget(taskID);
+    setDeleteOpen(true);
+  };
+
+  // Delete every LLM record for the target task, then refetch.
   const confirmDelete = () => {
+    if (!deleteTarget) return;
     setDeleting(true);
     api
-      .llmRecordsDeleteTask(pickedTask)
+      .llmRecordsDeleteTask(deleteTarget)
       .then(() => {
+        toast.success(`已删除任务 #${deleteTarget} 的全部记录`);
         setDeleteOpen(false);
-        setSelected(null);
-        setDetail(null);
-        setPickedTask("");
-        setPage(0);
+        setDeleteTarget("");
+        // 删掉的正是当前筛选的任务时清掉筛选,免得停在一个必然为空的列表上。
+        setTask((cur) => (cur === deleteTarget ? "" : cur));
+        setPage(1);
         setReloadTick((t) => t + 1);
       })
-      .catch(() => {})
+      .catch((e) => toast.error(`删除失败:${(e as Error).message}`))
       .finally(() => setDeleting(false));
   };
 
-  // Lazy-load full request/response when a row is selected.
-  React.useEffect(() => {
-    if (!selected) {
-      setDetail(null);
-      return;
-    }
-    let alive = true;
-    setDetailLoading(true);
-    setDetail(null);
-    api
-      .llmRecordDetail(selected.id)
-      .then((d) => { if (alive) setDetail(d); })
-      .catch(() => {})
-      .finally(() => { if (alive) setDetailLoading(false); });
-    return () => { alive = false; };
-  }, [selected]);
+  const copyRowValue = async (value: string, label: string) => {
+    const ok = await copyText(value);
+    toast[ok ? "success" : "error"](ok ? `已复制${label}` : "复制失败，请手动选择文本复制");
+  };
 
-  const totalPages = Math.max(1, Math.ceil(total / size));
-  const rangeStart = total === 0 ? 0 : page * size + 1;
-  const rangeEnd = page * size + records.length;
+  const deleteCount = tasks.find((t) => t.task_id === deleteTarget)?.count;
+
+  // 列表三态在 JSX 外算好:嵌套三元既难读又触发 noNestedTernary,而且「确实没有记录」
+  // 与「搜索无命中」必须给出不同出口(后者要提示放宽筛选),不能共用一个空态。
+  let body: React.ReactNode;
+  if (loading && records.length === 0) {
+    body = (
+      <div className="text-muted-foreground flex items-center justify-center gap-2 py-16 text-sm">
+        <Loader2Icon className="size-4 animate-spin" />
+        加载中…
+      </div>
+    );
+  } else if (records.length === 0) {
+    body = (
+      <div className="text-muted-foreground flex flex-col items-center gap-2 py-16 text-center text-sm">
+        {serverFiltered ? <SearchXIcon className="size-8 opacity-40" /> : <RadioIcon className="size-8 opacity-40" />}
+        <span>
+          {serverFiltered
+            ? "没有匹配的 LLM 调用记录。放宽或清空上方筛选条件后再试。"
+            : "还没有 LLM 调用记录。打开右上角「录制」开关后,后续每次 LLM 调用都会记录在这里。"}
+        </span>
+      </div>
+    );
+  } else if (shown.length === 0) {
+    body = (
+      <div className="text-muted-foreground flex flex-col items-center gap-2 py-16 text-center text-sm">
+        <SearchXIcon className="size-8 opacity-40" />
+        <span>本页没有匹配的记录。关键字与状态分类只作用于当前页,可翻页或改用「会话 / 模型 / 任务」做全量筛选。</span>
+      </div>
+    );
+  } else {
+    body = (
+      <>
+        {/* table-fixed 列宽:各列按最小可读值给固定宽,宽度之和 784px 明显小于
+            1280 视口下的内容区(~897px),不会撑出横向滚动条;模型与任务·会话两列
+            内容可能很长,统一用 truncate + title 收尾。 */}
+        <Table className="table-fixed">
+          <TableHeader>
+            <TableRow className="hover:bg-transparent">
+              <TableHead className="w-36">时间</TableHead>
+              <TableHead className="w-40">模型</TableHead>
+              <TableHead className="w-32">任务 / 会话</TableHead>
+              <TableHead className="w-20">状态</TableHead>
+              <TableHead className="w-20">延迟</TableHead>
+              <TableHead className="w-24">Tokens</TableHead>
+              <TableHead className="w-24">操作</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {shown.map((rec) => {
+              const copyValue = rec.session_id || rec.task_id;
+              const copyLabel = rec.session_id ? "会话 ID" : "任务 ID";
+              return (
+                <TableRow key={rec.id}>
+                  <TableCell className="text-muted-foreground text-xs tabular-nums">{fmtTime(rec.ts)}</TableCell>
+                  {/* 模型列即主入口:点进详情页看完整请求 / 响应 */}
+                  <TableCell className="min-w-0">
+                    <Link
+                      href={`/function/llm-records/detail?id=${rec.id}`}
+                      className="block w-full truncate font-mono text-xs hover:underline"
+                      title={rec.model || "—"}
+                    >
+                      {rec.model || "—"}
+                    </Link>
+                  </TableCell>
+                  <TableCell className="min-w-0">
+                    <span
+                      className="text-muted-foreground block truncate font-mono text-xs"
+                      title={taskSessionText(rec)}
+                    >
+                      {taskSessionText(rec)}
+                    </span>
+                  </TableCell>
+                  <TableCell>
+                    <StatusBadge status={rec.status} />
+                  </TableCell>
+                  <TableCell className={cn("text-xs tabular-nums", isSlow(rec.latency_ms) && "text-amber-500")}>
+                    {fmtLatency(rec.latency_ms)}
+                  </TableCell>
+                  <TableCell
+                    className="truncate text-xs tabular-nums"
+                    title={`输入 ${rec.input_tokens} / 输出 ${rec.output_tokens}`}
+                  >
+                    {fmtTokens(rec.input_tokens)} / {fmtTokens(rec.output_tokens)}
+                  </TableCell>
+                  <TableCell>
+                    <div className="flex items-center gap-0.5">
+                      {/* 列表接口不返回请求/响应正文,这里能复制的只有标识符 */}
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        disabled={!copyValue}
+                        title={copyValue ? `复制${copyLabel}` : "该记录没有会话 / 任务 ID"}
+                        onClick={() => void copyRowValue(copyValue, copyLabel)}
+                      >
+                        <CopyIcon className="size-3.5" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        disabled={!rec.task_id}
+                        title={
+                          rec.task_id ? `删除任务 #${rec.task_id} 的全部记录` : "该记录没有任务归属,无法按任务删除"
+                        }
+                        onClick={() => removeTaskRecords(rec.task_id)}
+                      >
+                        <Trash2Icon className="text-muted-foreground size-3.5" />
+                      </Button>
+                      <Button variant="ghost" size="icon-xs" asChild title="查看详情">
+                        <Link href={`/function/llm-records/detail?id=${rec.id}`} aria-label="查看详情">
+                          <ArrowRightIcon className="size-3.5" />
+                        </Link>
+                      </Button>
+                    </div>
+                  </TableCell>
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+        <TablePagination
+          page={page}
+          pageSize={pageSize}
+          total={total}
+          pageSizeOptions={PAGE_SIZES}
+          onPageChange={setPage}
+          onPageSizeChange={(s) => {
+            setPage(1);
+            setPageSize(s);
+          }}
+        />
+      </>
+    );
+  }
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-4">
-      {/* Header */}
-      <div className="flex items-center justify-between gap-4">
-        <div className="flex items-center gap-2">
-          <RadioIcon className="h-5 w-5 text-muted-foreground" />
-          <h1 className="text-xl font-semibold tracking-tight">LLM 录制</h1>
-          <Badge variant="secondary">{total}</Badge>
+    <div className="p-4 md:p-6">
+      <div className="mb-4 flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <h1 className="font-semibold text-xl">LLM 录制</h1>
+          <p className="text-muted-foreground text-sm">
+            记录每次 LLM 调用的模型、延迟与 token 用量,并保留请求 / 响应原文。点模型名进入详情页查看完整报文。
+          </p>
         </div>
-      </div>
-
-      {/* Toolbar */}
-      <div className="flex flex-wrap items-center gap-2">
-        <div className="relative max-w-sm flex-1">
-          <SearchIcon className="absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            placeholder="搜索 Session ID..."
-            value={session}
-            onChange={(e) => setSession(e.target.value)}
-            className="h-8 pl-8"
-          />
-        </div>
-        <Input
-          placeholder="Model"
-          className="h-8 w-48"
-          value={model}
-          onChange={(e) => setModel(e.target.value)}
-        />
-        <Select value={pickedTask} onValueChange={setPickedTask}>
-          <SelectTrigger size="sm" className="w-56">
-            <SelectValue placeholder="选择任务…" />
-          </SelectTrigger>
-          <SelectContent>
-            {tasks.length === 0 ? (
-              <SelectItem value="__none__" disabled>
-                暂无任务记录
-              </SelectItem>
-            ) : (
-              tasks.map((t) => (
-                <SelectItem key={t.task_id} value={t.task_id}>
-                  <span className="font-mono">#{t.task_id}</span>
-                  <span className="ml-2 text-muted-foreground">（{t.count}）</span>
-                </SelectItem>
-              ))
-            )}
-          </SelectContent>
-        </Select>
-        <Button
-          variant="destructive"
-          size="sm"
-          className="h-8"
-          disabled={!pickedTask || deleting}
-          title={pickedTask ? undefined : "先在上方选择任务"}
-          onClick={() => setDeleteOpen(true)}
-        >
-          <Trash2Icon className="size-3.5" />
-          删除任务对话
-        </Button>
-        <Select value={String(size)} onValueChange={(v) => setSize(Number(v))}>
-          <SelectTrigger size="sm" className="w-28">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {PAGE_SIZES.map((n) => (
-              <SelectItem key={n} value={String(n)}>
-                {n} / 页
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-
-        {/* Recording on/off — off means no LLM calls are recorded */}
-        <div className="flex items-center gap-2 rounded-md border px-2.5 py-1">
+        {/* 录制开关是整页的总闸:关闭后后端不再写新记录(已有记录保留)。 */}
+        <div className="flex items-center gap-2 rounded-md border px-2.5 py-1.5">
           <Switch
             id="llm-rec-toggle"
             size="sm"
@@ -344,220 +402,119 @@ export default function LLMRecordsPage() {
             {recEnabled ? "录制中" : "已关闭"}
           </label>
         </div>
-
-        <div className="ml-auto flex items-center gap-2 text-xs text-muted-foreground">
-          <span className="tabular-nums">
-            {rangeStart}–{rangeEnd} / {total}
-          </span>
-          <Button
-            variant="outline"
-            size="icon"
-            className="size-8"
-            disabled={page <= 0}
-            onClick={() => setPage((p) => Math.max(0, p - 1))}
-          >
-            <ChevronLeftIcon />
-          </Button>
-          <span className="tabular-nums">
-            {page + 1} / {totalPages}
-          </span>
-          <Button
-            variant="outline"
-            size="icon"
-            className="size-8"
-            disabled={page + 1 >= totalPages}
-            onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
-          >
-            <ChevronRightIcon />
-          </Button>
-        </div>
       </div>
 
-      {/* History table + inline detail (Burp-style split) */}
-      <div className="flex h-[calc(100vh-13rem)] min-h-0 flex-col gap-3">
-        <Card className="flex min-h-0 flex-1 flex-col overflow-hidden py-0">
-          <div className="min-h-0 flex-1 overflow-auto">
-            <Table>
-              <TableHeader className="sticky top-0 z-10 bg-card">
-                <TableRow>
-                  <TableHead className="w-[130px]">时间</TableHead>
-                  <TableHead className="w-[60px]">任务</TableHead>
-                  <TableHead className="w-[90px]">Worker</TableHead>
-                  <TableHead className="w-[100px]">Profile</TableHead>
-                  <TableHead className="w-[140px]">Model</TableHead>
-                  <TableHead className="w-[70px]">延迟</TableHead>
-                  <TableHead className="w-[90px]">Tokens</TableHead>
-                  <TableHead className="w-[60px]">状态</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {loading && records.length === 0 ? (
-                  <TableRow>
-                    <TableCell colSpan={8} className="py-12 text-center">
-                      <Loader2Icon className="mx-auto h-5 w-5 animate-spin text-muted-foreground" />
-                    </TableCell>
-                  </TableRow>
-                ) : records.length === 0 ? (
-                  <TableRow>
-                    <TableCell colSpan={8} className="py-12 text-center text-sm text-muted-foreground">
-                      暂无 LLM 调用记录
-                    </TableCell>
-                  </TableRow>
+      <Card>
+        <CardContent className="px-0 pt-4">
+          <div className="flex flex-wrap items-center gap-2 px-4 pb-3 lg:px-6">
+            <div className="relative w-full sm:max-w-xs">
+              <SearchIcon className="text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2" />
+              <Input
+                value={keyword}
+                onChange={(e) => setKeyword(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && runSearch()}
+                placeholder="搜索模型 / 会话 / 任务 ID"
+                title="在当前页内按模型、会话 ID、任务 ID 匹配(Enter 生效)"
+                className="pl-8"
+              />
+            </div>
+            <Button variant="outline" size="sm" onClick={runSearch}>
+              搜索
+            </Button>
+
+            {/* 状态分类器:可点页签 + 计数。计数取自当前页(后端无按状态聚合的接口),
+                所以加「本页」字样标明范围,避免被读成全站总数。 */}
+            <div className="flex items-center gap-1.5">
+              <span className="text-muted-foreground text-xs">本页</span>
+              <Tabs
+                value={status}
+                onValueChange={(v) => {
+                  setPage(1);
+                  setStatus(v as StatusFilter);
+                }}
+              >
+                <TabsList title="计数为当前页统计:后端未提供按状态聚合的接口">
+                  <TabsTrigger value="all">全部 {statusCounts.all}</TabsTrigger>
+                  <TabsTrigger value="ok">成功 {statusCounts.ok}</TabsTrigger>
+                  <TabsTrigger value="error">失败 {statusCounts.error}</TabsTrigger>
+                </TabsList>
+              </Tabs>
+            </div>
+
+            {/* 会话 / 模型 / 任务是服务端筛选:全量生效,不受当前页限制 */}
+            <Input
+              value={session}
+              onChange={(e) => setSession(e.target.value)}
+              placeholder="会话 ID(全量)"
+              title="按会话 ID 全量检索(子串匹配)"
+              className="w-44"
+            />
+            <Input
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              placeholder="模型(全量)"
+              title="按模型名全量检索(精确匹配)"
+              className="w-40"
+            />
+            <Select
+              value={task || "all"}
+              onValueChange={(v) => {
+                setPage(1);
+                setTask(v === "all" ? "" : v);
+              }}
+            >
+              <SelectTrigger className="w-48">
+                <SelectValue placeholder="全部任务" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">全部任务</SelectItem>
+                {tasks.length === 0 ? (
+                  <SelectItem value="__none__" disabled>
+                    暂无任务记录
+                  </SelectItem>
                 ) : (
-                  records.map((rec) => (
-                    <TableRow
-                      key={rec.id}
-                      className={cn(
-                        "cursor-pointer",
-                        selected?.id === rec.id && "bg-accent hover:bg-accent",
-                      )}
-                      onClick={() => setSelected(rec)}
-                    >
-                      <TableCell className="text-xs text-muted-foreground tabular-nums">
-                        {fmtTime(rec.ts)}
-                      </TableCell>
-                      <TableCell className="text-xs font-mono text-muted-foreground">
-                        {rec.task_id ? `#${rec.task_id}` : "-"}
-                      </TableCell>
-                      <TableCell>
-                        <Badge variant="outline" className="text-xs font-mono">
-                          {rec.worker || "-"}
-                        </Badge>
-                      </TableCell>
-                      <TableCell>
-                        <span className="text-xs">{rec.profile_name || "-"}</span>
-                      </TableCell>
-                      <TableCell>
-                        <span className="text-xs font-mono">{rec.model || "-"}</span>
-                      </TableCell>
-                      <TableCell>
-                        <span className={cn("text-xs", rec.latency_ms > 30000 && "text-amber-500")}>
-                          {fmtLatency(rec.latency_ms)}
-                        </span>
-                      </TableCell>
-                      <TableCell>
-                        <span className="text-xs">
-                          {fmtTokens(rec.input_tokens)} / {fmtTokens(rec.output_tokens)}
-                        </span>
-                      </TableCell>
-                      <TableCell>
-                        {rec.status === "ok" ? (
-                          <Badge variant="secondary" className="text-xs text-emerald-600">OK</Badge>
-                        ) : (
-                          <Badge variant="destructive" className="text-xs">Error</Badge>
-                        )}
-                      </TableCell>
-                    </TableRow>
+                  tasks.map((t) => (
+                    <SelectItem key={t.task_id} value={t.task_id}>
+                      <span className="font-mono">#{t.task_id}</span>
+                      <span className="text-muted-foreground">（{t.count}）</span>
+                    </SelectItem>
                   ))
                 )}
-              </TableBody>
-            </Table>
-          </div>
-        </Card>
+              </SelectContent>
+            </Select>
+            {/* 按任务删除:后端只有任务级删除(没有单条删除接口),所以入口固定绑定
+                一个任务,并在确认框里写明会连带删掉该任务的全部记录。 */}
+            <Button
+              variant="outline"
+              size="sm"
+              className="text-muted-foreground"
+              disabled={!task || deleting}
+              title={task ? `删除任务 #${task} 的全部记录` : "先选择任务"}
+              onClick={() => removeTaskRecords(task)}
+            >
+              <Trash2Icon className="size-4" />
+              删除任务对话
+            </Button>
 
-        {/* Inline detail panel */}
-        {selected && (
-          <Card className="flex h-[42%] min-h-0 flex-col overflow-hidden py-0">
-            {/* Detail header */}
-            <div className="flex items-center gap-2 border-b px-3 py-2">
-              <Badge variant="outline" className="text-xs font-mono">
-                #{selected.id}
-              </Badge>
-              <Badge variant="outline" className="text-xs font-mono">
-                {selected.profile_name || "-"}
-              </Badge>
-              <Badge variant="outline" className="text-xs font-mono">
-                {selected.model || "-"}
-              </Badge>
-              {selected.task_id && (
-                <Badge variant="outline" className="text-xs font-mono">
-                  任务 #{selected.task_id}
-                </Badge>
-              )}
-              <span className="text-xs text-muted-foreground">
-                {fmtTime(selected.ts)}
-              </span>
-              <span className={cn("text-xs", selected.latency_ms > 30000 && "text-amber-500")}>
-                {fmtLatency(selected.latency_ms)}
-              </span>
-              {selected.status === "ok" ? (
-                <Badge variant="secondary" className="text-xs text-emerald-600">OK</Badge>
-              ) : (
-                <Badge variant="destructive" className="text-xs">Error</Badge>
-              )}
-              {/* 原文视图开关。旧记录没有原文，此时禁用而非静默回退，避免看着像
-                  「原文与解析一致」。 */}
-              <Button
-                variant={showRaw ? "secondary" : "ghost"}
-                size="sm"
-                className="ml-auto h-7 shrink-0 text-xs"
-                disabled={!hasRaw}
-                title={hasRaw ? "查看与 provider 实际收发的 HTTP 原文" : "该记录录制于此功能上线前，无原文"}
-                onClick={() => setRawView((v) => !v)}
-              >
-                原文
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="size-7 shrink-0"
-                onClick={() => setSelected(null)}
-              >
-                <XIcon />
-              </Button>
-            </div>
-            {/* Request / Response split */}
-            <div className="grid min-h-0 flex-1 grid-cols-2 divide-x">
-              <div className="flex min-h-0 min-w-0 flex-col">
-                <div className="flex items-center gap-2 border-b py-0.5 pr-1.5 pl-3 text-[11px] font-medium text-muted-foreground">
-                  <span>Request{showRaw && " · 原文"}</span>
-                  <CopyButton text={reqText || ""} />
-                </div>
-                <div className="min-h-0 flex-1 overflow-auto">
-                  {detailLoading ? (
-                    <div className="flex items-center gap-2 p-3 text-xs text-muted-foreground">
-                      <Loader2Icon className="size-3.5 animate-spin" />
-                      加载…
-                    </div>
-                  ) : (
-                    <pre className="p-3 font-mono text-xs break-all whitespace-pre-wrap">
-                      {reqText || "（空）"}
-                    </pre>
-                  )}
-                </div>
-              </div>
-              <div className="flex min-h-0 min-w-0 flex-col">
-                <div className="flex items-center gap-2 border-b py-0.5 pr-1.5 pl-3 text-[11px] font-medium text-muted-foreground">
-                  <span>Response{showRaw && " · 原文（SSE）"}</span>
-                  <CopyButton text={respText || ""} />
-                </div>
-                <div className="min-h-0 flex-1 overflow-auto">
-                  {detailLoading ? (
-                    <div className="flex items-center gap-2 p-3 text-xs text-muted-foreground">
-                      <Loader2Icon className="size-3.5 animate-spin" />
-                      加载…
-                    </div>
-                  ) : (
-                    <pre className={cn(
-                      "p-3 font-mono text-xs break-all whitespace-pre-wrap",
-                      selected.status !== "ok" && "text-red-600 dark:text-red-400",
-                    )}>
-                      {respText || "（空）"}
-                    </pre>
-                  )}
-                </div>
-              </div>
-            </div>
-          </Card>
-        )}
-      </div>
+            <span className="text-muted-foreground ml-auto text-xs tabular-nums">
+              {clientFiltered
+                ? `本页 ${shown.length} / 共 ${total} 条`
+                : `${serverFiltered ? `命中 ${total} / ` : ""}共 ${total} 条`}
+            </span>
+          </div>
+
+          {body}
+        </CardContent>
+      </Card>
 
       <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>删除任务「{pickedTask}」的全部 LLM 对话？</AlertDialogTitle>
+            <AlertDialogTitle>删除任务「{deleteTarget}」的全部 LLM 对话？</AlertDialogTitle>
             <AlertDialogDescription>
-              将永久删除该任务的所有 LLM 调用记录（含请求/响应原文），此操作不可撤销。
+              将永久删除该任务的
+              {deleteCount === undefined ? "全部" : ` ${deleteCount} 条`}
+              LLM 调用记录（含请求 / 响应原文），此操作不可撤销。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
