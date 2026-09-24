@@ -100,12 +100,25 @@ function ApprovalOrigin({ row, detail = false }: { row: InterceptApprovalRow; de
 }
 
 function StatusBadge({ status }: { status: string }) {
-  const labels: Record<string, string> = { pending: "待审批", allowed: "已允许", denied: "已拒绝", timeout: "已超时" };
+  const labels: Record<string, string> = {
+    pending: "待审批",
+    allowed: "已允许",
+    denied: "已拒绝",
+    timeout: "已超时",
+    // flagged = AI判疑放通:工具已执行,仅留痕。它不是"待处理",配色必须与
+    // pending(待审批)拉开,否则用户会以为还有事要做。
+    flagged: "已判疑",
+  };
   let variant: "default" | "destructive" | "secondary" | "outline" = "outline";
   if (status === "allowed") variant = "default";
   if (status === "denied") variant = "destructive";
   if (status === "pending") variant = "secondary";
-  return <Badge variant={variant}>{labels[status] ?? status}</Badge>;
+  const className = status === "flagged" ? "border-amber-400 text-amber-600 dark:text-amber-400" : undefined;
+  return (
+    <Badge variant={variant} className={className}>
+      {labels[status] ?? status}
+    </Badge>
+  );
 }
 
 function MatchCell({ row, showReason = true }: { row: InterceptApprovalRow; showReason?: boolean }) {
@@ -164,7 +177,8 @@ const contextLabels: Record<string, string> = {
   tool_result: "工具输出",
 };
 
-const actionLabels: Record<string, string> = { allow: "允许", ask: "转人工审批", deny: "拒绝" };
+// 五档动作文案:deny 同时覆盖"正则拦截"与"AI拦截",flag 是判疑放通(不拦截)。
+const actionLabels: Record<string, string> = { allow: "允许", ask: "转人工审批", deny: "拒绝", flag: "判疑放通" };
 const executionLabels: Record<InterceptAudit["execution_status"], string> = {
   not_started: "尚未执行",
   not_executed: "未执行",
@@ -280,6 +294,13 @@ function DecisionActions({ row, busy, decide }: { row: InterceptApprovalRow; bus
   );
 }
 
+// 判疑放通没有"用户裁决"这一步,标题用"判疑记录"而不是"审批裁决"——后者会让人找按钮。
+function detailHeading(status: string) {
+  if (status === "pending") return "审查状态";
+  if (status === "flagged") return "判疑记录";
+  return "审批裁决";
+}
+
 export function ApprovalDetail({
   row,
   busy,
@@ -312,7 +333,10 @@ export function ApprovalDetail({
         if (cancelled) return;
         setDetail(next);
         setError("");
-        if (next.status !== "pending") onResolved?.(next.status);
+        // flagged(判疑放通)刻意不上报为 onResolved:它是"工具已执行"的留痕行,从来没有
+        // 等待过用户,不属于某次待审批的裁决。调用方(会话内联审批卡)拿到这个值会去渲染
+        // "已允许/已拒绝/已超时",flagged 落到那里会被显示成"已拒绝",与事实相反。
+        if (next.status !== "pending" && next.status !== "flagged") onResolved?.(next.status);
         if (next.status === "pending" || next.audit?.execution_status === "awaiting_result")
           timer = setTimeout(() => void load(), 5000);
       } catch (e) {
@@ -329,9 +353,14 @@ export function ApprovalDetail({
   // Row updates are authoritative until the lazy detail has caught up.
   const current = detail?.status === row.status ? detail : row;
   const audit = detail?.audit;
+  const flagged = current.status === "flagged";
   let execution = audit ? executionLabels[audit.execution_status] : "未记录";
   if (row.status === "pending") execution = "尚未执行";
   if (audit && audit.correlation !== "exact" && audit.effective_action === "allow") execution = "未关联执行结果";
+  // 审计里 flagged 的执行语义等同 allow(auditFor/Log 为它写 effective_action='allow',
+  // execution_status='awaiting_result'),直接复用 executionLabels 会显示成
+  // "已允许，等待执行结果",读起来像用户批准过;这里改成判疑口径。
+  if (flagged && audit?.execution_status === "awaiting_result") execution = "已判疑放通，等待执行结果";
   const command = typeof row.tool_input?.command === "string" ? row.tool_input.command : undefined;
   let initialLabel = source(row) === "model" ? "模型初判" : "规则初判";
   if (audit?.model_fallback) initialLabel = "模型异常回退";
@@ -362,26 +391,39 @@ export function ApprovalDetail({
           </p>
         </div>
         <div className="flex min-w-0 flex-col gap-4 lg:border-l lg:pl-5">
-          <h3 className="font-medium text-muted-foreground text-xs">
-            {current.status === "pending" ? "审查状态" : "审批裁决"}
-          </h3>
+          <h3 className="font-medium text-muted-foreground text-xs">{detailHeading(current.status)}</h3>
           <div className="flex flex-wrap items-center gap-2">
             <StatusBadge status={current.status} />
             <MatchCell row={current} showReason={false} />
           </div>
+          {/* 判疑行没有"允许/拒绝"可点,必须说明为什么——否则用户会以为按钮没加载出来。 */}
+          {flagged ? (
+            <Alert className="border-amber-400/60 bg-amber-50/50 dark:bg-amber-950/20">
+              <AlertDescription className="text-amber-800 text-xs dark:text-amber-300">
+                AI 判定为可疑但未达到拦截阈值，工具已照常执行。此记录仅用于事后复盘，无需处理。
+              </AlertDescription>
+            </Alert>
+          ) : null}
           <p className="whitespace-pre-wrap break-words text-sm leading-7 [overflow-wrap:anywhere]">
             {current.reason?.replace(/^\[模型\]\s*/, "") || "未记录审批理由"}
           </p>
           {audit?.decision_reason ? <p className="text-sm">{audit.decision_reason}</p> : null}
-          {audit?.effective_action ? <p className="text-sm">最终动作：{actionLabels[audit.effective_action]}</p> : null}
+          {audit?.effective_action ? (
+            <p className="text-sm">
+              最终动作：{actionLabels[audit.effective_action]}
+              {/* flagged 的审计按 allow 落库(effective_action='allow'),照抄会读成"用户允许了"。 */}
+              {flagged && audit.effective_action === "allow" ? "（判疑放通，非人工批准）" : null}
+            </p>
+          ) : null}
           <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 text-xs">
             <dt className="text-muted-foreground">来源</dt>
             <dd className="break-words">
               <ApprovalOrigin row={current} detail />
             </dd>
-            <dt className="text-muted-foreground">申请时间</dt>
+            {/* 判疑行没有"申请"这一步,它是判定当时就落库的留痕。 */}
+            <dt className="text-muted-foreground">{flagged ? "记录时间" : "申请时间"}</dt>
             <dd>{fmtTime(row.created_at)}</dd>
-            <dt className="text-muted-foreground">决定时间</dt>
+            <dt className="text-muted-foreground">{flagged ? "判定时间" : "决定时间"}</dt>
             <dd>{fmtTime(current.decided_at)}</dd>
             {audit?.rule_name ? (
               <>
@@ -766,8 +808,11 @@ export function ApprovalRecords({ taskId }: { taskId?: string }) {
   };
 
   const historyById = new Map(rows.map((row) => [row.id, row]));
+  // 待处理队列只收真正在等用户决定的 pending。后端 /intercept/pending 目前已经只返回
+  // status='pending',这里再挡一道:flagged(判疑放通)是"工具已执行"的留痕行,一旦漏进
+  // 这个队列,它会同时出现在"待处理"计数和"全部记录"里,用户会以为有件事没处理。
   const pending: InterceptApprovalRow[] = pendingRows
-    .filter((row) => !taskId || row.task_id === taskId)
+    .filter((row) => row.status === "pending" && (!taskId || row.task_id === taskId))
     .map((row) => ({
       conv_title: "",
       conv_agent_key: "",
@@ -811,6 +856,7 @@ export function ApprovalRecords({ taskId }: { taskId?: string }) {
                 <SelectItem value="denied">已拒绝</SelectItem>
                 <SelectItem value="pending">待审批</SelectItem>
                 <SelectItem value="allowed">已允许</SelectItem>
+                <SelectItem value="flagged">已判疑</SelectItem>
                 <SelectItem value="timeout">已超时</SelectItem>
               </SelectGroup>
             </SelectContent>

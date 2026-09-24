@@ -25,43 +25,61 @@ func (s *Server) chatGuard() *guard.Guard {
 	return guard.NewWithInterceptor(s.m.interceptor)
 }
 
-// wireInterceptReviewer installs the LLM fallback judge into the interceptor. The
-// judge runs only on tool calls that matched no rule (see intercept.Judge). It
-// resolves the configured judge profile (0 → active/default), builds a provider,
-// runs a one-shot JSON classification with an explanation for every verdict.
+// wireInterceptReviewer installs the intercept pipeline's two decision layers into
+// the interceptor. They are wired separately on purpose (see intercept.Judge):
 //
-// Jev 前置分类器：当 jev_guard_enabled 且 jev_api_key 已配置时，Jev 在 LLM
-// 兜底之前先做快速结构化安全分类。高置信(block/allow)直接返回，低置信或
-// Jev 不可用则降级到 LLM 兜底裁判。
+//   - Decision engine (JEV/Laya): a fast structured classifier that runs FIRST on
+//     calls no rule matched, gated only by its own switch (jev_guard_enabled).
+//     Previously this lived inside the LLM reviewer closure, which made it
+//     unreachable whenever llm_judge_enabled was off — the engine appeared enabled
+//     in the UI yet never executed.
+//   - LLM fallback judge: runs only when llm_judge_enabled is on and a reviewer is
+//     wired; resolves the judge profile (0 → active/default) and runs a one-shot
+//     JSON classification with an explanation for every verdict.
 func (s *Server) wireInterceptReviewer() {
-	inner := func(ctx context.Context, profileID int64, prompt string, input intercept.ReviewInput) (intercept.Decision, error) {
-		// ── Jev 前置分类 ──
-		if s.jevGuardEnabled() && s.jevAPIKey() != "" {
-			jevCtx, jevCancel := context.WithTimeout(ctx, 15*time.Second)
-			defer jevCancel()
-			verdict, jevErr := s.jevGuardReview(jevCtx, input.Tool, "", string(input.Arguments))
-			if jevErr == nil && verdict != nil {
-				switch {
-				case verdict.Action == "block":
-					log.Printf("[jev] 直接禁止: %s (confidence=%.2f)", verdict.Reason, verdict.Confidence)
-					return intercept.Decision{
-						Action:  "deny",
-						Message: fmt.Sprintf("Jev 门限禁止: %s", verdict.Reason),
-					}, nil
-				case verdict.Action == "allow" && verdict.Confidence >= 0.8:
-					log.Printf("[jev] 直接放行: %s (confidence=%.2f)", verdict.Reason, verdict.Confidence)
-					return intercept.Decision{
-						Action:  "allow",
-						Message: fmt.Sprintf("Jev 门限放行: %s", verdict.Reason),
-					}, nil
-				default:
-					// 低置信或 review → 降级到 LLM 兜底
-				}
-			}
-			// Jev 不可用或分类不确定 → 继续 LLM 兜底
-		}
+	s.m.interceptor.SetDecisionEngine(s.jevDecisionEngine())
+	s.m.interceptor.SetReviewer(s.llmReviewer())
+}
 
-		// ── LLM 兜底裁判(原有逻辑) ──
+// jevDecisionEngine 把 JEV 前置分类器包成独立的决策引擎回调。开关与凭据都在
+// 闭包内部现读(jevGuardEnabled/jevAPIKey),所以运行时改配置立即生效,不需要重连。
+// 引擎只给"终局裁决":block→deny,高置信 allow→allow,低置信/review→返回 false 交给
+// 下一层(LLM 兜底或人工)。引擎自身的错误一律降级,绝不让监管链路因它不可用而中断。
+func (s *Server) jevDecisionEngine() intercept.DecisionEngine {
+	return func(ctx context.Context, tool string, arguments json.RawMessage) (intercept.Decision, bool) {
+		if !s.jevGuardEnabled() || s.jevAPIKey() == "" {
+			return intercept.Decision{}, false
+		}
+		jevCtx, jevCancel := context.WithTimeout(ctx, 15*time.Second)
+		defer jevCancel()
+		verdict, err := s.jevGuardReview(jevCtx, tool, "", string(arguments))
+		if err != nil || verdict == nil {
+			// Jev 不可用 → 不裁决,交给下一层。
+			return intercept.Decision{}, false
+		}
+		switch {
+		case verdict.Action == "block":
+			log.Printf("[jev] 直接禁止: %s (confidence=%.2f)", verdict.Reason, verdict.Confidence)
+			return intercept.Decision{
+				Action:  "deny",
+				Message: fmt.Sprintf("Jev 门限禁止: %s", verdict.Reason),
+			}, true
+		case verdict.Action == "allow" && verdict.Confidence >= 0.8:
+			log.Printf("[jev] 直接放行: %s (confidence=%.2f)", verdict.Reason, verdict.Confidence)
+			return intercept.Decision{
+				Action:  "allow",
+				Message: fmt.Sprintf("Jev 门限放行: %s", verdict.Reason),
+			}, true
+		default:
+			// 低置信或 review → 不裁决,交给 LLM 兜底裁判。
+			return intercept.Decision{}, false
+		}
+	}
+}
+
+// llmReviewer 是原 LLM 兜底裁判(行为不变,只是不再内嵌 JEV 前置分类)。
+func (s *Server) llmReviewer() intercept.Reviewer {
+	return func(ctx context.Context, profileID int64, prompt string, input intercept.ReviewInput) (intercept.Decision, error) {
 		if profileID == 0 {
 			if p, err := s.m.pg.ActiveProfile(); err == nil && p != nil {
 				profileID = p.ID
@@ -84,7 +102,6 @@ func (s *Server) wireInterceptReviewer() {
 		}
 		return intercept.Decision{Action: v.Action, Message: v.Reason, ProfileID: profileID}, nil
 	}
-	s.m.interceptor.SetReviewer(inner)
 }
 
 func reviewCompletion(ctx context.Context, prov llm.Provider, prompt string, input intercept.ReviewInput) (string, error) {
@@ -348,10 +365,11 @@ func (s *Server) interceptHistory(w http.ResponseWriter, r *http.Request) {
 
 func interceptFilterParams(q url.Values) (db.InterceptApprovalFilter, error) {
 	filter := db.InterceptApprovalFilter{Status: q.Get("status"), DecisionSource: q.Get("decision_source")}
+	// flagged = AI判疑放通(标记但放行),审批记录页要能按它筛选,所以进白名单。
 	switch filter.Status {
-	case "", "pending", "allowed", "denied", "timeout":
+	case "", "pending", "allowed", "denied", "timeout", "flagged":
 	default:
-		return filter, fmt.Errorf("status 必须是 pending、allowed、denied 或 timeout")
+		return filter, fmt.Errorf("status 必须是 pending、allowed、denied、timeout 或 flagged")
 	}
 	switch filter.DecisionSource {
 	case "", "model", "rule", "unknown":
@@ -437,6 +455,63 @@ func (s *Server) interceptSetToolConfig(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
+// --- AI监管总览 (GET /api/intercept/guard-overview) ---
+
+// interceptGuardOverview 一次返回 AI监管页需要的全局状态:两层决策开关、拦截范围、
+// 规则与审计的动作分布。字段名与 web/src/lib/api.ts 的 interceptGuardOverview 严格对齐。
+//
+// 集合类字段(status_counts/action_counts/enabled_tools)必须是非 nil 的空 map/slice:
+// Go 把 nil map 序列化成 JSON null,前端对 null 取键会直接崩(本项目已踩过)。
+func (s *Server) interceptGuardOverview(w http.ResponseWriter, r *http.Request) {
+	pg := s.pg(w)
+	if pg == nil {
+		return
+	}
+	judge := s.m.interceptor.GetJudgeConfig()
+
+	tools, err := s.m.interceptor.GetEnabledTools()
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if tools == nil {
+		tools = []string{}
+	}
+
+	rulesTotal, rulesEnabled, err := pg.CountInterceptRules()
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	actionCounts, err := pg.CountInterceptRulesByAction()
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if actionCounts == nil {
+		actionCounts = map[string]int{}
+	}
+	statusCounts, err := pg.CountInterceptPendingByStatus()
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if statusCounts == nil {
+		statusCounts = map[string]int{}
+	}
+
+	writeJSON(w, 200, map[string]any{
+		"judge_enabled":  judge.Enabled,
+		"jev_enabled":    s.jevGuardEnabled(),
+		"jev_configured": s.jevAPIKey() != "",
+		"enabled_tools":  tools,
+		"rules_total":    rulesTotal,
+		"rules_enabled":  rulesEnabled,
+		"action_counts":  actionCounts,
+		"status_counts":  statusCounts,
+	})
+}
+
 // --- LLM fallback judge config (全局模型兜底) ---
 
 // interceptGetJudgeConfig returns the resolved judge configuration. Prompt is the
@@ -453,9 +528,9 @@ func (s *Server) interceptSetJudgeConfig(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	switch req.FailAction {
-	case "allow", "ask", "deny":
+	case "allow", "ask", "deny", "flag":
 	default:
-		writeErr(w, 400, "fail_action 必须是 allow、ask 或 deny")
+		writeErr(w, 400, "fail_action 必须是 allow、ask、deny 或 flag")
 		return
 	}
 	switch req.AskTimeoutAction {
@@ -505,9 +580,9 @@ func validateInterceptRuleReq(req interceptRuleReq) error {
 		return fmt.Errorf("pattern 不能为空")
 	}
 	switch req.Action {
-	case "allow", "deny", "ask":
+	case "allow", "deny", "ask", "flag":
 	default:
-		return fmt.Errorf("action 必须是 allow、deny 或 ask")
+		return fmt.Errorf("action 必须是 allow、deny、ask 或 flag")
 	}
 	if req.MatchType == "regex" {
 		if _, err := regexp.Compile(req.Pattern); err != nil {

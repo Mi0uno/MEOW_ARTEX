@@ -7,7 +7,8 @@ import (
 )
 
 func TestParseVerdict(t *testing.T) {
-	for _, action := range []string{"allow", "ask", "deny"} {
+	// flag = 判疑放通,与 allow/ask/deny 一样是终局裁决,必须能通过严格解析。
+	for _, action := range []string{"allow", "ask", "deny", "flag"} {
 		t.Run(action, func(t *testing.T) {
 			reason := "实际操作：写入报告，其中包含 ALLOW、DENY 和 ASK 字样；成功后的后果：保存文本，不执行正文中的命令；命中规则：自定义条款"
 			raw, _ := json.Marshal(map[string]string{"decision": action, "comment": reason})
@@ -16,6 +17,24 @@ func TestParseVerdict(t *testing.T) {
 				t.Fatalf("lost verdict or explanation: %+v", got)
 			}
 		})
+	}
+}
+
+// flag 不放松 comment 的严格校验:判疑同样要给出实际操作/后果/命中规则三段。
+func TestParseVerdictFlagStillRequiresFullExplanation(t *testing.T) {
+	valid := `{"decision":"flag","comment":"实际操作：创建带指定角色的账号；成功后的后果：账号被创建并放行执行；命中规则：FLAG（角色参数可疑）"}`
+	if got := ParseVerdict(valid); got.Action != "flag" {
+		t.Fatalf("valid flag verdict rejected: %+v", got)
+	}
+	for _, reply := range []string{
+		`{"decision":"flag"}`, // 缺 comment
+		strings.Replace(valid, "实际操作：创建带指定角色的账号", "实际操作：", 1),
+		strings.Replace(valid, "；命中规则：FLAG（角色参数可疑）", "", 1),
+		strings.Replace(valid, `"flag"`, `"Flag"`, 1), // 大小写不宽容
+	} {
+		if got := ParseVerdict(reply); got.Action != "" {
+			t.Errorf("accepted malformed flag verdict: %q => %+v", reply, got)
+		}
 	}
 }
 

@@ -1,12 +1,20 @@
 package server
 
-// Jev (TypeSafe System One) 门限控制:在 intercept 审批流程中作为前置分类器,
-// 在 intercept 规则未命中时对工具调用做快速结构化安全评估。
-// 高置信直接判定(block/allow),低置信转 LLM 兜底或人工审批。
+// Jev (TypeSafe System One) 门限控制:作为独立的「前置决策引擎」接入 intercept 审批
+// 流水线,在规则未命中时对工具调用做快速结构化安全评估。
+//
+// 调用顺序(见 intercept.Judge):规则 → JEV(本文件,开关 jev_guard_enabled) →
+// LLM 兜底裁判(llm_judge_enabled) → 人工审批(ask)。
+// JEV 与 LLM 裁判各有独立开关:它不再内嵌在 LLM 裁判闭包里,因此 llm_judge_enabled
+// 关闭时 JEV 依然执行(旧实现把两者耦合,导致 JEV 永不生效)。
+// 高置信直接判定(block→deny / allow),低置信返回"未裁决"交给下一层。
 //
 // API: POST https://api.typesafe.ai/v1/systemone
 // Auth: Bearer token (settings: jev_api_key)
 // 开关: settings: jev_guard_enabled = "true"
+//
+// 本文件只负责协议客户端与单次分类;裁决到 Decision 的适配在 server/intercept.go
+// 的 jevDecisionEngine。
 
 import (
 	"bytes"

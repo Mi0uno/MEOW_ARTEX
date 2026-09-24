@@ -288,6 +288,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	go s.reconcileConcurrency()
 	s.startTaskArchiveWorker()
 	s.wireInterceptReviewer() // LLM 兜底审批:未命中拦截规则的命令交给模型判定
+	s.wireTaskGuard()         // 任务级监管门限:按 taskID 覆盖全局姿态(读内存任务句柄,不查库)
 	return s
 }
 
@@ -1017,6 +1018,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/intercept/tool-config", s.interceptSetToolConfig)
 	mux.HandleFunc("GET /api/intercept/judge", s.interceptGetJudgeConfig)
 	mux.HandleFunc("PUT /api/intercept/judge", s.interceptSetJudgeConfig)
+	// AI监管总览:开关状态 + 拦截范围 + 五档动作分布(AI监管页一次取齐)。
+	mux.HandleFunc("GET /api/intercept/guard-overview", s.interceptGuardOverview)
 	// 决策引擎(前置决策模型)配置:AI管理→Decision 配置;监管&规则→AI监管 编排。
 	mux.HandleFunc("GET /api/decision/engines", s.decisionListEngines)
 	mux.HandleFunc("PUT /api/decision/engines/{key}", s.decisionUpdateEngine)
@@ -1626,6 +1629,10 @@ type createTaskReq struct {
 	// proxy_group_id 仅在 pool 时有效(0/省略=用全局选中的代理组)。
 	ProxyMode    string `json:"proxy_mode,omitempty"`
 	ProxyGroupID int64  `json:"proxy_group_id,omitempty"`
+	// 监管门限(任务级覆盖):省略/""/inherit=跟随全局;off=本任务不跑监管;enforce=强制启用。
+	// guard_rule_ids 非空=本任务只用这些规则;空/省略=用全部已启用规则。
+	GuardMode    string  `json:"guard_mode,omitempty"`
+	GuardRuleIDs []int64 `json:"guard_rule_ids,omitempty"`
 }
 
 func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
@@ -1692,6 +1699,18 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// 监管门限:与出网方式同处理——非法值必须在这里报错,不能让它落到 schema 的
+	// CHECK 约束上被静默拒绝(那样表现为"创建成功但门限没生效")。
+	req.GuardMode = db.NormalizeTaskGuardMode(strings.ToLower(strings.TrimSpace(req.GuardMode)))
+	if !db.ValidTaskGuardMode(req.GuardMode) {
+		writeErr(w, 400, "guard_mode 必须是空、inherit、off 或 enforce")
+		return
+	}
+	req.GuardRuleIDs = db.NormalizeTaskGuardRuleIDs(req.GuardRuleIDs)
+	if err := s.validateGuardRuleIDs(req.GuardRuleIDs); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	sourceIDs := make([]int64, 0, len(req.SourceTaskIDs))
 	seenSources := map[int64]bool{}
 	for _, raw := range req.SourceTaskIDs {
@@ -1723,6 +1742,8 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		SRCMode: req.SRCMode,
 		// 出网方式(任务级覆盖):建任务时就定下来,agent 与流水线都按它取出口。
 		ProxyMode: req.ProxyMode, ProxyGroupID: req.ProxyGroupID,
+		// 监管门限(任务级覆盖):同上,建任务时就定下来,拦截链路按 taskID 解析。
+		GuardMode: req.GuardMode, GuardRuleIDs: req.GuardRuleIDs,
 	})
 	if err != nil {
 		if errors.Is(err, db.ErrTaskCategoryInvalid) || errors.Is(err, db.ErrTaskCategoryNotFound) {
@@ -1733,8 +1754,16 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 400, "关联企业不存在或无效")
 			return
 		}
+		if errors.Is(err, db.ErrTaskGuardModeInvalid) {
+			writeErr(w, 400, err.Error())
+			return
+		}
 		writeErr(w, 500, err.Error())
 		return
+	}
+	if req.GuardMode != db.TaskGuardModeInherit {
+		// 非默认门限留痕:谁建了个不跑监管的任务,事后要查得到。
+		logTaskGuardChange(t.ID, req.GuardMode, req.GuardRuleIDs)
 	}
 	log.Printf("[task] 新建任务 #%s «%s» 目标: %s", t.ID, req.Description, req.Goal)
 	// SRC 模式:把企业 SRC 规范转成任务约束(防 AI 越界),再启动任务。

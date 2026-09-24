@@ -1060,6 +1060,14 @@ DROP TRIGGER IF EXISTS trg_intercept_rules_upd ON intercept_rules;
 CREATE TRIGGER trg_intercept_rules_upd BEFORE UPDATE ON intercept_rules
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
+-- 监管动作扩到五档:allow(AI放通)/deny(正则拦截·AI拦截)/ask(AI转人工)/
+-- flag(AI判疑——标记但放通:记一条 flagged 审计行,工具照常执行,不阻塞 worker)。
+-- 内联 CHECK 在首次建表时就已存在,老库不会重建,故必须显式 DROP + ADD
+-- (同 tasks_stage_check 的写法);不改内联定义是为了让新库与老库走同一条迁移路径。
+ALTER TABLE intercept_rules DROP CONSTRAINT IF EXISTS intercept_rules_action_check;
+ALTER TABLE intercept_rules ADD CONSTRAINT intercept_rules_action_check
+    CHECK (action IN ('allow','deny','ask','flag'));
+
 CREATE TABLE IF NOT EXISTS intercept_pending (
     id              BIGSERIAL PRIMARY KEY,
     rule_id         BIGINT REFERENCES intercept_rules(id) ON DELETE SET NULL,
@@ -1084,6 +1092,10 @@ ALTER TABLE intercept_pending ADD COLUMN IF NOT EXISTS audit JSONB;
 ALTER TABLE intercept_pending ADD COLUMN IF NOT EXISTS decision_source TEXT NOT NULL DEFAULT '';
 UPDATE intercept_pending SET decision_source=CASE WHEN rule_id IS NOT NULL THEN 'rule'
  WHEN reason LIKE '[模型]%' THEN 'model' ELSE 'unknown' END WHERE decision_source='';
+-- 审计状态扩到五档:flagged = AI 判疑放通(标记但放行,供人事后复盘)。同 rules.action 的写法。
+ALTER TABLE intercept_pending DROP CONSTRAINT IF EXISTS intercept_pending_status_check;
+ALTER TABLE intercept_pending ADD CONSTRAINT intercept_pending_status_check
+    CHECK (status IN ('pending','allowed','denied','timeout','flagged'));
 
 -- =====================================================================
 -- L. 漏洞发现持久化
@@ -1776,4 +1788,16 @@ CREATE TRIGGER trg_proxy_geo_cache_upd BEFORE UPDATE ON proxy_geo_cache
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS proxy_mode     TEXT NOT NULL DEFAULT '';
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS proxy_group_id BIGINT REFERENCES proxy_groups(id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS idx_tasks_proxy_mode ON tasks(proxy_mode) WHERE proxy_mode <> '';
+
+-- 任务的监管门限(任务级覆盖,与 proxy_mode 同一套语义)。
+--   guard_mode:'' 或 'inherit' = 跟随全局监管配置(默认,保持既有行为)
+--              'off'           = 本任务不跑监管(规则与 AI 审查都不介入)
+--              'enforce'       = 本任务强制启用监管(即使全局关)
+--   guard_rule_ids:本任务只用这些规则 id;空数组 = 用全部已启用规则。
+-- 用途:内网靶场类任务可 off 掉监管避免误拦,SRC 类任务可 enforce 收紧。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS guard_mode TEXT NOT NULL DEFAULT '';
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS guard_rule_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE tasks DROP CONSTRAINT IF EXISTS tasks_guard_mode_check;
+ALTER TABLE tasks ADD CONSTRAINT tasks_guard_mode_check
+    CHECK (guard_mode IN ('','inherit','off','enforce'));
 

@@ -20,8 +20,7 @@ import {
   XIcon,
 } from "lucide-react";
 
-import { StatusBadge } from "@/components/status-badge";
-import { Button } from "@/components/ui/button";
+import { StatusBadge } from "@/components/status-badge";import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
@@ -37,6 +36,8 @@ import type {
   TaskNode,
   TaskScopeRow,
 } from "@/lib/types";
+
+import { TaskGuardPanel } from "./task-guard-panel";
 
 // 紧凑格式化 token 数（12345 → 12.3k，2000000 → 2M）。
 function fmtTokens(n: number): string {
@@ -149,6 +150,17 @@ export function OverviewTab({ taskId }: { taskId: string }) {
     } catch {
       // 忽略：无 PG 时接口报错，卡片自然为空
     }
+  }, [taskId]);
+
+  // 门限改动后只重拉任务本体：3s 轮询里那次 load 会做同样的事，但用户点完保存
+  // 要立刻看到回显，不能等下一个轮询周期。
+  const reloadTask = React.useCallback(() => {
+    api
+      .task(taskId)
+      .then((next) => setTask((prev) => (prev ? { ...prev, ...next } : next)))
+      .catch(() => {
+        // 失败忽略：下一次轮询会补齐，不要因为回显失败弹错。
+      });
   }, [taskId]);
 
   const loadScope = React.useCallback(async () => {
@@ -447,6 +459,10 @@ export function OverviewTab({ taskId }: { taskId: string }) {
           </div>
         </CardContent>
       </Card>
+      {/* 监管门限:任务级覆盖全局监管姿态。放在描述/目标之后、目标管理之前,
+          让它在"这个任务是什么"与"这个任务要做什么"之间保持显眼——它是安全闸门,
+          被折叠或下移到页尾就等于用户不知道自己的任务是不是在无人看守地跑。 */}
+      {task && <TaskGuardPanel task={task} onUpdated={reloadTask} />}
       {/* 目标管理：查看/新增/修改/删除本任务的探索目标。新增与修改会通知规划者并复活任务，
           删除仅通知规划者（不复活）。目标 = 最终可交付/可核验的结果，不是攻击步骤或侦察动作。 */}
       <Card>

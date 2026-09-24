@@ -142,9 +142,12 @@ func (d *DB) DecideInterceptPending(id int64, status string) error {
 }
 
 // CreateDecidedIntercept inserts an intercept_pending row ALREADY in a final state
-// (status = 'allowed' | 'denied'), decided_at stamped now. Used to log allow/deny
-// rule matches for observability — they don't block and need no user action, so unlike
-// CreateInterceptPending (which starts 'pending') this records the outcome directly.
+// (status = 'allowed' | 'denied' | 'flagged'), decided_at stamped now. Used to log
+// allow/deny/flag rule matches for observability — they don't block and need no user
+// action, so unlike CreateInterceptPending (which starts 'pending') this records the
+// outcome directly. 'flagged' is the AI判疑(标记但放通) audit state: the tool DID run,
+// the row exists only so a suspicious-but-passed call stays reviewable. The accepted
+// values are enforced by intercept_pending_status_check in schema.sql.
 func (d *DB) CreateDecidedIntercept(ruleID, convID int64, taskID, agentName, toolName string, input []byte, status, reason string, audits ...*InterceptAudit) (int64, error) {
 	raw := json.RawMessage(input)
 	if len(raw) == 0 {
@@ -244,6 +247,10 @@ LEFT JOIN intercept_rules ir ON ir.id = ip.rule_id`
 const approvalRowSelect = `SELECT ` + approvalRowColumns + approvalRowJoins
 const approvalRowSelectWithAudit = `SELECT ` + approvalRowColumns + `, ip.audit` + approvalRowJoins
 
+// interceptSource 归类一条审计行的判定来源。flag 与其他动作走同一条规则:
+// 由规则产生的(ruleID!=0)是 rule,由模型/决策引擎产生的是 model(reason 带
+// [模型] 前缀,见 intercept.finishEngineDecision 与 Judge 的消息前缀)。因此
+// 新增 flag 档不需要在这里加分支——只要调用方保证 RuleID 与 reason 前缀如实。
 func interceptSource(ruleID int64, reason string) string {
 	if ruleID != 0 {
 		return "rule"
@@ -317,6 +324,60 @@ func (d *DB) ListTaskIntercepts(taskID string) ([]InterceptApprovalRow, error) {
 // ListTaskInterceptsPage is the paginated variant of ListTaskIntercepts.
 func (d *DB) ListTaskInterceptsPage(taskID string, page, size int, filter InterceptApprovalFilter) ([]InterceptApprovalRow, int, error) {
 	return d.listInterceptsPage(taskID, page, size, filter)
+}
+
+// --- AI监管总览聚合 ---
+//
+// 这三个查询服务于 GET /api/intercept/guard-overview:AI监管页要在一次请求里拿到
+// "监管是否生效 + 五档动作各自命中多少"。聚合放在 SQL 侧(而不是把全部规则/审计行
+// 拉到 Go 里数),因为 intercept_pending 是持续增长的流水表,页面只需要计数。
+
+// CountInterceptRules returns (total, enabled) rule counts.
+func (d *DB) CountInterceptRules() (int, int, error) {
+	var total, enabled int
+	err := d.QueryRow(`SELECT COUNT(*), COUNT(*) FILTER (WHERE enabled) FROM intercept_rules`).Scan(&total, &enabled)
+	return total, enabled, err
+}
+
+// CountInterceptRulesByAction returns rule counts keyed by action. Never nil: a
+// nil map would serialise as JSON null and break the frontend, so the caller
+// always gets an empty map when there are no rules.
+func (d *DB) CountInterceptRulesByAction() (map[string]int, error) {
+	rows, err := d.Query(`SELECT action, COUNT(*) FROM intercept_rules GROUP BY action`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var action string
+		var n int
+		if err := rows.Scan(&action, &n); err != nil {
+			return nil, err
+		}
+		out[action] = n
+	}
+	return out, rows.Err()
+}
+
+// CountInterceptPendingByStatus returns audit-row counts keyed by status
+// (pending/allowed/denied/timeout/flagged). Never nil, same reason as above.
+func (d *DB) CountInterceptPendingByStatus() (map[string]int, error) {
+	rows, err := d.Query(`SELECT status, COUNT(*) FROM intercept_pending GROUP BY status`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var status string
+		var n int
+		if err := rows.Scan(&status, &n); err != nil {
+			return nil, err
+		}
+		out[status] = n
+	}
+	return out, rows.Err()
 }
 
 func (d *DB) listInterceptsPage(taskID string, page, size int, filter InterceptApprovalFilter) ([]InterceptApprovalRow, int, error) {

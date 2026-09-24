@@ -1,12 +1,18 @@
 // Package intercept implements the user-configurable tool-call interception layer.
 // Rules are loaded from the database, cached in memory, and evaluated in priority
-// order (highest first) on every PreToolUse event. Three actions are supported:
+// order (highest first) on every PreToolUse event. Five actions are supported:
 //
 //   - allow: immediately permits the call, skipping lower-priority rules.
 //   - deny:  blocks the call and returns a message to the model.
 //   - ask:   blocks the call, creates an intercept_pending record, writes an
 //     activity to the active conversation, then waits for the user to approve or
 //     deny via the /api/intercept/pending/{id}/decide endpoint.
+//   - flag:  判疑放通 — permits the call like allow, but records a "flagged" audit
+//     row so a suspicious-but-not-blocking verdict stays reviewable afterwards.
+//     It never blocks and never waits for a human (that would make it deny/ask).
+//
+// Tool calls that match no rule go through Judge: the pre-decision engine
+// (JEV/Laya, own switch) first, then the LLM fallback judge (llm_judge_enabled).
 //
 // The timeout behaviour is configurable at runtime via SetTimeoutConfig.
 package intercept
@@ -120,6 +126,33 @@ func (p *pendingManager) remove(id int64) {
 // free of any llm dependency. profileID == 0 means "use the active/default profile".
 type Reviewer func(ctx context.Context, profileID int64, prompt string, input ReviewInput) (Decision, error)
 
+// DecisionEngine is the callback for a pre-decision engine (JEV/Laya): a fast
+// structured classification that runs BEFORE the LLM fallback judge on calls no
+// rule matched. Returning (Decision, true) means it reached a terminal verdict.
+//
+// It is parallel to — and independent of — Reviewer: the engine has its own
+// enable switch (jev_guard_enabled). Wiring it inside the Reviewer closure (the
+// previous design) silently bound it to llm_judge_enabled, so with the LLM judge
+// off the engine never ran at all, despite its own switch being on and its
+// credentials configured. Keeping the two callbacks separate is what makes the
+// engine's own switch authoritative.
+type DecisionEngine func(ctx context.Context, tool string, arguments json.RawMessage) (Decision, bool)
+
+// TaskGuardResolver resolves a task's own guard configuration, so a task can
+// override the global posture. mode is one of:
+//
+//	""  / "inherit" — follow the global configuration (the default posture);
+//	"off"           — this task runs no interception at all;
+//	"enforce"       — run interception regardless of any global switch.
+//
+// ruleIDs narrows matching to those rule ids; empty means "all enabled rules".
+// ok=false means no configuration was found for that task → treat as inherit.
+//
+// A nil resolver means "no task-level overrides exist": every task follows the
+// global posture, exactly as before this hook was introduced. That default is
+// deliberate — a missing/never-injected resolver must never widen permissions.
+type TaskGuardResolver func(taskID string) (mode string, ruleIDs []int64, ok bool)
+
 // Interceptor loads intercept rules from the database and evaluates them on
 // tool calls. It is safe for concurrent use.
 type Interceptor struct {
@@ -128,13 +161,68 @@ type Interceptor struct {
 	cached       []compiledRule  // sorted by priority DESC; nil means not loaded yet
 	enabledTools map[string]bool // nil means not loaded yet
 	pending      *pendingManager
-	reviewer     Reviewer // nil = LLM fallback judge not wired
+	reviewer     Reviewer       // nil = LLM fallback judge not wired
+	engine       DecisionEngine // nil = pre-decision engine (JEV/Laya) not wired
+	guardRes     TaskGuardResolver
+}
+
+// SetTaskGuardResolver installs the task-level guard resolver. Passing nil
+// disables task-level overrides (every task follows the global posture).
+func (i *Interceptor) SetTaskGuardResolver(r TaskGuardResolver) {
+	i.mu.Lock()
+	i.guardRes = r
+	i.mu.Unlock()
+}
+
+// resolveTaskGuard resolves the task-level guard configuration for the task in
+// ctx. off is true only for an explicit mode "off"; ruleIDs is nil when there is
+// no restriction.
+//
+// 关键:只有明确的 "off" 才是否决。resolver 未注入、ctx 里没有 taskID、resolver
+// 查不到该任务(ok=false)、mode 是 ""/ "inherit" —— 这四种情况一律返回"不否决、
+// 不限定",即与引入本钩子之前完全一致。安全控制不能因为"没查到配置"而悄悄放通,
+// 所以这里的默认值必须是"照常监管"而不是"跳过监管"。
+//
+// "enforce" 不需要在这里特判:它要求"即使全局关也照常跑",而监管链路上并不存在
+// 一个会整体关闭它的全局开关(工具范围 IsToolEnabled、两层模型开关都是各自独立
+// 的),所以 enforce 与 inherit 在当前实现下是同一路径。
+func (i *Interceptor) resolveTaskGuard(ctx context.Context) (off bool, ruleIDs []int64) {
+	taskID, _ := taskInfoFromCtx(ctx)
+	if taskID == "" {
+		return false, nil
+	}
+	i.mu.RLock()
+	r := i.guardRes
+	i.mu.RUnlock()
+	if r == nil {
+		return false, nil
+	}
+	mode, ids, ok := r(taskID)
+	if !ok {
+		return false, nil
+	}
+	if mode == "off" {
+		return true, nil
+	}
+	if len(ids) == 0 {
+		return false, nil
+	}
+	return false, ids
 }
 
 // SetReviewer installs the LLM fallback judge callback. Passing nil disables it.
 func (i *Interceptor) SetReviewer(r Reviewer) {
 	i.mu.Lock()
 	i.reviewer = r
+	i.mu.Unlock()
+}
+
+// SetDecisionEngine installs the pre-decision engine callback (JEV/Laya). Passing
+// nil disables it. Its enable switch lives in the callback itself (e.g.
+// jev_guard_enabled), so it keeps running even when the LLM judge is turned off.
+func (i *Interceptor) SetDecisionEngine(de DecisionEngine) {
+	i.mu.Lock()
+	i.engine = de
 	i.mu.Unlock()
 }
 
@@ -289,12 +377,15 @@ type Decision struct {
 	RuleName         string
 	ConfigDigest     string
 	ProfileID        int64
-	Action           string // "allow" | "deny" | "ask"
-	Message          string
-	RuleID           int64
-	TimeoutEnabled   bool
-	TimeoutSeconds   int
-	TimeoutAction    string // "deny" | "allow"
+	// "allow" | "deny" | "ask" | "flag"
+	// flag = AI判疑(标记但放通):动作等同 allow(工具照常执行、不阻塞 worker),
+	// 但审计落一条 status='flagged' 的记录,供人事后复盘。它不是"降级拦截"。
+	Action         string
+	Message        string
+	RuleID         int64
+	TimeoutEnabled bool
+	TimeoutSeconds int
+	TimeoutAction  string // "deny" | "allow"
 }
 
 // --- LLM fallback judge ---
@@ -328,7 +419,7 @@ type JudgeConfig struct {
 	ProfileID         int64  `json:"profile_id"` // 0 = follow active/default
 	Prompt            string `json:"prompt"`
 	TimeoutSeconds    int    `json:"timeout_seconds"`
-	FailAction        string `json:"fail_action"` // allow|ask|deny
+	FailAction        string `json:"fail_action"` // allow|ask|deny|flag
 	AskTimeoutSeconds int    `json:"ask_timeout_seconds"`
 	AskTimeoutAction  string `json:"ask_timeout_action"` // allow|deny
 }
@@ -338,10 +429,12 @@ type JudgeConfig struct {
 // follows dwarfs a few KV reads, and freshness avoids a cache-invalidation path.
 func (i *Interceptor) judgeConfig() JudgeConfig {
 	c := JudgeConfig{
-		Enabled:           i.db.GetBool(settingJudgeEnabled, false),
-		ProfileID:         int64(i.getSettingInt(settingJudgeProfileID, 0)),
+		Enabled:   i.db.GetBool(settingJudgeEnabled, false),
+		ProfileID: int64(i.getSettingInt(settingJudgeProfileID, 0)),
+		// fail_action 允许 flag:模型不可用时"判疑放通"是比 allow 更可取的降级——
+		// 工具照样执行,但每次失败都留痕,事后能看出监管实际处于降级状态。
 		TimeoutSeconds:    i.getSettingInt(settingJudgeTimeoutSecs, defaultJudgeTimeoutSecs),
-		FailAction:        i.getSettingChoice(settingJudgeFailAction, defaultJudgeFailAction, "allow", "ask", "deny"),
+		FailAction:        i.getSettingChoice(settingJudgeFailAction, defaultJudgeFailAction, "allow", "ask", "deny", "flag"),
 		AskTimeoutSeconds: i.getSettingInt(settingJudgeAskTimeoutSecs, defaultJudgeAskTimeoutSecs),
 		AskTimeoutAction:  i.getSettingChoice(settingJudgeAskTimeoutAction, defaultJudgeAskTimeoutAction, "allow", "deny"),
 	}
@@ -423,18 +516,54 @@ func (i *Interceptor) SetJudgeConfig(c JudgeConfig) error {
 	return nil
 }
 
-// Judge runs the LLM fallback judge for a tool call that matched no rule. It
-// returns (Decision, true) when the judge produced a terminal verdict, or
-// (Decision{}, false) when the fallback is disabled or not wired (caller then
-// keeps the current behavior: allow). On model error or an unparseable reply it
-// falls back to the configured FailAction. Ask verdicts carry the human-approval
+// Judge runs the fallback decision path for a tool call that matched no rule. It
+// asks, in order:
+//
+//  1. the pre-decision engine (JEV/Laya) — its own switch lives in the callback,
+//     so it runs regardless of llm_judge_enabled;
+//  2. the LLM fallback judge — only when llm_judge_enabled is on and a reviewer
+//     is wired.
+//
+// A task configured with mode "off" gets no verdict from either layer: it opted
+// out of interception, so the caller passes the call through (and, because it
+// never reaches Log/HandleAsk, no audit row is written).
+//
+// It returns (Decision, true) when a terminal verdict was reached, or
+// (Decision{}, false) when no layer decided (caller then keeps the current
+// behavior: allow). On model error or an unparseable reply the LLM path falls
+// back to the configured FailAction. Ask verdicts carry the human-approval
 // timeout so the existing HandleAsk consumes them unchanged.
 func (i *Interceptor) Judge(ctx context.Context, tool string, arguments json.RawMessage) (Decision, bool) {
-	cfg := i.judgeConfig()
+	// 任务级关闭:规则与两层模型全部不介入。放在最前面,是为了让"本任务不跑监管"
+	// 连决策引擎的 15s 网络调用都不发生。
+	if guardOff, _ := i.resolveTaskGuard(ctx); guardOff {
+		return Decision{}, false
+	}
 	i.mu.RLock()
+	engine := i.engine
 	rv := i.reviewer
 	i.mu.RUnlock()
-	if !cfg.Enabled || rv == nil {
+
+	// ── 1) 前置决策引擎(JEV/Laya):与 LLM 裁判平行,自己带开关 ──
+	// 这一层必须放在 llm_judge_enabled 判断之前:旧实现把引擎嵌在 reviewer 闭包
+	// 内部,而 Judge 开头就用 !cfg.Enabled 提前返回,于是 llm_judge_enabled=false
+	// 时引擎一次也不会执行(开关与凭据都配好了却毫无痕迹)。
+	if engine != nil {
+		if dec, ok := engine(ctx, tool, arguments); ok {
+			if out, valid := i.finishEngineDecision(ctx, dec, tool, arguments); valid {
+				return out, true
+			}
+		}
+	}
+
+	// ── 2) LLM 兜底裁判 ──
+	// 先看 reviewer 是否接入:未接入时这一层必然无裁决,不必读设置(省一次 KV 读)。
+	// 与 cfg.Enabled 是"与"关系,交换顺序不改变结果。
+	if rv == nil {
+		return Decision{}, false
+	}
+	cfg := i.judgeConfig()
+	if !cfg.Enabled {
 		return Decision{}, false
 	}
 
@@ -462,7 +591,7 @@ func (i *Interceptor) Judge(ctx context.Context, tool string, arguments json.Raw
 		out = Decision{ProfileID: out.ProfileID, ModelFallback: true, Action: cfg.FailAction, Message: "模型审批失败,按失败策略处理: " + err.Error()}
 	}
 	switch out.Action {
-	case "allow", "ask", "deny":
+	case "allow", "ask", "deny", "flag":
 		// valid verdict
 	default:
 		out = Decision{ProfileID: out.ProfileID, ModelFallback: true, Action: cfg.FailAction, Message: "模型输出无法解析,按失败策略处理"}
@@ -492,6 +621,42 @@ func (i *Interceptor) Judge(ctx context.Context, tool string, arguments json.Raw
 	return out, true
 }
 
+// finishEngineDecision normalises a pre-decision-engine verdict into the same
+// shape the LLM path produces: a validated action, a [模型]-prefixed reason and
+// the ask timeout. An invalid action is reported as "no verdict" (false) rather
+// than silently defaulting — a misbehaving engine must not be able to pass a
+// call through as if it had been approved.
+func (i *Interceptor) finishEngineDecision(ctx context.Context, dec Decision, tool string, arguments json.RawMessage) (Decision, bool) {
+	switch dec.Action {
+	case "allow", "ask", "deny", "flag":
+	default:
+		return Decision{}, false
+	}
+	if dec.Message == "" {
+		dec.Message = "[模型] " + judgeActionLabel(dec.Action)
+	} else if !strings.HasPrefix(dec.Message, "[模型]") {
+		dec.Message = "[模型] " + dec.Message
+	}
+	// 引擎没有规则归属(RuleID=0 → NULL);模型输入留档,审计页才能复盘引擎看到了什么。
+	dec.RuleID = 0
+	if len(dec.ModelInput) == 0 {
+		if input, err := BuildReviewInput(ctx, tool, arguments); err == nil {
+			if b, err := json.Marshal(input); err == nil {
+				dec.ModelInput = b
+				dec.ModelInputDigest = digestInput(b)
+			}
+		}
+	}
+	// ask 必须带上人工审批超时,否则 HandleAsk 会退回 60s 默认值并可能误判超时动作。
+	if dec.Action == "ask" {
+		cfg := i.judgeConfig()
+		dec.TimeoutEnabled = true
+		dec.TimeoutSeconds = cfg.AskTimeoutSeconds
+		dec.TimeoutAction = cfg.AskTimeoutAction
+	}
+	return dec, true
+}
+
 func judgeActionLabel(action string) string {
 	switch action {
 	case "allow":
@@ -500,6 +665,8 @@ func judgeActionLabel(action string) string {
 		return "拦截"
 	case "ask":
 		return "转人工审批"
+	case "flag":
+		return "判疑放通"
 	default:
 		return action
 	}
@@ -508,10 +675,32 @@ func judgeActionLabel(action string) string {
 // Match evaluates the rule list (priority DESC) against a tool call.
 // Returns (Decision, true) for the first matching enabled rule, or
 // (Decision{}, false) if no rule matches.
-func (i *Interceptor) Match(toolName string, input []byte) (Decision, bool) {
+//
+// It takes ctx because task-level configuration lives there (see WithTaskContext):
+// a task with mode "off" must not match any rule, and a task with ruleIDs must
+// only be matched against those rules. Both are applied here rather than in the
+// caller so no call path can bypass task-level gating by forgetting to ask.
+func (i *Interceptor) Match(ctx context.Context, toolName string, input []byte) (Decision, bool) {
+	guardOff, only := i.resolveTaskGuard(ctx)
+	if guardOff {
+		return Decision{}, false
+	}
 	rules, err := i.rules()
 	if err != nil || len(rules) == 0 {
 		return Decision{}, false
+	}
+	if len(only) > 0 {
+		allowed := make(map[int64]bool, len(only))
+		for _, id := range only {
+			allowed[id] = true
+		}
+		filtered := make([]compiledRule, 0, len(rules))
+		for _, r := range rules {
+			if allowed[r.ID] {
+				filtered = append(filtered, r)
+			}
+		}
+		rules = filtered
 	}
 	for _, r := range rules {
 		if ruleMatches(r, toolName, input) {
@@ -556,20 +745,34 @@ func defaultMessage(action, name string) string {
 		return "拦截规则 [" + name + "] 禁止执行此工具"
 	case "ask":
 		return "拦截规则 [" + name + "] 要求用户审批，请等待"
+	case "flag":
+		// 判疑放通不阻塞,消息只用于审计行:说清"已放行但标记",避免事后误读为拦截。
+		return "拦截规则 [" + name + "] 标记为可疑，已放行（留痕待复盘）"
 	default:
 		return ""
 	}
 }
 
-// Log records an allow/deny rule or model decision into intercept_pending as an ALREADY-decided
-// row (status = "allowed" | "denied"), for observability. Unlike HandleAsk it does NOT
-// block and needs no user action — it makes explicit review decisions visible on the history
-// page (GET /api/intercept/history) and the task's intercept list. Best-effort: a DB
-// error is swallowed so logging never changes the tool call's outcome. The pending list
-// (status='pending') is unaffected, so it still shows only asks awaiting a decision.
+// Log records an allow/deny/flag rule or model decision into intercept_pending as an
+// ALREADY-decided row (status = "allowed" | "denied" | "flagged"), for observability.
+// Unlike HandleAsk it does NOT block and needs no user action — it makes explicit review
+// decisions visible on the history page (GET /api/intercept/history) and the task's
+// intercept list. Best-effort: a DB error is swallowed so logging never changes the tool
+// call's outcome. The pending list (status='pending') is unaffected, so it still shows
+// only asks awaiting a decision.
 func (i *Interceptor) Log(ctx context.Context, convID int64, dec Decision, toolName string, input []byte, status string) {
 	taskID, agentName := taskInfoFromCtx(ctx)
 	audit := auditFor(ctx, dec, input, status)
+	if status == "flagged" {
+		// flag 与 allow 的执行语义相同(工具确实会执行),审计必须照 allow 记录,
+		// 否则 CompleteIntercept 的条件(effective_action='allow' 且
+		// execution_status='awaiting_result')不成立,执行结果永远关联不上。
+		audit.EffectiveAction = "allow"
+		audit.ExecutionStatus = "awaiting_result"
+		if audit.Correlation != "exact" {
+			audit.ExecutionStatus = "unknown"
+		}
+	}
 	id, err := i.db.CreateDecidedIntercept(dec.RuleID, convID, taskID, agentName, toolName, input, status, dec.Message, audit)
 	if err == nil {
 		i.bindResult(ctx, id, audit)

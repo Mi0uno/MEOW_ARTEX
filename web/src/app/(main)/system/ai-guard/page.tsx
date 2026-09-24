@@ -1,14 +1,30 @@
 "use client";
 
 // AI监管:操作审查的 AI 流水线编排页。
+//
+// 页面顺序按"能否一眼回答监管到底在不在工作"排:
+//   门限总览(生效状态 + 五档动作分布) → 决策引擎(前置快速判定) →
+//   监管模型(LLM 语义审查) → 任务级门限说明。
+//
 // 流水线:拦截规则未命中 → 决策引擎(前置快速判定,配置在 AI管理·Decision) →
 // 监管模型(LLM 语义审查,从 AI管理·LLM 的配置中选模型) → 人工审批。
+// 两层模型各有独立开关:监管模型关闭不会让决策引擎失效(两者是平行的一层)。
 
 import * as React from "react";
 
 import Link from "next/link";
 
-import { BotIcon, PlugZapIcon, WorkflowIcon } from "lucide-react";
+import {
+  BanIcon,
+  BotIcon,
+  CheckCircle2Icon,
+  InfoIcon,
+  PlugZapIcon,
+  ScanSearchIcon,
+  ScrollTextIcon,
+  UserCheckIcon,
+  WorkflowIcon,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -23,7 +39,20 @@ import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
 import type { DecisionEngine, JudgeConfig, LLMProfile } from "@/lib/types";
 
+import { GuardOverview } from "./_components/guard-overview";
+import { TaskGuardNotes } from "./_components/task-guard-notes";
+
 // ---- 决策引擎(前置) ----
+
+// JEV 的判据(questions)是硬编码在 Go 侧(server/jev.go)的协议内容,后端没有下发,
+// 这里只做说明——**不做假的编辑器**。数值阈值同样来自 server/jev.go 的常量
+// (jevConfidenceMin/jevAllowConf/jevNoulDanger),若后端调整需同步这份文案。
+const JEV_CRITERIA = [
+  { name: "action", kind: "choice", detail: "block / review / allow 三分类:危险直接拦、需人工复核、安全放行" },
+  { name: "is_destructive", kind: "noul", detail: "是否做不可逆破坏(删数据、格式化、重置凭据、卸载软件)" },
+  { name: "is_exfiltration", kind: "noul", detail: "是否把敏感数据送出授权测试范围" },
+  { name: "is_privilege", kind: "noul", detail: "是否尝试对目标提权或绕过认证" },
+];
 
 function DecisionEnginesCard() {
   const [engines, setEngines] = React.useState<DecisionEngine[]>([]);
@@ -72,13 +101,20 @@ function DecisionEnginesCard() {
   return (
     <Card>
       <CardContent className="space-y-4 p-4">
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <PlugZapIcon className="h-4 w-4 text-muted-foreground" />
           <p className="font-medium text-sm">决策引擎（前置快速判定）</p>
           <span className="text-muted-foreground text-xs">
             拦截规则未命中时先做结构化快评,高置信直接判定,低置信转监管模型/人工
           </span>
         </div>
+
+        <p className="rounded-md bg-muted/40 px-3 py-2 text-muted-foreground text-xs leading-relaxed">
+          决策引擎与监管模型是<span className="font-medium text-foreground">两个独立开关的平行层</span>：
+          本卡片里的引擎只要自己启用且凭据可用，即使监管模型关闭也会照常参与判定；引擎的裁决同样会落入五档动作
+          并计入上方门限总览（JEV 目前只输出「拦截」与「放通」两档，未裁决的情况交给监管模型）。
+        </p>
+
         {engines.length === 0 ? (
           <p className="py-6 text-center text-muted-foreground text-sm">加载中…</p>
         ) : (
@@ -129,6 +165,7 @@ function DecisionEnginesCard() {
               <p className="mt-1.5 text-muted-foreground text-xs">{engine.description}</p>
               <p className="mt-1 font-mono text-[11px] text-muted-foreground">
                 {engine.model} @ {engine.base_url}
+                {engine.endpoint_path ? ` · ${engine.endpoint_path}` : ""}
               </p>
               {testResult[engine.key] ? (
                 <p
@@ -137,6 +174,41 @@ function DecisionEnginesCard() {
                   {testResult[engine.key]}
                 </p>
               ) : null}
+
+              {/* 判据说明:如实标注"不可自定义",不提供假编辑器。 */}
+              <div className="mt-2 rounded-md border border-dashed px-2.5 py-2">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <ScrollTextIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                  <span className="font-medium text-[11px]">判据（questions）</span>
+                  <Badge variant="outline" className="px-1.5 py-0 text-[10px] text-muted-foreground">
+                    由引擎协议定义 · 当前不可自定义
+                  </Badge>
+                </div>
+                {engine.key === "jev" ? (
+                  <>
+                    <ul className="mt-1.5 space-y-0.5">
+                      {JEV_CRITERIA.map((q) => (
+                        <li key={q.name} className="text-[11px] text-muted-foreground leading-snug">
+                          <span className="font-mono text-foreground">{q.name}</span>
+                          <span className="ml-1 text-[10px] opacity-70">[{q.kind}]</span>
+                          <span className="ml-1.5">{q.detail}</span>
+                        </li>
+                      ))}
+                    </ul>
+                    <p className="mt-1.5 text-[10px] text-muted-foreground leading-relaxed">
+                      引擎只给「终局裁决」（服务端常量，见 server/jev.go）：分类为 block →
+                      直接拦截（不再设置信度门槛）；allow 且置信度 ≥ 0.8 → 直接放行；任一危险信号（noul）≥ 0.9 →
+                      直接拦截。 其余情况（review、或 allow 但置信度不足）引擎
+                      <span className="font-medium">不作裁决</span>， 交给下一层（监管模型 / 人工），因此 JEV
+                      本身不会产生「判疑」与「转人工」两档。
+                    </p>
+                  </>
+                ) : (
+                  <p className="mt-1.5 text-[10px] text-muted-foreground leading-relaxed">
+                    该引擎为协议预留位：客户端协议接入后，其判据同样由引擎协议固定，本页不做自定义。
+                  </p>
+                )}
+              </div>
             </div>
           ))
         )}
@@ -154,10 +226,40 @@ const defaultJudge = (): JudgeConfig => ({
   profile_id: 0,
   prompt: "",
   timeout_seconds: 15,
-  fail_action: "allow",
+  // 与后端 defaultJudgeFailAction 保持一致(失效方向必须是"拒")。这里的占位值只在
+  // 首次加载完成前显示;若加载失败,保存按钮会被 loadError 禁用,不会把占位值写回。
+  fail_action: "deny",
   ask_timeout_seconds: 300,
   ask_timeout_action: "deny",
 });
+
+// 五档裁决的含义。提示词编辑器旁边直接列出,用户才知道可以要求模型输出哪几种动作。
+const VERDICTS: Array<{ token: string; label: string; tone: string; detail: string }> = [
+  {
+    token: "deny",
+    label: "AI拦截",
+    tone: "text-red-600 dark:text-red-400",
+    detail: "模型判定为真实破坏,直接阻止执行,不转人工。",
+  },
+  {
+    token: "flag",
+    label: "AI判疑",
+    tone: "text-amber-600 dark:text-amber-400",
+    detail: "可疑但置信度不足以拦截:工具照常执行,只落一条判疑审计供事后复盘,不阻塞、不转人工。",
+  },
+  {
+    token: "allow",
+    label: "AI放通",
+    tone: "text-emerald-600 dark:text-emerald-400",
+    detail: "模型判定安全,放行执行。",
+  },
+  {
+    token: "ask",
+    label: "AI转人工",
+    tone: "text-blue-600 dark:text-blue-400",
+    detail: "信息不足且判错代价高,转人工审批,等待超时后按下方策略处理。",
+  },
+];
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
@@ -173,14 +275,23 @@ function JudgeCard() {
   const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [saving, setSaving] = React.useState(false);
+  // 加载失败时禁止保存:此时表单里是占位默认值,写回会把用户的真实配置覆盖掉。
+  const [loadError, setLoadError] = React.useState(false);
+  // 载入时的提示词快照:用于如实标注"当前内容是否与载入时一致",不猜测来源。
+  const [loadedPrompt, setLoadedPrompt] = React.useState("");
+  // 本次会话内点击过"恢复默认模板" → 此时内容确实等于内置模板,可以如实标注。
+  const [restoredDefault, setRestoredDefault] = React.useState(false);
 
   const load = React.useCallback(async () => {
     setLoading(true);
     try {
       const [j, ps] = await Promise.all([api.interceptGetJudgeConfig(), api.llmProfiles()]);
       setCfg(j);
+      setLoadedPrompt(j.prompt);
       setProfiles(ps);
+      setLoadError(false);
     } catch (e) {
+      setLoadError(true);
       toast.error(`加载监管模型配置失败: ${(e as Error).message}`);
     } finally {
       setLoading(false);
@@ -193,6 +304,7 @@ function JudgeCard() {
 
   function patch(p: Partial<JudgeConfig>) {
     setCfg((c) => ({ ...c, ...p }));
+    if (p.prompt !== undefined) setRestoredDefault(false);
   }
 
   async function save() {
@@ -215,12 +327,27 @@ function JudgeCard() {
       await api.interceptSetJudgeConfig({ ...cfg, prompt: "" });
       const j = await api.interceptGetJudgeConfig();
       setCfg(j);
+      setLoadedPrompt(j.prompt);
+      setRestoredDefault(true);
       toast.success("已恢复内置默认模板");
     } catch (e) {
       toast.error(`恢复失败: ${(e as Error).message}`);
     } finally {
       setSaving(false);
     }
+  }
+
+  const promptDirty = cfg.prompt !== loadedPrompt;
+
+  // 提示词来源徽标。后端不存"自定义/内置"标记:未设置时 GET 直接回填内置模板全文,
+  // 因此二者在响应里长得一模一样,本页无法可靠区分——只陈述能确证的事实:
+  // 本次会话点过恢复默认 → 确定是内置模板;与载入内容不一致 → 确定是未保存的改动;
+  // 其余情况标"来源未知"并说明留空即使用内置模板,不编造来源。
+  let promptOrigin = { label: "来源未知", tone: "text-muted-foreground" };
+  if (restoredDefault) {
+    promptOrigin = { label: "内置默认模板", tone: "border-emerald-400/50 text-emerald-600 dark:text-emerald-400" };
+  } else if (promptDirty) {
+    promptOrigin = { label: "已修改（未保存）", tone: "border-amber-400/60 text-amber-600 dark:text-amber-400" };
   }
 
   return (
@@ -238,7 +365,7 @@ function JudgeCard() {
             <p className="mt-0.5 text-muted-foreground text-xs">
               在<span className="font-medium text-foreground">拦截范围</span>内、且
               <span className="font-medium text-foreground">没有任何拦截规则命中</span>
-              、决策引擎也未给出高置信判定时,由监管模型做语义审查（放行 / 转人工 / 拦截）
+              、决策引擎也未给出高置信判定时,由监管模型做语义审查（放通 / 判疑 / 转人工 / 拦截）
             </p>
           </div>
         </div>
@@ -253,15 +380,29 @@ function JudgeCard() {
           {/* 左:提示词编辑器(直接展开,主区域) */}
           <Card className="lg:col-span-3">
             <CardContent className="flex h-full flex-col gap-2 p-4">
-              <div className="flex items-center justify-between">
+              <div className="flex items-start justify-between gap-2">
                 <div>
-                  <p className="font-medium text-sm">审查提示词</p>
-                  <p className="text-muted-foreground text-xs">模型据此判定 ALLOW / ASK / DENY，可直接编辑</p>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <p className="font-medium text-sm">审查提示词</p>
+                    <Badge variant="outline" className={`px-1.5 py-0 text-[10px] ${promptOrigin.tone}`}>
+                      {promptOrigin.label}
+                    </Badge>
+                  </div>
+                  <p className="mt-0.5 text-muted-foreground text-xs">
+                    模型据此判定 allow / flag / ask / deny，可直接编辑
+                  </p>
                 </div>
-                <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={restorePrompt} disabled={saving}>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 shrink-0 text-xs"
+                  onClick={restorePrompt}
+                  disabled={saving}
+                >
                   恢复默认模板
                 </Button>
               </div>
+
               <Textarea
                 className="min-h-[22rem] flex-1 resize-none font-mono text-xs leading-relaxed"
                 value={cfg.prompt}
@@ -269,7 +410,39 @@ function JudgeCard() {
                 placeholder="留空使用内置模板"
                 spellCheck={false}
               />
-              <p className="text-right text-[11px] text-muted-foreground">{cfg.prompt.length} 字</p>
+              <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+                <span>{promptDirty ? "有未保存的改动" : "与载入内容一致"}</span>
+                <span>{cfg.prompt.length} 字</span>
+              </div>
+
+              {/* 提示词语义说明:用户要"配置提示词和规则",这里必须说清提示词能表达什么。 */}
+              <div className="space-y-1.5 rounded-md bg-muted/40 px-3 py-2.5">
+                <p className="font-medium text-[11px]">提示词里可以让模型输出的四种裁决</p>
+                <ul className="space-y-1">
+                  {VERDICTS.map((v) => (
+                    <li key={v.token} className="flex flex-wrap items-baseline gap-x-1.5 text-[11px] leading-snug">
+                      <span className={`font-medium font-mono ${v.tone}`}>{v.token}</span>
+                      <span className="font-medium">{v.label}</span>
+                      <span className="text-muted-foreground">{v.detail}</span>
+                    </li>
+                  ))}
+                </ul>
+                <p className="text-[10px] text-muted-foreground leading-relaxed">
+                  其中 <span className="font-mono">flag</span>（AI判疑）是「标记但放通」这一档：工具照常执行、不阻塞、
+                  不转人工，只在审批记录里留下一条判疑行。默认模板已包含 flag 的适用条件与 FLAG 条款；
+                  自定义提示词时可直接要求模型在「可疑但不够拦」时输出 flag。
+                </p>
+                <p className="text-[10px] text-muted-foreground leading-relaxed">
+                  无论自定义与否，服务端保存后都会在提示词末尾追加《审查输入边界》与《裁决输出协议》—— 输出格式（只输出
+                  decision/comment 的 JSON、四项裁决的取值范围）由平台固定，无需自己声明；提示词只需要写
+                  <span className="font-medium">判定策略</span>。
+                </p>
+                <p className="text-[10px] text-muted-foreground leading-relaxed">
+                  来源标注说明：后端不记录「自定义 / 内置默认」标记（未设置时直接回填内置模板全文），
+                  因此本页无法可靠区分二者，只标注能确证的状态。留空保存即恢复使用内置模板；
+                  「恢复默认模板」会清空自定义内容并回填内置模板。
+                </p>
+              </div>
             </CardContent>
           </Card>
 
@@ -326,11 +499,16 @@ function JudgeCard() {
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem value="allow">放行</SelectItem>
+                      <SelectItem value="flag">判疑放通（标记但放行，留痕）</SelectItem>
                       <SelectItem value="ask">转人工审批</SelectItem>
                       <SelectItem value="deny">拦截</SelectItem>
                     </SelectContent>
                   </Select>
                 </Field>
+                <p className="text-[11px] text-muted-foreground leading-relaxed">
+                  模型不可用时按此策略降级。「判疑放通」比「放行」更可取：工具照常执行，但每次失败都留下判疑记录，
+                  事后能看出监管实际处于降级状态。
+                </p>
               </div>
 
               <Separator />
@@ -364,16 +542,44 @@ function JudgeCard() {
                     </SelectContent>
                   </Select>
                 </Field>
+                <p className="text-[11px] text-muted-foreground leading-relaxed">
+                  仅对「转人工」这一档生效：等待超过该秒数仍未处理时按上方动作放行或拦截。
+                  待审批与超时的记录都会计入门限总览的「AI转人工」。
+                </p>
               </div>
             </CardContent>
           </Card>
         </div>
       )}
 
-      <div className="flex justify-end">
-        <Button size="sm" onClick={save} disabled={saving || loading}>
-          {saving ? "保存中…" : "保存配置"}
-        </Button>
+      {/* 监管模型关闭时,上面整块参数区都不显示 —— 这里补一句它意味着什么,避免用户
+          误以为"关掉模型=监管全关"(决策引擎与规则仍然独立生效)。 */}
+      {!cfg.enabled && (
+        <div className="flex items-start gap-2 rounded-md border border-dashed px-3 py-2.5">
+          <InfoIcon className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          <p className="text-muted-foreground text-xs leading-relaxed">
+            监管模型未启用：规则未命中的调用不再有模型兜底，也不会产生「AI判疑 / AI放通 / AI转人工」这几档模型裁决。
+            拦截规则与决策引擎是各自独立的一层，不受此开关影响。
+          </p>
+        </div>
+      )}
+
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="text-muted-foreground text-xs">
+          {loadError
+            ? "配置加载失败，为避免覆盖服务端现有配置，保存已禁用 — 请先重试加载。"
+            : "提示词与参数改动需要保存后才生效；启用开关同样在保存后写入。"}
+        </p>
+        <div className="flex items-center gap-2">
+          {loadError && (
+            <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading}>
+              重新加载
+            </Button>
+          )}
+          <Button size="sm" onClick={save} disabled={saving || loading || loadError}>
+            {saving ? "保存中…" : "保存配置"}
+          </Button>
+        </div>
       </div>
     </div>
   );
@@ -390,9 +596,35 @@ export default function AiGuardPage() {
           AI监管
         </h1>
         <p className="mt-0.5 text-muted-foreground text-sm">
-          操作审查的 AI 流水线:拦截规则未命中 → 决策引擎快速判定 → 监管模型语义审查 → 人工审批
+          操作审查的门限控制:拦截规则未命中 → 决策引擎快速判定 → 监管模型语义审查 → 人工审批, 最终落到五档动作（正则拦截
+          / AI拦截 / AI判疑 / AI放通 / AI转人工）
         </p>
+        {/* 五档动作速览:标题下方一行,先给用户"这一页在管什么"的完整心智模型。 */}
+        <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+          <span className="inline-flex items-center gap-1">
+            <BanIcon className="h-3.5 w-3.5 text-red-600 dark:text-red-400" />
+            正则拦截
+          </span>
+          <span className="inline-flex items-center gap-1">
+            <BotIcon className="h-3.5 w-3.5 text-rose-600 dark:text-rose-400" />
+            AI拦截
+          </span>
+          <span className="inline-flex items-center gap-1">
+            <ScanSearchIcon className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400" />
+            AI判疑（标记但放通）
+          </span>
+          <span className="inline-flex items-center gap-1">
+            <CheckCircle2Icon className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
+            AI放通
+          </span>
+          <span className="inline-flex items-center gap-1">
+            <UserCheckIcon className="h-3.5 w-3.5 text-blue-600 dark:text-blue-400" />
+            AI转人工
+          </span>
+        </div>
       </div>
+
+      <GuardOverview />
       <DecisionEnginesCard />
       <div className="flex items-center gap-2 text-muted-foreground text-xs">
         <span className="h-px flex-1 bg-border" />
@@ -400,6 +632,7 @@ export default function AiGuardPage() {
         <span className="h-px flex-1 bg-border" />
       </div>
       <JudgeCard />
+      <TaskGuardNotes />
     </div>
   );
 }

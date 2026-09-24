@@ -79,7 +79,14 @@ func (g *Guard) preToolUse(ctx context.Context, ev hook.Event) hook.Result {
 }
 
 // applyIntercept evaluates user-configured intercept rules against the tool call.
-// Both rules and the fallback judge receive the complete tool input.
+// Both rules and the fallback judge receive the complete tool input. The four
+// terminal actions map to: deny=block, ask=block until decided, allow/flag=pass
+// through (flag additionally writes a 'flagged' audit row).
+//
+// Task-level configuration is resolved inside Match/Judge from the task context:
+// a task set to "off" reports neither a rule match nor a verdict, so this
+// function returns a bare pass-through and writes no audit row — the task opted
+// out of interception, and logging it would turn "off" into "off but noisy".
 func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 	if g.interceptor == nil {
 		return hook.Result{}
@@ -88,10 +95,11 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 		return hook.Result{}
 	}
 	ctx = intercept.WithCall(ctx, ev.ToolName, ev.Input)
-	dec, matched := g.interceptor.Match(ev.ToolName, ev.Input)
+	dec, matched := g.interceptor.Match(ctx, ev.ToolName, ev.Input)
 	if !matched {
-		// No rule matched. Ask the LLM fallback judge (if enabled); when it is off
-		// or unwired, keep current behavior and allow.
+		// No rule matched (or the task disabled interception). Ask the pre-decision
+		// engine (JEV/Laya) first, then the LLM fallback judge; when both are off or
+		// unwired, keep current behavior and allow.
 		d, judged := g.interceptor.Judge(ctx, ev.ToolName, ev.Input)
 		if !judged {
 			return hook.Result{}
@@ -106,6 +114,12 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 	case "allow":
 		// Record explicit rule and model approvals so review details remain auditable.
 		g.interceptor.Log(ctx, intercept.ConvIDFromContext(ctx), dec, ev.ToolName, ev.Input, "allowed")
+		return hook.Result{}
+	case "flag":
+		// AI判疑(标记但放通):审计落一条 flagged,工具照常执行。
+		// 这里刻意不走 HandleAsk——判疑的语义就是"不阻塞、不转人工";一旦在这里等待
+		// 用户决定,它退化成 ask,worker 会被无谓挂起。也不返回 block。
+		g.interceptor.Log(ctx, intercept.ConvIDFromContext(ctx), dec, ev.ToolName, ev.Input, "flagged")
 		return hook.Result{}
 	case "ask":
 		// If the worker context is already cancelled (task stopped / killed), block

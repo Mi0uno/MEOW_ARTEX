@@ -26,6 +26,10 @@ export interface Task {
   proxy_group_id?: number;
   /** 实际生效的出网地址(后端回显,便于确认任务真的走了代理池);空=直连 */
   proxy_egress?: string;
+  /** 监管门限(任务级覆盖):""=跟随全局 / "off"=本任务不跑监管 / "enforce"=强制启用监管 */
+  guard_mode?: string;
+  /** 仅本任务启用这些拦截规则 id;空数组=用全部已启用规则 */
+  guard_rule_ids?: number[];
   step_config?: Record<string, unknown>; // 步骤配置
   created_at: string;
   created_unix?: number; // created_at as unix seconds (run-duration calc)
@@ -1747,7 +1751,9 @@ export interface Stats {
 }
 
 // ---- Intercept Rules ----
-export type InterceptAction = "allow" | "deny" | "ask";
+// 五档监管动作:allow=AI放通 / deny=正则拦截·AI拦截 / ask=AI转人工 /
+// flag=AI判疑(标记但放通——记审计不阻塞,供人事后复盘)。
+export type InterceptAction = "allow" | "deny" | "ask" | "flag";
 export type InterceptMatchTarget = "tool_name" | "tool_input";
 export type InterceptMatchType = "string" | "regex";
 
@@ -1778,7 +1784,8 @@ export interface InterceptPending {
   tool_name: string;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   tool_input: Record<string, any>;
-  status: "pending" | "allowed" | "denied" | "timeout";
+  // flagged = AI 判疑放通:工具已执行,此记录仅留痕。
+  status: "pending" | "allowed" | "denied" | "timeout" | "flagged";
   reason: string; // 规则 message 或模型判定理由(模型判定带 [模型] 前缀)
   decided_at?: string;
   created_at: string;
@@ -1790,7 +1797,7 @@ export interface JudgeConfig {
   profile_id: number; // 0 = 跟随激活/默认配置
   prompt: string; // 判定提示词;GET 未设置时后端回填内置模板全文
   timeout_seconds: number; // 模型调用超时
-  fail_action: "allow" | "ask" | "deny"; // 模型出错/超时/不可解析时的回退
+  fail_action: "allow" | "ask" | "deny" | "flag"; // 模型出错/超时/不可解析时的回退
   ask_timeout_seconds: number; // 模型判 ask 转人工后的审批等待超时
   ask_timeout_action: "allow" | "deny"; // 审批超时后的默认动作
 }

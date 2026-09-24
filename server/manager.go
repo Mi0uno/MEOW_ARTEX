@@ -80,6 +80,15 @@ type Task struct {
 	notify       chan struct{}
 	lifecycleMu  sync.RWMutex
 	llmMu        sync.RWMutex
+	// 监管门限(任务级覆盖):''/inherit=跟随全局;off=本任务不跑监管;enforce=强制启用。
+	// GuardRuleIDs 非空=本任务只用这些规则;空=用全部已启用规则。
+	//
+	// 单独一把锁而不是并进 lifecycleMu:这些字段由 guard resolver 在**每次工具调用前**
+	// 读取,而 lifecycleSnapshot() 会连带复制一堆切片;独立小锁让热路径只做一次
+	// RLock + 字符串/切片读,不参与任务列表的生命周期快照。
+	guardMode    string
+	guardRuleIDs []int64
+	guardMu      sync.RWMutex
 
 	// pendingTriggers accumulates the concrete changes (worker done / finding) that
 	// fired planning rounds since the last one consumed them. The debounce coalesces
@@ -159,6 +168,30 @@ func (t *Task) updateLifecycle(update func(*taskLifecycleState)) {
 	t.CategoryID = cloneInt64Ptr(state.CategoryID)
 	t.CategoryName = state.CategoryName
 	t.lifecycleMu.Unlock()
+}
+
+// taskGuardSnapshot 读取任务级监管门限。返回的切片是副本:调用方(resolver)会把它
+// 直接交给 intercept 包,共享底层数组会让"任务运行中改门限"与"正在进行的工具调用"
+// 之间产生数据竞争。
+func (t *Task) taskGuardSnapshot() (string, []int64) {
+	if t == nil {
+		return "", nil
+	}
+	t.guardMu.RLock()
+	defer t.guardMu.RUnlock()
+	return t.guardMode, append([]int64(nil), t.guardRuleIDs...)
+}
+
+// setTaskGuard 更新内存镜像。只由 UpdateTaskMetadata 在数据库写成功后调用,
+// 保证"库里是什么,内存里就是什么"。
+func (t *Task) setTaskGuard(mode string, ruleIDs []int64) {
+	if t == nil {
+		return
+	}
+	t.guardMu.Lock()
+	t.guardMode = mode
+	t.guardRuleIDs = append(t.guardRuleIDs[:0], ruleIDs...)
+	t.guardMu.Unlock()
 }
 
 type taskLLMState struct {
@@ -946,6 +979,7 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		StepKey: pt.StepKey, StepConfig: append(json.RawMessage(nil), pt.StepConfig...),
 		SRCMode: pt.SRCMode, SRCProfileID: pt.SRCProfileID,
 		ProxyMode: pt.ProxyMode, ProxyGroupID: pt.ProxyGroupID,
+		guardMode: pgdb.NormalizeTaskGuardMode(pt.GuardMode), guardRuleIDs: pgdb.NormalizeTaskGuardRuleIDs(pt.GuardRuleIDs),
 		Store: store, Guard: guard.NewWithInterceptor(ic), notify: make(chan struct{}, 1),
 	}
 }
@@ -973,6 +1007,12 @@ func (m *Manager) UpdateTaskMetadata(taskID string, patch pgdb.TaskPatch) (*Task
 		state.Name = updated.Name
 		state.PinnedAt = unixOrZero(updated.PinnedAt)
 	})
+	// 监管门限同时镜像进内存:guard resolver 走内存读,不镜像的话 PATCH 之后
+	// 任务列表显示已改、实际拦截仍按旧门限跑,直到进程重启才对齐。
+	// 只在请求真的带了该字段时才写,避免 name/pin 的 PATCH 把并发改的门限冲掉。
+	if patch.GuardMode != nil || patch.GuardRuleIDs != nil {
+		task.setTaskGuard(pgdb.NormalizeTaskGuardMode(updated.GuardMode), pgdb.NormalizeTaskGuardRuleIDs(updated.GuardRuleIDs))
+	}
 	return task, nil
 }
 

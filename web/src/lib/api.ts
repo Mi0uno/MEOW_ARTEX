@@ -308,6 +308,8 @@ export const api = {
     srcMode?: boolean; // SRC 模式:产出计入 SRC 成果,并按企业 SRC 规范约束 AI 边界
     proxyMode?: string; // 出网方式:""=跟随全局 / "direct"=强制直连 / "pool"=强制走代理池
     proxyGroupId?: number; // 仅 pool 时有效:指定代理组;0/缺省=用全局选中的组
+    guardMode?: string; // 监管门限:""=跟随全局 / "off"=本任务不跑监管 / "enforce"=强制启用
+    guardRuleIds?: number[]; // 仅本任务启用这些拦截规则;空=用全部已启用规则
     stepKey?: string; // recon 单步骤:收集器 key(推荐)
     stepConfig?: Record<string, unknown>; // 步骤配置
     pipeline?: ReconPipeline; // 兼容旧多步编排;stepKey 优先
@@ -328,6 +330,8 @@ export const api = {
       src_mode: input.srcMode ?? false,
       proxy_mode: input.proxyMode ?? "",
       proxy_group_id: input.proxyGroupId ?? 0,
+      guard_mode: input.guardMode ?? "",
+      guard_rule_ids: input.guardRuleIds ?? [],
       step_key: input.stepKey,
       step_config: input.stepConfig,
       pipeline: input.pipeline,
@@ -424,6 +428,10 @@ export const api = {
   updateTask: (id: string, input: { name?: string; pinned?: boolean }) => patch<Task>(`/tasks/${id}`, input),
   renameTask: (id: string, name: string) => patch<Task>(`/tasks/${id}`, { name }),
   pinTask: (id: string, pinned: boolean) => patch<Task>(`/tasks/${id}`, { pinned }),
+  // 任务级监管门限:''=跟随全局 / 'off'=本任务不跑监管 / 'enforce'=强制启用。
+  // ruleIds 空数组=用全部已启用规则。
+  updateTaskGuard: (id: string, guardMode: string, guardRuleIds: number[] = []) =>
+    patch<Task>(`/tasks/${id}`, { guard_mode: guardMode, guard_rule_ids: guardRuleIds }),
   createTaskCategory: (name: string) => post<TaskCategory>("/task-categories", { name }),
   renameTaskCategory: (id: number, name: string) => patch<TaskCategory>(`/task-categories/${id}`, { name }),
   deleteTaskCategory: (id: number) => del<{ deleted: number }>(`/task-categories/${id}`),
@@ -1564,6 +1572,22 @@ export const api = {
   // ---- intercept LLM judge (模型兜底审批,全局配置) ----
   interceptGetJudgeConfig: () => get<JudgeConfig>("/intercept/judge"),
   interceptSetJudgeConfig: (cfg: JudgeConfig) => put<{ ok: boolean }>("/intercept/judge", cfg),
+
+  // ---- AI监管总览(门限是否生效 / 五档动作分布 / 拦截范围) ----
+  // 一次取齐 AI监管页需要的全局状态:决策引擎开关、监管模型开关、拦截范围、
+  // 各档动作的历史命中计数——避免页面为每块信息各发一次请求。
+  interceptGuardOverview: () =>
+    get<{
+      judge_enabled: boolean;
+      jev_enabled: boolean;
+      jev_configured: boolean;
+      enabled_tools: string[];
+      rules_total: number;
+      rules_enabled: number;
+      // 按 action(规则) 与 status(审计) 聚合的历史命中数。
+      action_counts: Record<string, number>;
+      status_counts: Record<string, number>;
+    }>("/intercept/guard-overview"),
 
   // ---- commands (tool execution history, any tool) ----
   commands: (params?: { task?: string; q?: string; page?: number; size?: number }) => {

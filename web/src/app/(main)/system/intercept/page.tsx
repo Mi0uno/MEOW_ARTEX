@@ -96,14 +96,33 @@ const defaultForm = (): RuleForm => ({
 
 // ---- small components ----
 
+// 五档监管动作徽标。flag(判疑放通)与 ask(转人工)都"不拦截"，但只有 ask 会挂起等用户，
+// 因此刻意分成两色(琥珀/蓝)——同色会让人把"判疑放通"误读成"卡住了在等审批"。
 function ActionBadge({ action }: { action: InterceptAction }) {
   if (action === "allow") return <Badge variant="secondary">允许</Badge>;
   if (action === "deny") return <Badge variant="destructive">禁止</Badge>;
+  if (action === "flag")
+    return (
+      <Badge
+        variant="outline"
+        className="border-amber-400 text-amber-600"
+        title="AI判疑：标记但放通，工具照常执行，仅写一条「已判疑」记录供事后复盘"
+      >
+        判疑放通
+      </Badge>
+    );
   return (
-    <Badge variant="outline" className="border-amber-400 text-amber-600">
+    <Badge variant="outline" className="border-blue-400 text-blue-600" title="AI转人工：等待用户审批，期间工具调用被阻塞">
       申请
     </Badge>
   );
+}
+
+// 消息字段在不同档位下含义不同:deny 会回给模型,ask 是审批说明,flag 只写进留痕记录。
+function messageLabel(action: InterceptAction) {
+  if (action === "deny") return "拒绝消息（返回给模型）";
+  if (action === "flag") return "判疑说明（写入留痕记录，可选）";
+  return "审批说明（可选）";
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
@@ -383,7 +402,7 @@ export default function InterceptPage() {
                     <TableHead className="w-[90px]">目标</TableHead>
                     <TableHead className="w-[80px]">类型</TableHead>
                     <TableHead>模式</TableHead>
-                    <TableHead className="w-[72px]">策略</TableHead>
+                    <TableHead className="w-[88px]">策略</TableHead>
                     <TableHead className="w-[64px] text-center">启用</TableHead>
                     <TableHead className="w-[80px]" />
                   </TableRow>
@@ -516,12 +535,21 @@ export default function InterceptPage() {
                   <SelectItem value="allow">允许 — 直接放行，跳过后续规则</SelectItem>
                   <SelectItem value="deny">禁止 — 阻断，返回拒绝消息给模型</SelectItem>
                   <SelectItem value="ask">向用户申请 — 等待审批</SelectItem>
+                  <SelectItem value="flag">AI判疑（标记但放通）— 工具照常执行，只留痕</SelectItem>
                 </SelectContent>
               </Select>
+              {/* 名字里的"判疑"极易被读成"拦截待审"，这里明确它是放通档，不阻塞任务。 */}
+              {form.action === "flag" && (
+                <p className="text-muted-foreground text-xs">
+                  <span className="font-medium text-amber-600">判疑放通不拦截</span>
+                  ：命中的工具会照常执行，只在审批记录里写一条「已判疑」供事后复盘，不产生待审批、不阻塞任务。
+                  因为没有等待，超时字段对它无意义，故此处不提供（与「允许」档一致）。
+                </p>
+              )}
             </Field>
 
             {form.action !== "allow" && (
-              <Field label={form.action === "deny" ? "拒绝消息（返回给模型）" : "审批说明（可选）"}>
+              <Field label={messageLabel(form.action)}>
                 <Textarea
                   placeholder={form.action === "deny" ? "操作被安全策略阻止" : ""}
                   value={form.message}

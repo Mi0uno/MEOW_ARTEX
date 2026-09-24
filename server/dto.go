@@ -73,6 +73,12 @@ type TaskDTO struct {
 	ProxyGroupID int64  `json:"proxy_group_id,omitempty"`
 	// ProxyEgress 是实际生效的出网地址(回显用,便于确认任务真的走了代理池)。
 	ProxyEgress string `json:"proxy_egress,omitempty"`
+	// 监管门限(任务级覆盖):''=跟随全局;off=本任务不跑监管;enforce=强制启用。
+	// 刻意不带 omitempty:前端要用空串区分"跟随全局"与"字段缺失",omitempty 会让
+	// 跟随全局的任务少一个键,前端只能靠 undefined 猜(而 undefined 也可能只是老后端)。
+	GuardMode string `json:"guard_mode"`
+	// 仅本任务启用这些拦截规则;空数组=用全部已启用规则。同理不带 omitempty。
+	GuardRuleIDs []int64 `json:"guard_rule_ids"`
 }
 
 func applyTaskArchiveBlocker(dto *TaskDTO, blockers map[int64]int64) {
@@ -108,6 +114,7 @@ func tokenTotalDTO(u db.TokenUsage) TokenTotalDTO {
 func taskDTO(t *Task, status string) TaskDTO {
 	lifecycle := t.lifecycleSnapshot()
 	llmState := t.llmStateSnapshot()
+	guardMode, guardRuleIDs := t.taskGuardSnapshot()
 	sourceIDs := make([]string, 0, len(lifecycle.SourceTaskIDs))
 	for _, id := range lifecycle.SourceTaskIDs {
 		sourceIDs = append(sourceIDs, i64s(id))
@@ -147,6 +154,8 @@ func taskDTO(t *Task, status string) TaskDTO {
 		SRCProfileID:       t.SRCProfileID,
 		ProxyMode:          t.ProxyMode,
 		ProxyGroupID:       t.ProxyGroupID,
+		GuardMode:          guardMode,
+		GuardRuleIDs:       guardRuleIDs,
 	}
 }
 

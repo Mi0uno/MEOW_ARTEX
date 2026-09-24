@@ -38,6 +38,9 @@ import {
   PlusIcon,
   SaveIcon,
   SearchIcon,
+  ShieldAlertIcon,
+  ShieldCheckIcon,
+  ShieldOffIcon,
   SlidersHorizontalIcon,
   StarIcon,
   TagsIcon,
@@ -63,6 +66,7 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -1373,6 +1377,28 @@ const TaskRow = React.memo(function TaskRow({
           ) : task.proxy_mode === "direct" ? (
             <Badge variant="outline" className="shrink-0 text-xs" title="本任务强制直连,不走代理池">
               直连
+            </Badge>
+          ) : null}
+          {/* 监管门限标记:同样是任务级覆盖才显示(跟随全局是默认,不占位)。
+              "监管已关"用 destructive 是为了在列表里一眼可见——它是唯一会
+              静默放行 AI 动作的状态,不能和普通徽标长得一样。 */}
+          {task.guard_mode === "off" ? (
+            <Badge
+              variant="destructive"
+              className="shrink-0 text-xs"
+              title="本任务不跑监管:规则与 AI 判定都不会介入,也不会留下拦截审计"
+            >
+              <ShieldOffIcon className="size-3" />
+              监管已关
+            </Badge>
+          ) : task.guard_mode === "enforce" ? (
+            <Badge
+              variant="outline"
+              className="shrink-0 text-xs"
+              title="本任务强制启用监管,不受全局开关影响"
+            >
+              <ShieldCheckIcon className="size-3" />
+              强制监管
             </Badge>
           ) : null}
         </div>
@@ -3277,6 +3303,10 @@ function CreateTaskSheet({
       .catch(() => setProxyGroups([]));
   }, [open, proxyMode, proxyGroups.length]);
 
+  // 监管门限(任务级覆盖):""=跟随全局 / "off"=本任务不跑监管 / "enforce"=强制启用。
+  // 规则集限定(guard_rule_ids)本次不做 UI,一律留空 = 用全部已启用规则。
+  const [guardMode, setGuardMode] = React.useState("");
+
   // load LLM profiles once for the create-task profile picker.
   React.useEffect(() => {
     api
@@ -3346,6 +3376,9 @@ function CreateTaskSheet({
         // 出网方式:默认跟随全局;选「走代理池」时可指定用哪个组。
         proxyMode,
         proxyGroupId: proxyMode === "pool" ? proxyGroupID : 0,
+        // 监管门限:默认跟随全局;guard_rule_ids 留空 = 用全部已启用规则。
+        guardMode,
+        guardRuleIds: [],
       });
       toast.success("任务已创建");
       setName("");
@@ -3362,6 +3395,7 @@ function CreateTaskSheet({
       setCoverageEnabled(true);
       setProxyMode("");
       setProxyGroupID(0);
+      setGuardMode("");
       setUploadCount(0);
       draftIdRef.current = "";
       setOpen(false);
@@ -3617,6 +3651,37 @@ function CreateTaskSheet({
                   <p className="text-muted-foreground text-xs">
                     本任务的 agent 与信息搜集流水线都按这里出网。选「走代理池」后请求会经代理组按策略轮换出口；
                     代理池不可用时回落到全局出口而不是静默直连，避免真实 IP 意外暴露。
+                  </p>
+                </div>
+                {/* 监管门限:AI 监管是否管这个任务。默认跟随全局,可单独覆盖。 */}
+                <div className="grid gap-2">
+                  <Label htmlFor="guard-mode">监管门限</Label>
+                  <Select value={guardMode === "" ? "inherit" : guardMode} onValueChange={(v) => setGuardMode(v === "inherit" ? "" : v)}>
+                    <SelectTrigger id="guard-mode" className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectGroup>
+                        <SelectItem value="inherit">跟随全局（默认）</SelectItem>
+                        <SelectItem value="off">本任务不跑监管</SelectItem>
+                        <SelectItem value="enforce">强制启用监管</SelectItem>
+                      </SelectGroup>
+                    </SelectContent>
+                  </Select>
+                  {guardMode === "off" ? (
+                    <Alert variant="destructive">
+                      <ShieldAlertIcon />
+                      <AlertTitle>监管关闭后这个任务将无人看守</AlertTitle>
+                      <AlertDescription>
+                        监管是防 AI 越界的最后一道闸门：关闭后本任务的工具调用不再过拦截规则、也不再过 AI 判定，
+                        <strong>连拦截审计记录都不会留下</strong>，事后无法复盘 agent 到底做了什么。仅在你完全清楚
+                        本任务会执行什么、且已用测试范围/约束另行限定时才使用。
+                      </AlertDescription>
+                    </Alert>
+                  ) : null}
+                  <p className="text-muted-foreground text-xs">
+                    监管在每次工具调用前按本任务的配置裁决。「强制启用」用于在全局关掉监管时仍单独保住这个任务；
+                    本任务只启用部分拦截规则（规则集限定）暂未开放界面，一律使用全部已启用规则。
                   </p>
                 </div>
               </CollapsibleContent>

@@ -66,6 +66,12 @@ type Task struct {
 	// ProxyGroupID 仅在 pool 时有效(0=用全局选中的代理组)。
 	ProxyMode    string `json:"proxy_mode"`
 	ProxyGroupID int64  `json:"proxy_group_id"`
+	// 监管门限(任务级覆盖):''/inherit=跟随全局;off=本任务不跑监管;enforce=强制启用。
+	// 与出网方式同一套「任务级覆盖全局」的语义,由 server 层的 resolver 注入到
+	// intercept 包(见 intercept.TaskGuardResolver),在每次工具调用前生效。
+	// GuardRuleIDs 非空=本任务只用这些规则;空=用全部已启用规则(注意:空不等于"不启用")。
+	GuardMode    string  `json:"guard_mode"`
+	GuardRuleIDs []int64 `json:"guard_rule_ids"`
 }
 
 // 任务级出网模式取值(与 settings 的全局模式同一套语义,外加 ”=跟随全局)。
@@ -82,6 +88,81 @@ func ValidTaskProxyMode(m string) bool {
 		return true
 	}
 	return false
+}
+
+// 任务级监管门限取值(与 db/schema.sql 的 tasks_guard_mode_check 必须逐字一致,
+// 否则非法值会在 INSERT/UPDATE 时被 CHECK 静默拒绝,表现为"保存成功但没生效")。
+const (
+	TaskGuardModeInherit = ""        // 跟随全局监管配置(默认,保持既有行为)
+	TaskGuardModeOff     = "off"     // 本任务不跑监管(规则与模型都不介入)
+	TaskGuardModeEnforce = "enforce" // 强制启用监管(即使全局关)
+)
+
+// ValidTaskGuardMode 校验任务级监管门限。空串合法(表示跟随全局),所以不能用
+// 零值判断"未设置"——调用方需要区分"没传"时必须用指针。
+func ValidTaskGuardMode(m string) bool {
+	switch m {
+	case TaskGuardModeInherit, "inherit", TaskGuardModeOff, TaskGuardModeEnforce:
+		return true
+	}
+	return false
+}
+
+// NormalizeTaskGuardMode 把 'inherit' 折叠成 ''(两者语义相同,统一存空串,
+// 让"跟随全局"在库里只有一种表示,避免列表徽标/比较逻辑要判两个值)。
+func NormalizeTaskGuardMode(m string) string {
+	if m == "inherit" {
+		return TaskGuardModeInherit
+	}
+	return m
+}
+
+// ErrTaskGuardModeInvalid 表示任务级监管门限取值非法(handler 据此回 400)。
+var ErrTaskGuardModeInvalid = errors.New("invalid task guard mode")
+
+// NormalizeTaskGuardRuleIDs 归一规则集限定:去重 + 丢弃非正 id + 保持调用方顺序。
+// 返回 nil 表示"不限定"(用全部已启用规则)。nil 与空切片在拦截侧同义,
+// 但归一后统一成 nil,便于 scanTask 回读时与 []int64{} 保持一致。
+func NormalizeTaskGuardRuleIDs(ids []int64) []int64 {
+	var out []int64
+	seen := map[int64]bool{}
+	for _, id := range ids {
+		if id <= 0 || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
+}
+
+// marshalGuardRuleIDs 把规则集序列化成写库用的 JSONB 字面量。
+// guard_rule_ids 列是 NOT NULL,而 json.Marshal(nil slice) 得到 "null"(JSON null,
+// 不是 SQL NULL),会让下游 SQL 聚合与前端渲染多一种要兼容的形态;所以 nil 一律
+// 写成 '[]'。空数组语义 = "不限定规则",与 nil 相同,不会放宽也不会收紧监管。
+func marshalGuardRuleIDs(ids []int64) ([]byte, error) {
+	if len(ids) == 0 {
+		return []byte("[]"), nil
+	}
+	raw, err := json.Marshal(ids)
+	if err != nil {
+		return nil, fmt.Errorf("marshal guard rule ids: %w", err)
+	}
+	return raw, nil
+}
+
+// parseGuardRuleIDs 反序列化 guard_rule_ids。空值/非法值一律当作"不限定规则"
+// 返回 nil:这一列坏掉时应当退回"用全部已启用规则"(更严),绝不能因为解析失败
+// 而变成"没有任何规则可用"。
+func parseGuardRuleIDs(raw []byte) []int64 {
+	if len(raw) == 0 {
+		return nil
+	}
+	var ids []int64
+	if err := json.Unmarshal(raw, &ids); err != nil {
+		return nil
+	}
+	return NormalizeTaskGuardRuleIDs(ids)
 }
 
 // TaskDeleteResult reports optional related-data cleanup performed in the same
@@ -199,6 +280,10 @@ type TaskCreateOptions struct {
 	// 出网方式(任务级覆盖):''=跟随全局;direct=强制直连;pool=强制走代理池。
 	ProxyMode    string
 	ProxyGroupID int64
+	// 监管门限(任务级覆盖):''/inherit=跟随全局;off=本任务不跑监管;enforce=强制启用。
+	// GuardRuleIDs 非空=本任务只用这些规则;空=用全部已启用规则。
+	GuardMode    string
+	GuardRuleIDs []int64
 }
 
 // CreateTaskWithOptions creates an exploration, task, direct source relations,
@@ -273,10 +358,23 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 	default:
 		return nil, fmt.Errorf("invalid task kind %q", opts.Kind)
 	}
+	// 监管门限归一与校验:与 proxy_mode 同处理——非法值必须报错,不能落到 CHECK 上
+	// 被静默拒绝(那样会得到"创建成功但门限没生效"的假象)。'inherit' 折叠成 ''。
+	opts.GuardMode = NormalizeTaskGuardMode(opts.GuardMode)
+	if !ValidTaskGuardMode(opts.GuardMode) {
+		return nil, fmt.Errorf("%w: %q", ErrTaskGuardModeInvalid, opts.GuardMode)
+	}
+	opts.GuardRuleIDs = NormalizeTaskGuardRuleIDs(opts.GuardRuleIDs)
 	var active *int64
 	if len(opts.LLMProfileIDs) > 0 {
 		id := opts.LLMProfileIDs[0]
 		active = &id
+	}
+	// guard_rule_ids 是 JSONB NOT NULL:显式把 nil 序列化成 '[]' 而不是 'null',
+	// 让"不限定规则"在库里只有一种表示(SQL 聚合/前端渲染都不用额外兼容 JSON null)。
+	guardRuleIDs, err := marshalGuardRuleIDs(opts.GuardRuleIDs)
+	if err != nil {
+		return nil, err
 	}
 	t := &Task{
 		Name: opts.Name, CategoryID: opts.CategoryID, CategoryName: categoryName,
@@ -291,11 +389,12 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 		StepKey: opts.StepKey, StepConfig: append(json.RawMessage(nil), opts.StepConfig...),
 		SRCMode: opts.SRCMode, SRCProfileID: opts.SRCProfileID,
 		ProxyMode: opts.ProxyMode, ProxyGroupID: opts.ProxyGroupID,
+		GuardMode: opts.GuardMode, GuardRuleIDs: append([]int64(nil), opts.GuardRuleIDs...),
 	}
 	if err := tx.QueryRow(`
-INSERT INTO tasks(name, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled, stage, kind, pipeline, step_key, step_config, src_mode, src_profile_id, proxy_mode, proxy_group_id)
-VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NULLIF($16,0),$17,NULLIF($18,0))
-RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled, opts.Stage, opts.Kind, opts.Pipeline, opts.StepKey, opts.StepConfig, opts.SRCMode, opts.SRCProfileID, opts.ProxyMode, opts.ProxyGroupID).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
+INSERT INTO tasks(name, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled, stage, kind, pipeline, step_key, step_config, src_mode, src_profile_id, proxy_mode, proxy_group_id, guard_mode, guard_rule_ids)
+VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NULLIF($16,0),$17,NULLIF($18,0),$19,$20)
+RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled, opts.Stage, opts.Kind, opts.Pipeline, opts.StepKey, opts.StepConfig, opts.SRCMode, opts.SRCProfileID, opts.ProxyMode, opts.ProxyGroupID, opts.GuardMode, guardRuleIDs).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
 		return nil, err
 	}
 	if err := insertTaskRelations(tx, t.ID, opts.SourceTaskIDs); err != nil {
@@ -408,13 +507,16 @@ func insertTaskLLMProfiles(tx *sql.Tx, taskID int64, profileIDs []int64) error {
 
 const taskCols = `id, COALESCE(name,''), category_id,
 COALESCE((SELECT category.name FROM task_categories category WHERE category.id=tasks.category_id),''),
-description, goal, exploration_id, status, paused, queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), first_run_at, deadline_at, COALESCE(stage,'exploit'), COALESCE(kind,'agent'), pipeline, COALESCE(step_key,''), step_config, COALESCE(src_mode,false), COALESCE(src_profile_id,0), COALESCE(proxy_mode,''), COALESCE(proxy_group_id,0)`
+description, goal, exploration_id, status, paused, queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), first_run_at, deadline_at, COALESCE(stage,'exploit'), COALESCE(kind,'agent'), pipeline, COALESCE(step_key,''), step_config, COALESCE(src_mode,false), COALESCE(src_profile_id,0), COALESCE(proxy_mode,''), COALESCE(proxy_group_id,0), COALESCE(guard_mode,''), guard_rule_ids`
 
 func scanTask(sc interface{ Scan(...any) error }) (*Task, error) {
 	var t Task
 	// pipeline/step_config 可空(NULL=未配置):经 []byte 中转,空值保持 nil RawMessage。
 	var pipeline, stepConfig []byte
-	if err := sc.Scan(&t.ID, &t.Name, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.FirstRunAt, &t.DeadlineAt, &t.Stage, &t.Kind, &pipeline, &t.StepKey, &stepConfig, &t.SRCMode, &t.SRCProfileID, &t.ProxyMode, &t.ProxyGroupID); err != nil {
+	// guard_rule_ids 是 JSONB(NOT NULL DEFAULT '[]'):同样走 []byte 中转再解成 []int64,
+	// 老库刚迁移完/手工写坏时的空值与非法值都退回 nil(=不限定规则,用全部已启用规则)。
+	var guardRuleIDs []byte
+	if err := sc.Scan(&t.ID, &t.Name, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.FirstRunAt, &t.DeadlineAt, &t.Stage, &t.Kind, &pipeline, &t.StepKey, &stepConfig, &t.SRCMode, &t.SRCProfileID, &t.ProxyMode, &t.ProxyGroupID, &t.GuardMode, &guardRuleIDs); err != nil {
 		return nil, err
 	}
 	if len(pipeline) > 0 {
@@ -423,6 +525,8 @@ func scanTask(sc interface{ Scan(...any) error }) (*Task, error) {
 	if len(stepConfig) > 0 {
 		t.StepConfig = json.RawMessage(stepConfig)
 	}
+	t.GuardMode = NormalizeTaskGuardMode(t.GuardMode)
+	t.GuardRuleIDs = parseGuardRuleIDs(guardRuleIDs)
 	t.Pinned = t.PinnedAt != nil
 	return &t, nil
 }
@@ -461,23 +565,53 @@ ORDER BY (pinned_at IS NOT NULL) DESC, pinned_at DESC NULLS LAST, id DESC`)
 }
 
 // TaskPatch updates task list metadata without changing execution state.
+//
+// Guard 相关字段一律用指针:监管门限的"跟随全局"就是空串、规则集"不限定"就是空数组,
+// 都是合法值。用零值判断会把"改回跟随全局"变成"没传,保持原样",用户就再也关不掉
+// 自己开的门限——所以必须靠 nil(没传)与 &""/&[]int64{}(传空)区分。
 type TaskPatch struct {
 	Name   *string
 	Pinned *bool
+	// GuardMode: nil=不改;非 nil 时必须是合法取值(""/"inherit"/"off"/"enforce"),
+	// 'inherit' 会归一成 '' 存储。
+	GuardMode *string
+	// GuardRuleIDs: nil=不改;非 nil 时整列替换(空切片=改回"不限定规则")。
+	GuardRuleIDs *[]int64
 }
 
-// UpdateTask applies a partial task name/pin mutation and returns the updated row.
+// UpdateTask applies a partial task name/pin/guard mutation and returns the updated row.
 // Re-pinning an already pinned task preserves its original position.
 func (d *DB) UpdateTask(id int64, patch TaskPatch) (*Task, error) {
+	// 门限归一与校验必须在写库前完成:非法值直接报错,不落到 CHECK 约束上被拒
+	// (那样调用方只会看到一条含糊的约束错误,不知道是哪个字段不合法)。
+	var guardMode *string
+	if patch.GuardMode != nil {
+		mode := NormalizeTaskGuardMode(*patch.GuardMode)
+		if !ValidTaskGuardMode(mode) {
+			return nil, fmt.Errorf("%w: %q", ErrTaskGuardModeInvalid, *patch.GuardMode)
+		}
+		guardMode = &mode
+	}
+	var guardRuleIDs []byte
+	if patch.GuardRuleIDs != nil {
+		raw, err := marshalGuardRuleIDs(NormalizeTaskGuardRuleIDs(*patch.GuardRuleIDs))
+		if err != nil {
+			return nil, err
+		}
+		guardRuleIDs = raw
+	}
 	task, err := scanTask(d.QueryRow(`UPDATE tasks SET
 	name = CASE WHEN $2::boolean THEN $3 ELSE name END,
 	pinned_at = CASE
 		WHEN $4::boolean IS NULL THEN pinned_at
 		WHEN $4::boolean THEN COALESCE(pinned_at, now())
 		ELSE NULL
-	END
+	END,
+	guard_mode = CASE WHEN $5::boolean THEN $6 ELSE guard_mode END,
+	guard_rule_ids = CASE WHEN $7::boolean THEN $8::jsonb ELSE guard_rule_ids END
 WHERE id=$1 AND deleted_at IS NULL
-RETURNING `+taskCols, id, patch.Name != nil, patch.Name, patch.Pinned))
+RETURNING `+taskCols, id, patch.Name != nil, patch.Name, patch.Pinned,
+		guardMode != nil, guardMode, patch.GuardRuleIDs != nil, guardRuleIDs))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

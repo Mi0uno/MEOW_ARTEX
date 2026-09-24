@@ -33,7 +33,8 @@ func TestInterceptFilterHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, state := range []string{"pending", "allowed", "denied", "timeout"} {
+	// flagged = AI判疑放通,与其余四档一样必须可写、可筛(否则该档在审批页不可见)。
+	for _, state := range []string{"pending", "allowed", "denied", "timeout", "flagged"} {
 		if _, err := d.CreateDecidedIntercept(0, 0, scope, "test", "Bash", []byte(`{}`), state, "[模型] fixture"); err != nil {
 			t.Fatal(err)
 		}
@@ -86,11 +87,12 @@ func TestInterceptFilterHTTP(t *testing.T) {
 		query             string
 		total, rows, page int
 	}{
-		{"", 4, 4, 0},
-		{"?page=2&size=2&decision_source=model", 4, 2, 2},
+		{"", 5, 5, 0},
+		{"?page=2&size=2&decision_source=model", 5, 2, 2},
 		{"?page=2&size=1&status=denied&decision_source=model", 1, 0, 2},
 		{"?status=denied&decision_source=unknown", 0, 0, 1},
 		{"?page=0&size=0&status=pending", 1, 1, 1},
+		{"?page=0&size=0&status=flagged", 1, 1, 1},
 	} {
 		rec := do("/api/intercept/task/"+scope+tc.query, true)
 		var body struct {
