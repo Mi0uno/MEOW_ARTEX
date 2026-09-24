@@ -851,6 +851,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/assets", s.listAssets)
 	mux.HandleFunc("GET /api/assets/counts", s.assetCounts)
 	mux.HandleFunc("POST /api/assets", s.insertAssets)
+	mux.HandleFunc("POST /api/assets/import", s.importAssets)
 	mux.HandleFunc("DELETE /api/assets", s.deleteAssets)
 
 	// company system
@@ -1811,6 +1812,8 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	// 必须在 launchTask 之前写:约束要赶在首轮 Planner 之前就位。
 	if req.SRCMode {
 		s.applySRCConstraints(t, req.SRCPlatformID, req.SRCTargetID)
+		// 目标下整理的资产同步挂为任务的测试资产,让 AI 的测试范围与清单一致。
+		s.attachSRCTargetAssets(t, req.SRCPlatformID, req.SRCTargetID)
 	}
 	// 共享的建后流程(seed + 种子意图 + 后台目标分解 + engine.Run),与 spawn_task 复用同一段。
 	// launchTask 内部异步,不阻塞 UI —— 目标分解在后台可见地进行。

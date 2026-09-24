@@ -196,6 +196,8 @@ export const sidebarItems: NavGroup[] = [
           // 平台选择:选平台 → 进入平台添加目标 → 进入目标添加资产。平台的奖励标准/
           // 评分标准/守则/规范(含上传的附件)会转成 AI 硬约束,防止越界。
           { id: "src-platforms", title: "平台选择", url: "/function/src/platforms", icon: Building2 },
+          // 目标:跨平台聚合全部目标(「我有哪些目标」「挂在哪几个平台」一屏可答)。
+          { id: "src-targets", title: "目标", url: "/function/src/targets", icon: Target },
           // 任务:只看 SRC 模式任务(?src=1 锁定视图),本页「新建任务」默认按 SRC 模式创建。
           { id: "src-tasks", title: "任务", url: "/function/tasks?src=1", icon: Crosshair },
           // 平台批量:按平台聚合目标,勾选多个目标批量建 SRC 任务。

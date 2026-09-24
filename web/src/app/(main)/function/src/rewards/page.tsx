@@ -33,7 +33,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Textarea } from "@/components/ui/textarea";
 import { TablePagination } from "@/components/table-pagination";
 import { api } from "@/lib/api";
-import type { Company, SRCOverview, SRCReward } from "@/lib/types";
+import type { Company, SRCOverview, SRCPlatform, SRCReward, SRCTarget } from "@/lib/types";
 
 const PAGE_SIZE = 50;
 
@@ -66,6 +66,8 @@ export default function SRCRewardsPage() {
   const [counts, setCounts] = React.useState<Record<string, number>>({});
   const [query, setQuery] = React.useState("");
   const [companyFilter, setCompanyFilter] = React.useState("all");
+  const [platformFilter, setPlatformFilter] = React.useState("all");
+  const [targetFilter, setTargetFilter] = React.useState("all");
   const [statusFilter, setStatusFilter] = React.useState("all");
   const [severity, setSeverity] = React.useState("all");
   const [sort, setSort] = React.useState("created");
@@ -74,14 +76,32 @@ export default function SRCRewardsPage() {
   const [pageSize, setPageSize] = React.useState(PAGE_SIZE);
   const [loading, setLoading] = React.useState(true);
   const [editing, setEditing] = React.useState<SRCReward | null>(null);
+  const [platforms, setPlatforms] = React.useState<SRCPlatform[]>([]);
+  const [targets, setTargets] = React.useState<SRCTarget[]>([]);
+  // 平台筛选变化时精确拉该平台下的目标列表(比按计数过滤准确)
+  React.useEffect(() => {
+    if (platformFilter === "all") {
+      api
+        .srcTargets({ limit: 200 })
+        .then((r) => setTargets(r.targets ?? []))
+        .catch(() => setTargets([]));
+      return;
+    }
+    api
+      .srcPlatformTargets(Number(platformFilter), { limit: 200 })
+      .then((r) => setTargets(r.targets ?? []))
+      .catch(() => setTargets([]));
+  }, [platformFilter]);
 
   const load = React.useCallback(
-    (q: string, cid: string, st: string, sev: string, srt: string, p: number, size: number) => {
+    (q: string, cid: string, pid: string, tid: string, st: string, sev: string, srt: string, p: number, size: number) => {
       setLoading(true);
       api
         .srcRewards({
           q,
           companyId: cid === "all" ? undefined : Number(cid),
+          platformId: pid === "all" ? undefined : Number(pid),
+          targetId: tid === "all" ? undefined : Number(tid),
           status: st === "all" ? "" : st,
           severity: sev === "all" ? "" : sev,
           sort: srt,
@@ -104,6 +124,15 @@ export default function SRCRewardsPage() {
       .companies()
       .then(setCompanies)
       .catch(() => undefined);
+    // 平台/目标筛选数据:成果现在带平台与目标归属,筛选器要跟上(「补天这个月收录多少」一屏可答)。
+    api
+      .srcPlatforms({ limit: 200 })
+      .then((r) => setPlatforms(r.platforms ?? []))
+      .catch(() => undefined);
+    api
+      .srcTargets({ limit: 200 })
+      .then((r) => setTargets(r.targets ?? []))
+      .catch(() => setTargets([]));
     api
       .srcOverview()
       .then((r) =>
@@ -118,16 +147,16 @@ export default function SRCRewardsPage() {
   }, []);
 
   React.useEffect(() => {
-    load(query, companyFilter, statusFilter, severity, sort, page, pageSize);
+    load(query, companyFilter, platformFilter, targetFilter, statusFilter, severity, sort, page, pageSize);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [companyFilter, statusFilter, severity, sort, page, pageSize]);
+  }, [companyFilter, platformFilter, targetFilter, statusFilter, severity, sort, page, pageSize]);
 
   const search = () => {
     setPage(1);
-    load(query, companyFilter, statusFilter, severity, sort, 1, pageSize);
+    load(query, companyFilter, platformFilter, targetFilter, statusFilter, severity, sort, 1, pageSize);
   };
   const reload = () => {
-    load(query, companyFilter, statusFilter, severity, sort, page, pageSize);
+    load(query, companyFilter, platformFilter, targetFilter, statusFilter, severity, sort, page, pageSize);
     api
       .srcOverview()
       .then(setOverview)
@@ -245,6 +274,44 @@ export default function SRCRewardsPage() {
                   {companies.map((c) => (
                     <SelectItem key={c.id} value={String(c.id)}>
                       {c.name}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+            <Select
+              value={platformFilter}
+              onValueChange={(v) => {
+                setPage(1);
+                setPlatformFilter(v);
+                // 平台切换后目标选项随之失效:目标归属按平台×目标,切平台要重选目标。
+                setTargetFilter("all");
+              }}
+            >
+              <SelectTrigger className="w-44">
+                <SelectValue placeholder="平台" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectItem value="all">全部平台</SelectItem>
+                  {platforms.map((p) => (
+                    <SelectItem key={p.id} value={String(p.id)}>
+                      {p.name}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+            <Select value={targetFilter} onValueChange={(v) => { setPage(1); setTargetFilter(v); }}>
+              <SelectTrigger className="w-40">
+                <SelectValue placeholder="目标" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectItem value="all">全部目标</SelectItem>
+                  {targets.map((t) => (
+                    <SelectItem key={t.id} value={String(t.id)}>
+                      {t.name}
                     </SelectItem>
                   ))}
                 </SelectGroup>

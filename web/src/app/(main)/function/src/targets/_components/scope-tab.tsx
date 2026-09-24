@@ -193,19 +193,28 @@ export function ScopeTab({
         <CardHeader className="flex-row flex-wrap items-center justify-between gap-2">
           <div className="flex flex-wrap items-center gap-2">
             <CardTitle className="text-sm">编辑平台</CardTitle>
-            <Select value={String(platformId)} onValueChange={switchPlatform}>
-              <SelectTrigger className="w-56">
-                <SelectValue placeholder="选择平台" />
-              </SelectTrigger>
-              <SelectContent>
-                {links.map((l) => (
-                  <SelectItem key={l.platform_id} value={String(l.platform_id)}>
-                    {l.platform_name || `平台 #${l.platform_id}`}
-                    {l.enabled ? "" : "(停用)"}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            {/* 单平台目标不需要切换器:多出来的一次点击是纯摩擦,用静态徽标标明平台即可。
+                多平台时切换器才是必需的(切换=换一份授权范围)。 */}
+            {links.length === 1 ? (
+              <Badge variant="outline" className="max-w-56 truncate" title={currentName}>
+                {currentName}
+                {link?.enabled === false ? "(停用)" : ""}
+              </Badge>
+            ) : (
+              <Select value={String(platformId)} onValueChange={switchPlatform}>
+                <SelectTrigger className="w-56">
+                  <SelectValue placeholder="选择平台" />
+                </SelectTrigger>
+                <SelectContent>
+                  {links.map((l) => (
+                    <SelectItem key={l.platform_id} value={String(l.platform_id)}>
+                      {l.platform_name || `平台 #${l.platform_id}`}
+                      {l.enabled ? "" : "(停用)"}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
             {dirty && (
               <Badge variant="outline" className="bg-amber-500/15 text-amber-600 border-amber-500/30">
                 有未保存修改

@@ -130,6 +130,47 @@ func (s *Server) srcOverview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, st)
 }
 
+// attachSRCTargetAssets 把「平台×目标」下整理的资产自动挂为任务的测试资产。
+//
+// 为什么必须挂:SRC 用户在目标详情页整理的资产清单(手工录入 + 信息搜集导入)是本次
+// 测试范围的直接表达;建任务若只带企业归属,任务资产会按企业名下资产聚合,
+// 这份清单就成了纯展示——AI 实际测试范围与用户整理的范围对不上。
+// 幂等性由 AttachAssetsToTask 保证(已在任务里的资产按 existing 计数,不重复挂)。
+func (s *Server) attachSRCTargetAssets(t *Task, platformID, targetID int64) {
+	if t == nil || targetID <= 0 {
+		return
+	}
+	ids, err := s.m.PG().SrcTargetAssetIDs(targetID, platformID)
+	if err != nil {
+		log.Printf("[src] 任务 %s 读取目标 #%d 资产失败: %v", t.ID, targetID, err)
+		return
+	}
+	if len(ids) == 0 {
+		return
+	}
+	as := s.assetStore()
+	if as == nil {
+		return
+	}
+	// 服务层 Task.ID 在 wire 上是字符串(int64 → string 约定),资产挂载要数值型。
+	taskID, err := strconv.ParseInt(t.ID, 10, 64)
+	if err != nil || taskID <= 0 {
+		return
+	}
+	// 摘要限长(MaxTaskAssetSummaryRunes=500):目标名可能很长,截断保证不超
+	name := t.Name
+	if len(name) > 60 {
+		name = name[:60]
+	}
+	mutation, err := as.AttachAssetsToTask(taskID, ids, "SRC 目标资产 · "+name)
+	if err != nil {
+		log.Printf("[src] 任务 %s 挂载目标 #%d 的 %d 个资产失败: %v", t.ID, targetID, len(ids), err)
+		return
+	}
+	log.Printf("[src] 任务 %s 已挂载目标 #%d 资产 %d 个(重复 %d)",
+		t.ID, targetID, mutation.Requested, mutation.Requested-len(ids))
+}
+
 // applySRCConstraints 把「平台规范 + 该平台下目标的授权范围」转成任务的
 // allow/deny 约束写入 task_constraints。
 //

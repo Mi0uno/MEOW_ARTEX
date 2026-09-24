@@ -209,10 +209,16 @@ export default function SRCBatchPage() {
             自动带上该平台的规范与目标在该平台下的授权范围)
           </p>
         </div>
-        <Button size="sm" disabled={creating || selected.size === 0} onClick={() => void batchCreate()}>
-          <RocketIcon className="size-4" />
-          {creating ? "创建中…" : `批量建 SRC 任务(${selected.size})`}
-        </Button>
+        <div className="flex shrink-0 items-center gap-2">
+          {/* 单个目标的高频路径导流到任务页:两个入口语义互补而不是二选一 */}
+          <Button variant="outline" size="sm" asChild>
+            <Link href="/function/tasks?src=1">SRC 任务页</Link>
+          </Button>
+          <Button size="sm" disabled={creating || selected.size === 0} onClick={() => void batchCreate()}>
+            <RocketIcon className="size-4" />
+            {creating ? "创建中…" : `批量建 SRC 任务(${selected.size})`}
+          </Button>
+        </div>
       </div>
 
       <Card>

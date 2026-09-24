@@ -71,6 +71,39 @@ export function OverviewTab({
       .catch(() => undefined);
   }, []);
 
+  // P2b:一键创建同名企业并关联。创建公司(空范围)+ 更新目标的 company_id 一步完成,
+  // 信息搜集导入链路(按企业筛暂存区/已有资产)随即可用。
+  const [creatingCompany, setCreatingCompany] = React.useState(false);
+  const createAndLinkCompany = async () => {
+    const companyName = nameRef.current.trim();
+    if (!companyName) {
+      toast.error("请先填写目标名称——企业将以同名创建");
+      return;
+    }
+    setCreatingCompany(true);
+    try {
+      const created = await api.createCompany(companyName, []);
+      const { target: saved } = await api.saveSRCTarget({
+        id: targetRef.current.id,
+        name: nameRef.current.trim(),
+        company_id: created.id,
+        description: descriptionRef.current,
+        enabled: enabledRef.current,
+      });
+      // 本地同步:下拉里要能立刻看到新企业,不重拉接口
+      setCompanies((cs) =>
+        cs.some((c) => c.id === created.id) ? cs : [...cs, { id: created.id, name: companyName, asset_count: 0 }],
+      );
+      setCompanyID(String(created.id));
+      toast.success(`已创建企业「${companyName}」并关联`);
+      onSavedRef.current(saved);
+    } catch (e) {
+      toast.error(`创建失败:${(e as Error).message}`);
+    } finally {
+      setCreatingCompany(false);
+    }
+  };
+
   const dirty =
     name !== target.name ||
     description !== target.description ||
@@ -157,6 +190,19 @@ export function OverviewTab({
             <p className="text-muted-foreground text-xs">
               关联企业后,信息搜集暂存区与已有资产才能按企业筛选出来导入到本目标。
             </p>
+            {/* 未关联企业的一键补救:「先有目标后补企业」是支持的路径,但不能让用户
+                手工去资产页建同名企业再回来选——一键创建并关联,信息搜集导入立刻可用。 */}
+            {companyID === NO_COMPANY && (
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={creatingCompany}
+                onClick={() => void createAndLinkCompany()}
+              >
+                <Building2Icon className="size-4" />
+                {creatingCompany ? "创建中…" : "一键创建同名企业并关联"}
+              </Button>
+            )}
           </Field>
           <Field label="描述">
             <Textarea
@@ -191,6 +237,7 @@ export function OverviewTab({
                 <TableRow className="hover:bg-transparent">
                   {/* 平台名列不设宽度:table-fixed 下自动吃掉余量。 */}
                   <TableHead>平台</TableHead>
+                  <TableHead>授权范围摘要</TableHead>
                   <TableHead className="w-20">状态</TableHead>
                   <TableHead className="w-44">更新时间</TableHead>
                   <TableHead className="w-20">操作</TableHead>
@@ -207,6 +254,12 @@ export function OverviewTab({
                       >
                         {l.platform_name || `平台 #${l.platform_id}`}
                       </Link>
+                    </TableCell>
+                    {/* 授权范围摘要:不进授权范围页签也能回答「这个目标在某平台下能测什么」 */}
+                    <TableCell className="text-muted-foreground min-w-0">
+                      <span className="block truncate text-xs" title={l.scope_note || "未填写授权范围"}>
+                        {l.scope_note || "未填写授权范围"}
+                      </span>
                     </TableCell>
                     <TableCell>
                       <Badge

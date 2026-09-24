@@ -27,6 +27,7 @@ import {
   EyeIcon,
   FolderInputIcon,
   GripVerticalIcon,
+  LayersIcon,
   Loader2Icon,
   NetworkIcon,
   PaperclipIcon,
@@ -910,11 +911,21 @@ function TasksPageInner() {
           自己在 SRC 任务页(和「任务中心 → 任务」长得一样)。 */}
       {srcOnly && (
         <div className="mx-4 mt-4 lg:mx-6">
-          <h1 className="font-semibold text-xl">SRC 模式 · 任务</h1>
-          <p className="text-muted-foreground text-sm">
-            只显示 SRC 模式任务;本页「新建任务」创建的任务同样标记为 SRC,产出计入 SRC 成果。
-            要绑定平台与目标(注入授权边界)请从目标详情页的「建 SRC 任务」创建。
-          </p>
+          <div className="flex flex-wrap items-start justify-between gap-2">
+            <div>
+              <h1 className="font-semibold text-xl">SRC 模式 · 任务</h1>
+              <p className="text-muted-foreground text-sm">
+                只显示 SRC 模式任务。要绑定平台与目标(注入授权边界),用右侧「新建 SRC 任务」或到目标详情页创建。
+              </p>
+            </div>
+            {/* 批量建任务导流:一次要开多个目标时,批量页比逐个对话框高效 */}
+            <Button variant="outline" size="sm" asChild>
+              <Link href="/function/src/batch">
+                <LayersIcon className="size-4" />
+                批量建任务
+              </Link>
+            </Button>
+          </div>
         </div>
       )}
       <TabsList className="mx-4 lg:mx-6">
