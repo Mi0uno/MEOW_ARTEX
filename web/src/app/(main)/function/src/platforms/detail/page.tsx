@@ -14,7 +14,7 @@ import * as React from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 
-import { ArrowLeftIcon, Loader2Icon, ShieldAlertIcon } from "lucide-react";
+import { ArrowLeftIcon, LayersIcon, Loader2Icon, ShieldAlertIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -165,6 +165,14 @@ function SRCPlatformDetailBody({ platformId }: { platformId: number }) {
         </div>
         <div className="flex shrink-0 items-center gap-2">
           {dirty && <span className="text-amber-600 text-xs">有未保存的改动</span>}
+          {/* 批量建任务入口:平台内多个目标要一起开任务时不用绕去「平台批量」页。
+              单个目标的行内「建任务」在「目标」页签里。 */}
+          <Button variant="outline" size="sm" asChild>
+            <Link href="/function/src/batch">
+              <LayersIcon className="size-4" />
+              批量建任务
+            </Link>
+          </Button>
           <Button size="sm" disabled={saving} onClick={() => void save()}>
             {saving && <Loader2Icon className="size-4 animate-spin" />}
             {saving ? "保存中…" : "保存"}
@@ -189,7 +197,7 @@ function SRCPlatformDetailBody({ platformId }: { platformId: number }) {
         </TabsContent>
 
         <TabsContent value="targets" className="mt-3">
-          <TargetsTab platformId={platformId} onChanged={refreshStats} />
+          <TargetsTab platform={platform} onChanged={refreshStats} />
         </TabsContent>
 
         <TabsContent value="rewards" className="mt-3">

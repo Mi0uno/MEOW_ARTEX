@@ -11,15 +11,16 @@ import * as React from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 
-import { ArrowLeftIcon, SaveIcon, TargetIcon, Trash2Icon } from "lucide-react";
+import { ArrowLeftIcon, RocketIcon, SaveIcon, TargetIcon, Trash2Icon } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
-import type { SRCTarget, SRCTargetLink } from "@/lib/types";
+import type { SRCPlatform, SRCTarget, SRCTargetLink } from "@/lib/types";
 
+import { CreateSRCTaskDialog } from "../../_components/create-task-dialog";
 import { AssetsTab } from "../_components/assets-tab";
 import { OverviewTab } from "../_components/overview-tab";
 import { RewardsTab } from "../_components/rewards-tab";
@@ -47,6 +48,11 @@ function SRCTargetDetailInner() {
   const [loaded, setLoaded] = React.useState(false);
   const [tab, setTab] = React.useState("overview");
   const [platformId, setPlatformId] = React.useState(0);
+  // 建任务对话框要拿到平台对象(它用平台名渲染注入说明),而本页只有 link(含 platform_name)。
+  // 按需拉一次当前平台,拉不到就退化用一个只带 id/name 的最小对象——不该因为统计接口失败
+  // 就让用户建不了任务。
+  const [taskPlatform, setTaskPlatform] = React.useState<SRCPlatform | null>(null);
+  const [createOpen, setCreateOpen] = React.useState(false);
   // 头部保存按钮由页签注册进来(只有概览/授权范围有可保存的表单)。
   // 两个页签都被 forceMount 常驻,所以按页签名分槽存——共用一个槽会互相覆盖,
   // 结果是「概览」页签上永远看不到保存按钮。
@@ -130,6 +136,41 @@ function SRCTargetDetailInner() {
     void loadTarget(id);
     void loadLinks(id);
   }, [id, loadTarget, loadLinks]);
+
+  // 当前平台对象(建任务对话框要用平台名与 id)。platformId 变化时重拉;
+  // 失败时用 link 里的名字兜底,保证建任务入口永远可用。
+  React.useEffect(() => {
+    if (platformId <= 0) {
+      setTaskPlatform(null);
+      return;
+    }
+    let alive = true;
+    api
+      .getSRCPlatform(platformId)
+      .then((p) => {
+        if (alive && p?.id) setTaskPlatform(p);
+      })
+      .catch(() => {
+        if (!alive) return;
+        const link = links.find((l) => l.platform_id === platformId);
+        setTaskPlatform({
+          id: platformId,
+          name: link?.platform_name || `平台 #${platformId}`,
+          homepage: "",
+          description: "",
+          reward_standard: "",
+          scoring_standard: "",
+          code_of_conduct: "",
+          rules: "",
+          enabled: true,
+          created_at: "",
+          updated_at: "",
+        });
+      });
+    return () => {
+      alive = false;
+    };
+  }, [platformId, links]);
 
   // 这几个回调必须是稳定引用:页签把它们放进 effect 依赖里注册「保存」动作,
   // 每次渲染都换新函数会导致 effect 反复重跑 → setBridge → 再渲染的死循环。
@@ -215,8 +256,19 @@ function SRCTargetDetailInner() {
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-1">
+          {/* 建任务入口:平台与目标都已确定,这是「开干」最自然的位置。
+              没有可用平台时禁用——任务必须绑定「平台×目标」才能注入授权边界。 */}
+          <Button
+            size="sm"
+            disabled={!taskPlatform}
+            title={taskPlatform ? `对「${taskPlatform.name} × ${target.name}」建 SRC 任务` : "请先给该目标挂上平台"}
+            onClick={() => setCreateOpen(true)}
+          >
+            <RocketIcon className="size-4" />
+            建 SRC 任务
+          </Button>
           {showSave && (
-            <Button size="sm" disabled={!bridge.dirty || bridge.saving} onClick={() => void bridge.save()}>
+            <Button size="sm" variant="outline" disabled={!bridge.dirty || bridge.saving} onClick={() => void bridge.save()}>
               <SaveIcon className="size-4" />
               {bridge.saving ? "保存中…" : "保存"}
             </Button>
@@ -274,6 +326,15 @@ function SRCTargetDetailInner() {
           <RewardsTab targetId={target.id} />
         </TabsContent>
       </Tabs>
+
+      {taskPlatform && (
+        <CreateSRCTaskDialog
+          open={createOpen}
+          onOpenChange={setCreateOpen}
+          platform={taskPlatform}
+          target={target}
+        />
+      )}
     </div>
   );
 }

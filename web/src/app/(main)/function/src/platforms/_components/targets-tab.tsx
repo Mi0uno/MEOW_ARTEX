@@ -10,7 +10,7 @@ import * as React from "react";
 
 import Link from "next/link";
 
-import { ArrowRightIcon, PlusIcon, SearchIcon, TargetIcon, Trash2Icon } from "lucide-react";
+import { ArrowRightIcon, PlusIcon, RocketIcon, SearchIcon, TargetIcon, Trash2Icon } from "lucide-react";
 import { toast } from "sonner";
 
 import { TablePagination } from "@/components/table-pagination";
@@ -30,8 +30,9 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectVa
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
-import type { Company, SRCTarget } from "@/lib/types";
+import type { Company, SRCPlatform, SRCTarget } from "@/lib/types";
 
+import { CreateSRCTaskDialog } from "../../_components/create-task-dialog";
 import { Field, fmtTime } from "./platform-shared";
 
 const PAGE_SIZE = 50;
@@ -39,7 +40,14 @@ const PAGE_SIZE = 50;
 const NO_COMPANY = "__none__";
 const PICK_TARGET = "__pick__";
 
-export function TargetsTab({ platformId, onChanged }: { platformId: number; onChanged: () => void }) {
+export function TargetsTab({
+  platform,
+  onChanged,
+}: {
+  platform: SRCPlatform;
+  onChanged: () => void;
+}) {
+  const platformId = platform.id;
   const [targets, setTargets] = React.useState<SRCTarget[]>([]);
   const [total, setTotal] = React.useState(0);
   const [query, setQuery] = React.useState("");
@@ -47,6 +55,8 @@ export function TargetsTab({ platformId, onChanged }: { platformId: number; onCh
   const [pageSize, setPageSize] = React.useState(PAGE_SIZE);
   const [loading, setLoading] = React.useState(true);
   const [addOpen, setAddOpen] = React.useState(false);
+  // 行内「建任务」:记住是哪个目标,对话框按它渲染。
+  const [taskTarget, setTaskTarget] = React.useState<SRCTarget | null>(null);
 
   const load = React.useCallback(
     (q: string, p: number, size: number) => {
@@ -182,6 +192,14 @@ export function TargetsTab({ platformId, onChanged }: { platformId: number; onCh
                         <Button
                           variant="ghost"
                           size="icon-xs"
+                          onClick={() => setTaskTarget(t)}
+                          title="对该目标建 SRC 任务"
+                        >
+                          <RocketIcon className="size-3.5" />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon-xs"
                           onClick={() => void remove(t)}
                           title="移出本平台(只解除关联)"
                         >
@@ -225,6 +243,17 @@ export function TargetsTab({ platformId, onChanged }: { platformId: number; onCh
           onChanged();
         }}
       />
+
+      {taskTarget && (
+        <CreateSRCTaskDialog
+          open={!!taskTarget}
+          onOpenChange={(o) => {
+            if (!o) setTaskTarget(null);
+          }}
+          platform={platform}
+          target={taskTarget}
+        />
+      )}
     </Card>
   );
 }
