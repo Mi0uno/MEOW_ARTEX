@@ -722,6 +722,20 @@ export interface TaskAssetScopeMutation {
   scopes_existing: number;
 }
 
+// 资产文件导入（POST /api/assets/import）的逐行失败原因。errors 后端最多返回 200 条。
+export type AssetImportError = { row: number; value: string; error: string };
+
+// 资产文件导入结果：total=解析出的有效条数；imported=成功入库；failed=入库失败；
+// skipped=无法识别被跳过。results 是成功入库行的明细，errors 是失败/跳过行的原因。
+export type AssetImportResult = {
+  total: number;
+  imported: number;
+  failed: number;
+  skipped: number;
+  results: { row: number; id: number; type: string; value: string }[];
+  errors: AssetImportError[];
+};
+
 // ---- Asset coverage graph (per task) ----
 // 力导向「资产覆盖图」的一个节点。key 唯一：资产="a:<id>"、公司="c:<id>"、
 // 无资产行的根域名="r:<domain>"。in_scope=false 的是仅用于连线的灰色上下文节点。

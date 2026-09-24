@@ -14,6 +14,7 @@ import type {
   AgentTrigger,
   ArchiveBatchItem,
   Asset,
+  AssetImportResult,
   Audit,
   BatchCategoryItem,
   BatchControlItem,
@@ -642,6 +643,14 @@ export const api = {
     ).then((r) => ({ assets: r?.assets ?? [], total: r?.total ?? r?.count ?? 0 })),
   assetCounts: (taskId = "") =>
     get<Record<string, number>>(`/assets/counts${taskId ? `?task_id=${encodeURIComponent(taskId)}` : ""}`),
+  // 导入资产文件（txt/csv/xlsx，≤10MB）：后端解析入库并按各企业资产范围自动归属。
+  // FormData 直接走 http()——helper 对 FormData 不会覆盖 multipart Content-Type（见其内部注释）。
+  // 本次不做任务关联，task_id 不传。
+  importAssets: (file: File) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    return http<AssetImportResult>("/assets/import", { method: "POST", body: fd });
+  },
   deleteAssets: (ids: number[]) =>
     http<{ deleted: number }>("/assets", { method: "DELETE", body: JSON.stringify({ ids }) }),
   // task-scoped view of the same endpoint — server-side paginated like `assets`
