@@ -35,6 +35,8 @@ import type {
   Edge,
   EvidenceBodyPreview,
   ExplorationNodePage,
+  JevThresholds,
+  JevThresholdsResponse,
   ExplorationNodeQuery,
   ExternalAPIConfig,
   ExternalAPIProviderDesc,
@@ -1174,6 +1176,11 @@ export const api = {
     post<{ ok: boolean; latency_ms?: number; detail?: string; error?: string }>(
       `/decision/engines/${encodeURIComponent(key)}/test`,
     ),
+  // JEV 门限阈值:置信度门槛、危险信号阈值、提权是否硬拦、低置信策略。
+  // 响应附 defaults,便于页面提示"恢复默认"。
+  jevThresholds: () => get<JevThresholdsResponse>("/decision/engines/jev/thresholds"),
+  saveJevThresholds: (th: JevThresholds) =>
+    put<JevThresholdsResponse>("/decision/engines/jev/thresholds", th),
   chatMentions: (kind: string, query: string, signal?: AbortSignal, cursor = "") =>
     http<{ items: ChatMention[]; next_cursor?: string }>(
       `/chat/mentions?${new URLSearchParams({ kind, q: query, cursor })}`,

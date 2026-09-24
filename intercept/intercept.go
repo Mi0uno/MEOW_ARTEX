@@ -126,6 +126,23 @@ func (p *pendingManager) remove(id int64) {
 // free of any llm dependency. profileID == 0 means "use the active/default profile".
 type Reviewer func(ctx context.Context, profileID int64, prompt string, input ReviewInput) (Decision, error)
 
+// DecisionEngineInput 是喂给前置决策引擎的一次调用快照。它刻意带上与 LLM 裁判
+// 同等量的上下文:引擎在链路上更靠前,信息更少会让它对"看起来可疑"的授权渗透动作
+// 先行拦截,而后一层的裁判根本没机会纠正(实测:只给工具名+参数时,JEV 把
+// HTTP 请求走私的只读探测脚本、token 刷新脚本判成高风险)。
+type DecisionEngineInput struct {
+	Tool      string          `json:"tool_name"`
+	Arguments json.RawMessage `json:"arguments"`
+	// WorkingDir 是本次运行的工作目录,帮助引擎区分"攻击者产物/临时脚本"与"目标生产资产"。
+	WorkingDir string `json:"working_directory,omitempty"`
+	// Background 是显式绑定的人类消息(仅 user_message 来源),让引擎知道
+	// "用户要求做什么",而不是只看单次调用。
+	Background string `json:"background,omitempty"`
+	// TaskID / AgentName 标明这次调用属于哪个任务的哪一步;空 = 无归属的裸调用。
+	TaskID    string `json:"task_id,omitempty"`
+	AgentName string `json:"agent_name,omitempty"`
+}
+
 // DecisionEngine is the callback for a pre-decision engine (JEV/Laya): a fast
 // structured classification that runs BEFORE the LLM fallback judge on calls no
 // rule matched. Returning (Decision, true) means it reached a terminal verdict.
@@ -136,7 +153,7 @@ type Reviewer func(ctx context.Context, profileID int64, prompt string, input Re
 // off the engine never ran at all, despite its own switch being on and its
 // credentials configured. Keeping the two callbacks separate is what makes the
 // engine's own switch authoritative.
-type DecisionEngine func(ctx context.Context, tool string, arguments json.RawMessage) (Decision, bool)
+type DecisionEngine func(ctx context.Context, in DecisionEngineInput) (Decision, bool)
 
 // TaskGuardResolver resolves a task's own guard configuration, so a task can
 // override the global posture. mode is one of:
@@ -516,6 +533,23 @@ func (i *Interceptor) SetJudgeConfig(c JudgeConfig) error {
 	return nil
 }
 
+// engineInput 组装前置决策引擎的输入:工具名、参数,以及 LLM 裁判同样能看到的
+// 工作目录、人类背景、任务归属。这三项是判定"授权渗透的提权尝试"与"越权操作"的
+// 关键——只看工具名和参数时,任何触及凭据/提权语义的调用都会显得可疑。
+func (i *Interceptor) engineInput(ctx context.Context, tool string, arguments json.RawMessage) DecisionEngineInput {
+	in := DecisionEngineInput{Tool: tool, Arguments: append(json.RawMessage(nil), arguments...)}
+	if wd, bg, ok := ReviewEnvironmentFromContext(ctx); ok {
+		in.WorkingDir = wd
+		if bg.Source == BackgroundUserMessage {
+			in.Background = bg.Text
+		}
+	}
+	if taskID, agent, ok := TaskContextFromContext(ctx); ok {
+		in.TaskID, in.AgentName = taskID, agent
+	}
+	return in
+}
+
 // Judge runs the fallback decision path for a tool call that matched no rule. It
 // asks, in order:
 //
@@ -549,7 +583,7 @@ func (i *Interceptor) Judge(ctx context.Context, tool string, arguments json.Raw
 	// 内部,而 Judge 开头就用 !cfg.Enabled 提前返回,于是 llm_judge_enabled=false
 	// 时引擎一次也不会执行(开关与凭据都配好了却毫无痕迹)。
 	if engine != nil {
-		if dec, ok := engine(ctx, tool, arguments); ok {
+		if dec, ok := engine(ctx, i.engineInput(ctx, tool, arguments)); ok {
 			if out, valid := i.finishEngineDecision(ctx, dec, tool, arguments); valid {
 				return out, true
 			}

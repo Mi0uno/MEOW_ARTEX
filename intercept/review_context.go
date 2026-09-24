@@ -68,3 +68,23 @@ func BuildReviewInput(ctx context.Context, tool string, arguments json.RawMessag
 	}
 	return in, nil
 }
+
+// ReviewEnvironmentFromContext 取回本次运行显式绑定的工作目录与背景,供决策引擎
+// (JEV) 复用。LLM 裁判走 BuildReviewInput 拿到的是同一份环境,两者信息量必须一致:
+// 决策引擎在链路里更靠前,若它看到的信息比后一层少,就会对"看起来可疑"的调用先行
+// 拦截,后面的裁判根本没机会纠正。
+func ReviewEnvironmentFromContext(ctx context.Context) (workingDir string, background ReviewBackground, ok bool) {
+	env, found := ctx.Value(reviewContextKey{}).(reviewEnvironment)
+	if !found {
+		return "", ReviewBackground{}, false
+	}
+	return env.workingDir, env.background, true
+}
+
+// TaskContextFromContext 取回任务级上下文(taskID + agent 名),供决策引擎判断
+// "这次调用属于哪个任务的哪一步"。决策引擎据此知道调用发生在渗透任务的执行面,
+// 而不是无归属的裸调用——这是"授权渗透里的提权尝试"与"越权操作"的关键区别。
+func TaskContextFromContext(ctx context.Context) (taskID, agentName string, ok bool) {
+	taskID, agentName = taskInfoFromCtx(ctx)
+	return taskID, agentName, taskID != ""
+}

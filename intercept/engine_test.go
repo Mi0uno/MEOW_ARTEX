@@ -21,10 +21,10 @@ import (
 func TestDecisionEngineRunsWithoutLLMJudge(t *testing.T) {
 	ic := &Interceptor{pending: newPendingManager()}
 	calls := 0
-	ic.SetDecisionEngine(func(_ context.Context, tool string, _ json.RawMessage) (Decision, bool) {
+	ic.SetDecisionEngine(func(_ context.Context, in DecisionEngineInput) (Decision, bool) {
 		calls++
-		if tool != "Bash" {
-			t.Fatalf("engine got tool %q", tool)
+		if in.Tool != "Bash" {
+			t.Fatalf("engine got tool %q", in.Tool)
 		}
 		return Decision{Action: "flag", Message: "Jev 判疑: 参数可疑"}, true
 	})
@@ -48,7 +48,7 @@ func TestDecisionEngineRunsWithoutLLMJudge(t *testing.T) {
 
 func TestDecisionEngineAbstainsFallsThrough(t *testing.T) {
 	ic := &Interceptor{pending: newPendingManager()}
-	ic.SetDecisionEngine(func(context.Context, string, json.RawMessage) (Decision, bool) {
+	ic.SetDecisionEngine(func(context.Context, DecisionEngineInput) (Decision, bool) {
 		return Decision{}, false // 低置信:交给下一层
 	})
 	// reviewer 为 nil → 第二层无裁决,整体返回 false(保持放行语义)。
@@ -59,7 +59,7 @@ func TestDecisionEngineAbstainsFallsThrough(t *testing.T) {
 
 func TestDecisionEngineInvalidActionIsNotAVerdict(t *testing.T) {
 	ic := &Interceptor{pending: newPendingManager()}
-	ic.SetDecisionEngine(func(context.Context, string, json.RawMessage) (Decision, bool) {
+	ic.SetDecisionEngine(func(context.Context, DecisionEngineInput) (Decision, bool) {
 		return Decision{Action: "approve"}, true // 引擎返回白名单外的动作
 	})
 	if _, ok := ic.Judge(context.Background(), "Bash", json.RawMessage(`{}`)); ok {
@@ -72,7 +72,7 @@ func TestEngineVerdictShapes(t *testing.T) {
 	for _, action := range []string{"allow", "deny", "flag"} {
 		t.Run(action, func(t *testing.T) {
 			ic := &Interceptor{pending: newPendingManager()}
-			ic.SetDecisionEngine(func(context.Context, string, json.RawMessage) (Decision, bool) {
+			ic.SetDecisionEngine(func(context.Context, DecisionEngineInput) (Decision, bool) {
 				return Decision{Action: action}, true
 			})
 			dec, ok := ic.Judge(context.Background(), "Write", json.RawMessage(`{"path":"a.txt"}`))
@@ -110,7 +110,7 @@ func TestEngineAskCarriesApprovalTimeout(t *testing.T) {
 	defer d.Close()
 
 	ic := New(d)
-	ic.SetDecisionEngine(func(context.Context, string, json.RawMessage) (Decision, bool) {
+	ic.SetDecisionEngine(func(context.Context, DecisionEngineInput) (Decision, bool) {
 		return Decision{Action: "ask"}, true
 	})
 	dec, ok := ic.Judge(context.Background(), "Bash", json.RawMessage(`{"command":"ls"}`))

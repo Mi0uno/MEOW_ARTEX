@@ -328,6 +328,25 @@ export interface DecisionEngine {
   available: boolean; // 协议已接入=false 仅可配置预留
 }
 
+// JEV 门限阈值。取向是"宁可交给下一层,不要误拦":JEV 只做前置快筛,误拦会直接
+// 中断整个渗透任务,而放过去的调用后面还有监管模型与人工两层兜底。
+export interface JevThresholds {
+  /** 判 block 时至少要有的置信度,低于它视为未裁决(交给下一层)。 */
+  block_confidence: number;
+  /** 判 allow 时至少要有的置信度,低于它视为未裁决。 */
+  allow_confidence: number;
+  /** 单个危险信号超过它才算"确凿",才允许硬拦。 */
+  danger_score: number;
+  /** 是否允许「提权/绕认证」信号单独触发硬拦截。默认关:授权渗透里提权是被授权的核心动作。 */
+  privilege_blocks: boolean;
+  /** 置信度不足时的动作:""=交给下一层 / "flag"=判疑放通 / "ask"=转人工 / "allow"=放行。 */
+  low_confidence_action: "" | "flag" | "ask" | "allow";
+}
+
+export interface JevThresholdsResponse extends JevThresholds {
+  defaults: JevThresholds;
+}
+
 // ---- 外部接口(空间测绘 API 配置) ----
 
 export interface ExternalAPICredField {
