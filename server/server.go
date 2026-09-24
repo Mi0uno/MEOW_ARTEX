@@ -1024,6 +1024,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/decision/engines", s.decisionListEngines)
 	mux.HandleFunc("PUT /api/decision/engines/{key}", s.decisionUpdateEngine)
 	mux.HandleFunc("POST /api/decision/engines/{key}/test", s.decisionTestEngine)
+	// 决策引擎门限阈值(置信度/危险信号阈值/提权是否硬拦/低置信策略)。
+	mux.HandleFunc("GET /api/decision/engines/jev/thresholds", s.jevGetThresholds)
+	mux.HandleFunc("PUT /api/decision/engines/jev/thresholds", s.jevSetThresholds)
 
 	// /api/* goes through CORS + JWT + no-store; everything else is served by the embedded
 	// frontend (public — auth is enforced client-side and on the API). With the
