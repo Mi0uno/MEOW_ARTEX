@@ -78,12 +78,14 @@ func (s *Server) autoCreateSRCRewardForFinding(findingID, taskID int64) {
 	if err != nil || f == nil {
 		return
 	}
-	// 归属企业:任务关联的第一个企业(创建 SRC 任务时必选)。
+	// 归属企业:任务关联的第一个企业(创建 SRC 任务时通常会给)。
+	// 新模型下企业不再是必要条件——平台/目标归属才是 SRC 的核心维度,
+	// 所以这里不再因缺企业而直接返回,避免「没有企业归属的 SRC 任务」丢成果。
 	var companyID int64
 	if len(t.CompanyIDs) > 0 {
 		companyID = t.CompanyIDs[0]
 	}
-	if companyID <= 0 {
+	if companyID <= 0 && t.SRCPlatformID <= 0 && t.SRCTargetID <= 0 {
 		return
 	}
 	title := strings.TrimSpace(f.Name)
@@ -93,7 +95,7 @@ func (s *Server) autoCreateSRCRewardForFinding(findingID, taskID int64) {
 	if title == "" {
 		title = fmt.Sprintf("发现 #%d", f.ID)
 	}
-	id, created, err := s.m.PG().AutoCreateSRCReward(companyID, taskID, findingID, title,
+	id, created, err := s.m.PG().AutoCreateSRCReward(companyID, t.SRCPlatformID, t.SRCTargetID, taskID, findingID, title,
 		strings.ToLower(strings.TrimSpace(f.Severity)), strings.TrimSpace(f.VulnClass))
 	if err != nil {
 		log.Printf("[src] 任务 %d 成果自动创建失败(发现 %d): %v", taskID, findingID, err)

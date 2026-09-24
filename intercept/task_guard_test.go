@@ -50,7 +50,7 @@ func TestTaskGuardOffSkipsDecisionEngine(t *testing.T) {
 		return "off", nil, true
 	})
 	calls := 0
-	ic.SetDecisionEngine(func(context.Context, string, json.RawMessage) (Decision, bool) {
+	ic.SetDecisionEngine(func(context.Context, DecisionEngineInput) (Decision, bool) {
 		calls++
 		return Decision{Action: "deny"}, true
 	})

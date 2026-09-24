@@ -68,9 +68,11 @@ type Task struct {
 	// recon 单步骤任务:StepKey=收集器 key(空=多步 pipeline 兼容路径)。
 	StepKey    string          `json:"step_key,omitempty"`
 	StepConfig json.RawMessage `json:"step_config,omitempty"`
-	// SRC 模式:任务产出算 SRC 成果(自动建成果记录),并按企业 SRC 规范约束 AI 边界。
-	SRCMode      bool  `json:"src_mode,omitempty"`
-	SRCProfileID int64 `json:"src_profile_id,omitempty"`
+	// SRC 模式:任务产出算 SRC 成果(自动建成果记录),并按平台/目标规范约束 AI 边界。
+	SRCMode       bool  `json:"src_mode,omitempty"`
+	SRCProfileID  int64 `json:"src_profile_id,omitempty"`
+	SRCPlatformID int64 `json:"src_platform_id,omitempty"`
+	SRCTargetID   int64 `json:"src_target_id,omitempty"`
 	// 出网方式(任务级覆盖):''=跟随全局;direct=强制直连;pool=强制走代理池。
 	// ProxyGroupID 仅在 pool 时有效(0=用全局选中的组)。
 	ProxyMode    string                 `json:"proxy_mode,omitempty"`
@@ -978,6 +980,7 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		Stage: pt.Stage, Kind: pt.Kind, Pipeline: append(json.RawMessage(nil), pt.Pipeline...),
 		StepKey: pt.StepKey, StepConfig: append(json.RawMessage(nil), pt.StepConfig...),
 		SRCMode: pt.SRCMode, SRCProfileID: pt.SRCProfileID,
+		SRCPlatformID: pt.SRCPlatformID, SRCTargetID: pt.SRCTargetID,
 		ProxyMode: pt.ProxyMode, ProxyGroupID: pt.ProxyGroupID,
 		guardMode: pgdb.NormalizeTaskGuardMode(pt.GuardMode), guardRuleIDs: pgdb.NormalizeTaskGuardRuleIDs(pt.GuardRuleIDs),
 		Store: store, Guard: guard.NewWithInterceptor(ic), notify: make(chan struct{}, 1),

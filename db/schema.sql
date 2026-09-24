@@ -1801,3 +1801,167 @@ ALTER TABLE tasks DROP CONSTRAINT IF EXISTS tasks_guard_mode_check;
 ALTER TABLE tasks ADD CONSTRAINT tasks_guard_mode_check
     CHECK (guard_mode IN ('','inherit','off','enforce'));
 
+-- ============================================================
+-- SRC 平台选择:平台 → 目标 → 资产 三级结构。
+--
+-- 为什么重构:旧的 src_profiles 是「一个企业一条规范」,platform 只是个自由文本,
+-- 所以「进入平台 → 添加目标 → 添加资产」这条链路在数据上根本不存在,平台批量页
+-- 也只能靠前端 group-by 字符串聚合。新模型把平台提升为顶层实体。
+--
+-- 关键取舍:平台与目标是多对多(src_platform_targets)。同一家企业可能同时收录在
+-- 补天和漏洞盒子,各平台下的授权范围/规范/奖励标准各不相同——把授权范围挂在
+-- 「平台×目标」这一层而不是目标上,才能表达这种差异。
+-- ============================================================
+
+-- src_nkey 归一化平台/目标的自然键:小写 + 折叠空白。与 Go 侧 srcNKey 必须一致,
+-- 否则迁移建的行和运行时建的行会因键不同而重复。
+CREATE OR REPLACE FUNCTION src_nkey(value text) RETURNS text AS $$
+    SELECT btrim(regexp_replace(lower(btrim(coalesce(value, ''))), '\s+', ' ', 'g'));
+$$ LANGUAGE sql IMMUTABLE;
+
+CREATE TABLE IF NOT EXISTS src_platforms (
+    id               BIGSERIAL PRIMARY KEY,
+    name             TEXT NOT NULL,
+    nkey             TEXT NOT NULL UNIQUE,
+    homepage         TEXT NOT NULL DEFAULT '',   -- 平台主页/提交入口
+    description      TEXT NOT NULL DEFAULT '',
+    -- 四类平台级文本规范。它们与附件解析出的正文一起,在创建 SRC 任务时
+    -- 转成 task_constraints 注入 Planner/Worker 系统提示(防 AI 越界)。
+    reward_standard  TEXT NOT NULL DEFAULT '',   -- 奖励标准
+    scoring_standard TEXT NOT NULL DEFAULT '',   -- 评分标准
+    code_of_conduct  TEXT NOT NULL DEFAULT '',   -- 守则
+    rules            TEXT NOT NULL DEFAULT '',   -- 规范
+    enabled          BOOLEAN NOT NULL DEFAULT true,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+DROP TRIGGER IF EXISTS trg_src_platforms_upd ON src_platforms;
+CREATE TRIGGER trg_src_platforms_upd BEFORE UPDATE ON src_platforms
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- 平台规范附件。stored_name 只存文件名(不含路径),路径由 dataDir/src-platforms/<platform_id>/
+-- 推导——与 report_templates.orig_path 同样的可移植性考虑:换机器/换 dataDir 后仍能找回。
+-- content_text 是解析出的正文,合并进规范文本注入约束;pdf/xlsx 解析不了就留空并标 skipped。
+CREATE TABLE IF NOT EXISTS src_platform_files (
+    id           BIGSERIAL PRIMARY KEY,
+    platform_id  BIGINT NOT NULL REFERENCES src_platforms(id) ON DELETE CASCADE,
+    kind         TEXT NOT NULL CHECK (kind IN ('reward_standard','scoring_standard','code_of_conduct','rules')),
+    filename     TEXT NOT NULL DEFAULT '',
+    stored_name  TEXT NOT NULL DEFAULT '',
+    byte_size    BIGINT NOT NULL DEFAULT 0,
+    content_text TEXT NOT NULL DEFAULT '',
+    -- parsed=已解析出正文并注入约束 / skipped=格式不支持,仅存档 / failed=解析报错
+    parse_status TEXT NOT NULL DEFAULT 'skipped' CHECK (parse_status IN ('parsed','skipped','failed')),
+    parse_note   TEXT NOT NULL DEFAULT '',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_src_platform_files_platform ON src_platform_files(platform_id, id);
+
+-- 目标是「被测试的对象」(厂商/学校/单位)。独立表而非直接复用 companies:
+-- 平台下的目标可以只是个待补全的名字(还没建企业、还没有资产归属),等资产进来
+-- 再关联企业;company_id 可空正是为了这条路。
+CREATE TABLE IF NOT EXISTS src_targets (
+    id          BIGSERIAL PRIMARY KEY,
+    name        TEXT NOT NULL,
+    nkey        TEXT NOT NULL UNIQUE,
+    company_id  BIGINT REFERENCES companies(id) ON DELETE SET NULL,
+    description TEXT NOT NULL DEFAULT '',
+    enabled     BOOLEAN NOT NULL DEFAULT true,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_src_targets_company ON src_targets(company_id) WHERE company_id IS NOT NULL;
+DROP TRIGGER IF EXISTS trg_src_targets_upd ON src_targets;
+CREATE TRIGGER trg_src_targets_upd BEFORE UPDATE ON src_targets
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- 平台 × 目标 关联:授权范围与规范挂这一层(同一目标在不同平台下规范不同)。
+CREATE TABLE IF NOT EXISTS src_platform_targets (
+    id            BIGSERIAL PRIMARY KEY,
+    platform_id   BIGINT NOT NULL REFERENCES src_platforms(id) ON DELETE CASCADE,
+    target_id     BIGINT NOT NULL REFERENCES src_targets(id) ON DELETE CASCADE,
+    scope_note    TEXT NOT NULL DEFAULT '',
+    forbidden     TEXT NOT NULL DEFAULT '',   -- 禁止事项,每行一条,逐条注入 deny 约束
+    allowed_types TEXT NOT NULL DEFAULT '',
+    rate_limit    TEXT NOT NULL DEFAULT '',
+    rules         TEXT NOT NULL DEFAULT '',
+    enabled       BOOLEAN NOT NULL DEFAULT true,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_src_platform_targets UNIQUE (platform_id, target_id)
+);
+CREATE INDEX IF NOT EXISTS idx_src_platform_targets_target ON src_platform_targets(target_id);
+DROP TRIGGER IF EXISTS trg_src_platform_targets_upd ON src_platform_targets;
+CREATE TRIGGER trg_src_platform_targets_upd BEFORE UPDATE ON src_platform_targets
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- 目标资产:资产本体仍在 assets 表,这里只记「该平台该目标纳入了哪些资产」。
+-- 用引用而非复制,资产详情/覆盖度等既有链路完全不受影响。
+--   source: manual=手工录入 / recon=从信息搜集导入 / existing=关联已有资产
+CREATE TABLE IF NOT EXISTS src_target_assets (
+    id          BIGSERIAL PRIMARY KEY,
+    platform_id BIGINT NOT NULL REFERENCES src_platforms(id) ON DELETE CASCADE,
+    target_id   BIGINT NOT NULL REFERENCES src_targets(id) ON DELETE CASCADE,
+    asset_id    BIGINT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+    source      TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('manual','recon','existing')),
+    note        TEXT NOT NULL DEFAULT '',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_src_target_assets UNIQUE (platform_id, target_id, asset_id)
+);
+CREATE INDEX IF NOT EXISTS idx_src_target_assets_target ON src_target_assets(target_id, platform_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_src_target_assets_asset  ON src_target_assets(asset_id);
+
+-- 任务归属到「平台×目标」,成果随之可平台维度聚合。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS src_platform_id BIGINT REFERENCES src_platforms(id) ON DELETE SET NULL;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS src_target_id   BIGINT REFERENCES src_targets(id)   ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_tasks_src_platform ON tasks(src_platform_id) WHERE src_platform_id IS NOT NULL;
+ALTER TABLE src_rewards ADD COLUMN IF NOT EXISTS platform_id BIGINT REFERENCES src_platforms(id) ON DELETE SET NULL;
+ALTER TABLE src_rewards ADD COLUMN IF NOT EXISTS target_id   BIGINT REFERENCES src_targets(id)   ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_src_rewards_platform ON src_rewards(platform_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_src_rewards_target   ON src_rewards(target_id, created_at DESC);
+
+-- 存量数据迁移:旧 src_profiles(企业 + 平台文本) → 新三级结构。
+-- 用 settings 里的标记保证只跑一次(建平台/目标都是 INSERT,重复跑会累积垃圾),
+-- 跑完把标记写上;src_profiles 表本身保留不删,作为回滚源。
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM settings WHERE key = 'src_platforms_migrated') THEN
+        RETURN;
+    END IF;
+
+    -- 1. 平台:旧 platform 文本去重。空文本归入「未分类平台」而不是丢弃——
+    --    丢了那些规范就再也找不回来了。
+    INSERT INTO src_platforms (name, nkey, description)
+    SELECT btrim(p.platform), src_nkey(p.platform), '由旧「企业模式」SRC 规范迁移'
+      FROM src_profiles p
+     WHERE btrim(p.platform) <> ''
+     GROUP BY src_nkey(p.platform), btrim(p.platform)
+    ON CONFLICT (nkey) DO NOTHING;
+
+    INSERT INTO src_platforms (name, nkey, description)
+    SELECT '未分类平台', src_nkey('未分类平台'), '旧规范中未填写平台名称的记录'
+     WHERE EXISTS (SELECT 1 FROM src_profiles WHERE btrim(platform) = '')
+    ON CONFLICT (nkey) DO NOTHING;
+
+    -- 2. 目标:旧规范关联的企业升级为平台下的目标。
+    INSERT INTO src_targets (name, nkey, company_id)
+    SELECT c.name, c.nkey, c.id
+      FROM src_profiles p
+      JOIN companies c ON c.id = p.company_id
+    ON CONFLICT (nkey) DO NOTHING;
+
+    -- 3. 挂链:旧规范的全部字段原样搬到「平台×目标」这一层,一个都不丢。
+    INSERT INTO src_platform_targets
+        (platform_id, target_id, scope_note, forbidden, allowed_types, rate_limit, rules, enabled)
+    SELECT pl.id, t.id, p.scope_note, p.forbidden, p.allowed_types, p.rate_limit, p.rules, p.enabled
+      FROM src_profiles p
+      JOIN companies c  ON c.id = p.company_id
+      JOIN src_targets t ON t.company_id = c.id
+      JOIN src_platforms pl
+        ON pl.nkey = CASE WHEN btrim(p.platform) = '' THEN src_nkey('未分类平台') ELSE src_nkey(p.platform) END
+    ON CONFLICT (platform_id, target_id) DO NOTHING;
+
+    INSERT INTO settings (key, value) VALUES ('src_platforms_migrated', 'true')
+    ON CONFLICT (key) DO NOTHING;
+END $$;
+

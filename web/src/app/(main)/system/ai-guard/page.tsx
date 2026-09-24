@@ -22,6 +22,7 @@ import {
   PlugZapIcon,
   ScanSearchIcon,
   ScrollTextIcon,
+  SlidersHorizontalIcon,
   UserCheckIcon,
   WorkflowIcon,
 } from "lucide-react";
@@ -37,7 +38,7 @@ import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
-import type { DecisionEngine, JudgeConfig, LLMProfile } from "@/lib/types";
+import type { DecisionEngine, JevThresholds, JevThresholdsResponse, JudgeConfig, LLMProfile } from "@/lib/types";
 
 import { GuardOverview } from "./_components/guard-overview";
 import { TaskGuardNotes } from "./_components/task-guard-notes";
@@ -196,11 +197,10 @@ function DecisionEnginesCard() {
                       ))}
                     </ul>
                     <p className="mt-1.5 text-[10px] text-muted-foreground leading-relaxed">
-                      引擎只给「终局裁决」（服务端常量，见 server/jev.go）：分类为 block →
-                      直接拦截（不再设置信度门槛）；allow 且置信度 ≥ 0.8 → 直接放行；任一危险信号（noul）≥ 0.9 →
-                      直接拦截。 其余情况（review、或 allow 但置信度不足）引擎
-                      <span className="font-medium">不作裁决</span>， 交给下一层（监管模型 / 人工），因此 JEV
-                      本身不会产生「判疑」与「转人工」两档。
+                      引擎只给「终局裁决」：<span className="font-medium">高置信</span>且明确的
+                      block / allow 才直接拦截或放行； 置信度不足、review、以及未达阈值的危险信号一律
+                      <span className="font-medium">不作裁决</span>
+                      ，交给下一层（监管模型 / 人工），因此判不准时不会拦死。 阈值可在下方调整。
                     </p>
                   </>
                 ) : (
@@ -209,11 +209,171 @@ function DecisionEnginesCard() {
                   </p>
                 )}
               </div>
+
+              {/* 门限阈值:JEV 的可调参数。默认取向是"宁可交给下一层,不要误拦"——
+                  误拦会直接中断整个渗透任务,而放过去的调用后面还有两层兜底。 */}
+              {engine.key === "jev" ? <JevThresholdPanel /> : null}
             </div>
           ))
         )}
       </CardContent>
     </Card>
+  );
+}
+
+// ---- JEV 门限阈值 ----
+
+function JevThresholdPanel() {
+  const [th, setTh] = React.useState<JevThresholdsResponse | null>(null);
+  const [saving, setSaving] = React.useState(false);
+  const [open, setOpen] = React.useState(false);
+
+  const load = React.useCallback(async () => {
+    try {
+      setTh(await api.jevThresholds());
+    } catch (e) {
+      toast.error(`加载门限阈值失败: ${(e as Error).message}`);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    void load();
+  }, [load]);
+
+  async function save(next: JevThresholds) {
+    setSaving(true);
+    try {
+      const r = await api.saveJevThresholds(next);
+      setTh(r);
+      toast.success("门限阈值已保存");
+    } catch (e) {
+      toast.error(`保存失败: ${(e as Error).message}`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (!th) {
+    return <p className="mt-2 text-[11px] text-muted-foreground">加载门限阈值…</p>;
+  }
+
+  const pct = (v: number) => `${Math.round(v * 100)}%`;
+
+  return (
+    <div className="mt-2 rounded-md border px-2.5 py-2">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full flex-wrap items-center gap-1.5 text-left"
+      >
+        <SlidersHorizontalIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+        <span className="font-medium text-[11px]">门限阈值</span>
+        <Badge variant="outline" className="px-1.5 py-0 text-[10px] text-muted-foreground">
+          拦截 ≥ {pct(th.block_confidence)} · 放行 ≥ {pct(th.allow_confidence)} · 危险 ≥ {pct(th.danger_score)}
+        </Badge>
+        {th.privilege_blocks ? null : (
+          <Badge variant="outline" className="border-amber-500/40 px-1.5 py-0 text-[10px] text-amber-600">
+            提权不硬拦
+          </Badge>
+        )}
+        <span className="ml-auto text-[10px] text-muted-foreground">{open ? "收起" : "调整"}</span>
+      </button>
+
+      {open ? (
+        <div className="mt-2 space-y-2.5">
+          <p className="text-[10px] text-muted-foreground leading-relaxed">
+            阈值调高 = 引擎更少下结论（判不准就交给监管模型/人工）；调低 = 引擎更敢直接拦。
+            <span className="font-medium">误拦会中断整个渗透任务</span>，而放过去的调用后面还有两层兜底，
+            所以默认偏向"少拦"。
+          </p>
+
+          <div className="grid gap-2.5 sm:grid-cols-3">
+            <Field label={`拦截置信度门槛（当前 ${pct(th.block_confidence)}）`}>
+              <Input
+                type="number"
+                min={1}
+                max={100}
+                value={Math.round(th.block_confidence * 100)}
+                onChange={(e) => {
+                  const n = parseInt(e.target.value, 10);
+                  if (n > 0 && n <= 100) setTh({ ...th, block_confidence: n / 100 });
+                }}
+              />
+            </Field>
+            <Field label={`放行置信度门槛（当前 ${pct(th.allow_confidence)}）`}>
+              <Input
+                type="number"
+                min={1}
+                max={100}
+                value={Math.round(th.allow_confidence * 100)}
+                onChange={(e) => {
+                  const n = parseInt(e.target.value, 10);
+                  if (n > 0 && n <= 100) setTh({ ...th, allow_confidence: n / 100 });
+                }}
+              />
+            </Field>
+            <Field label={`危险信号阈值（当前 ${pct(th.danger_score)}）`}>
+              <Input
+                type="number"
+                min={1}
+                max={100}
+                value={Math.round(th.danger_score * 100)}
+                onChange={(e) => {
+                  const n = parseInt(e.target.value, 10);
+                  if (n > 0 && n <= 100) setTh({ ...th, danger_score: n / 100 });
+                }}
+              />
+            </Field>
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded-md bg-muted/40 px-2.5 py-1.5">
+            <div className="min-w-0">
+              <p className="text-[11px] font-medium">提权/绕认证信号单独硬拦</p>
+              <p className="text-[10px] text-muted-foreground">
+                默认关闭——授权渗透里"尝试提权、绕过认证"正是被授权的核心动作，用它硬拦等于把渗透任务本身判成攻击。
+              </p>
+            </div>
+            <Switch
+              checked={th.privilege_blocks}
+              onCheckedChange={(v) => setTh({ ...th, privilege_blocks: v })}
+            />
+          </div>
+
+          <Field label="置信度不足时">
+            <Select
+              value={th.low_confidence_action || "inherit"}
+              onValueChange={(v) =>
+                setTh({ ...th, low_confidence_action: (v === "inherit" ? "" : v) as JevThresholds["low_confidence_action"] })
+              }
+            >
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="inherit">交给下一层（监管模型 / 人工，默认）</SelectItem>
+                <SelectItem value="flag">判疑放通（标记但放行，留痕不阻塞）</SelectItem>
+                <SelectItem value="ask">转人工审批</SelectItem>
+                <SelectItem value="allow">直接放行</SelectItem>
+              </SelectContent>
+            </Select>
+          </Field>
+
+          <div className="flex items-center justify-end gap-2">
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={saving}
+              onClick={() => void save(th.defaults)}
+            >
+              恢复默认
+            </Button>
+            <Button size="sm" disabled={saving} onClick={() => void save(th)}>
+              {saving ? "保存中…" : "保存阈值"}
+            </Button>
+          </div>
+        </div>
+      ) : null}
+    </div>
   );
 }
 

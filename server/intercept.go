@@ -46,34 +46,25 @@ func (s *Server) wireInterceptReviewer() {
 // 引擎只给"终局裁决":block→deny,高置信 allow→allow,低置信/review→返回 false 交给
 // 下一层(LLM 兜底或人工)。引擎自身的错误一律降级,绝不让监管链路因它不可用而中断。
 func (s *Server) jevDecisionEngine() intercept.DecisionEngine {
-	return func(ctx context.Context, tool string, arguments json.RawMessage) (intercept.Decision, bool) {
+	return func(ctx context.Context, in intercept.DecisionEngineInput) (intercept.Decision, bool) {
 		if !s.jevGuardEnabled() || s.jevAPIKey() == "" {
 			return intercept.Decision{}, false
 		}
 		jevCtx, jevCancel := context.WithTimeout(ctx, 15*time.Second)
 		defer jevCancel()
-		verdict, err := s.jevGuardReview(jevCtx, tool, "", string(arguments))
+		verdict, err := s.jevGuardReview(jevCtx, in)
 		if err != nil || verdict == nil {
 			// Jev 不可用 → 不裁决,交给下一层。
 			return intercept.Decision{}, false
 		}
-		switch {
-		case verdict.Action == "block":
-			log.Printf("[jev] 直接禁止: %s (confidence=%.2f)", verdict.Reason, verdict.Confidence)
-			return intercept.Decision{
-				Action:  "deny",
-				Message: fmt.Sprintf("Jev 门限禁止: %s", verdict.Reason),
-			}, true
-		case verdict.Action == "allow" && verdict.Confidence >= 0.8:
-			log.Printf("[jev] 直接放行: %s (confidence=%.2f)", verdict.Reason, verdict.Confidence)
-			return intercept.Decision{
-				Action:  "allow",
-				Message: fmt.Sprintf("Jev 门限放行: %s", verdict.Reason),
-			}, true
-		default:
-			// 低置信或 review → 不裁决,交给 LLM 兜底裁判。
+		dec, ok := jevVerdictToDecision(verdict)
+		if !ok {
+			// 未裁决(低置信/review):交给 LLM 兜底裁判或人工。
+			log.Printf("[jev] 未裁决: %s (confidence=%.2f, raw=%s)", verdict.Reason, verdict.Confidence, verdict.RawChoice)
 			return intercept.Decision{}, false
 		}
+		log.Printf("[jev] %s (confidence=%.2f, raw=%s)", dec.Message, verdict.Confidence, verdict.RawChoice)
+		return dec, true
 	}
 }
 
