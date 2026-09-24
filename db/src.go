@@ -1,9 +1,10 @@
 package db
 
-// SRC 模式:企业 SRC 规范(src_profiles) + 成果产出(src_rewards)。
+// SRC 平台选择:成果产出(src_rewards)的检索与统计。
 //
-// 规范的作用是把「企业/平台的 SRC 授权边界」变成注入 Agent 的硬约束,
-// 防止 AI 越界(打到非授权域名、用高危 payload、超速率)。
+// 平台与目标的 CRUD 在 src_platforms.go / src_targets.go;本文件只负责成果。
+// 成果记录同时带 company_id / platform_id / target_id 三个归属:企业是「谁家的资产」,
+// 平台是「提交到哪」,目标是「打的哪个目标」——三者互相独立,缺哪个都不影响另外两个。
 // 成果页跟踪每条产出从待提交到平台反馈的全过程。
 
 import (
@@ -13,215 +14,39 @@ import (
 	"time"
 )
 
-// SRCProfile 是一个企业的 SRC 规范。
-type SRCProfile struct {
-	ID           int64     `json:"id"`
-	CompanyID    int64     `json:"company_id"`
-	CompanyName  string    `json:"company_name,omitempty"`
-	Name         string    `json:"name"`
-	Platform     string    `json:"platform"`
-	ScopeNote    string    `json:"scope_note"`
-	Forbidden    string    `json:"forbidden"`
-	AllowedTypes string    `json:"allowed_types"`
-	RateLimit    string    `json:"rate_limit"`
-	Rules        string    `json:"rules"`
-	Enabled      bool      `json:"enabled"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
-}
-
-const srcProfileCols = `p.id, p.company_id, COALESCE(c.name,''), p.name, p.platform, p.scope_note,
-	p.forbidden, p.allowed_types, p.rate_limit, p.rules, p.enabled, p.created_at, p.updated_at`
-
-func scanSRCProfile(sc interface{ Scan(...any) error }) (*SRCProfile, error) {
-	var p SRCProfile
-	if err := sc.Scan(&p.ID, &p.CompanyID, &p.CompanyName, &p.Name, &p.Platform, &p.ScopeNote,
-		&p.Forbidden, &p.AllowedTypes, &p.RateLimit, &p.Rules, &p.Enabled, &p.CreatedAt, &p.UpdatedAt); err != nil {
-		return nil, err
-	}
-	return &p, nil
-}
-
-// ListSRCProfiles 列出全部 SRC 规范(可按企业筛选;q 搜企业名/平台/规范名)。
-func (d *DB) ListSRCProfiles(companyID int64, q string, limit, offset int) ([]*SRCProfile, int, error) {
-	if limit <= 0 || limit > 200 {
-		limit = 50
-	}
-	if offset < 0 {
-		offset = 0
-	}
-	where := []string{"1=1"}
-	args := []any{}
-	if companyID > 0 {
-		where = append(where, fmt.Sprintf("p.company_id=$%d", len(args)+1))
-		args = append(args, companyID)
-	}
-	if strings.TrimSpace(q) != "" {
-		where = append(where, fmt.Sprintf("(c.name ILIKE $%d OR p.platform ILIKE $%d OR p.name ILIKE $%d)",
-			len(args)+1, len(args)+1, len(args)+1))
-		args = append(args, "%"+strings.TrimSpace(q)+"%")
-	}
-	kw := strings.Join(where, " AND ")
-	var total int
-	if err := d.QueryRow(`SELECT COUNT(*) FROM src_profiles p LEFT JOIN companies c ON c.id=p.company_id WHERE `+kw, args...).Scan(&total); err != nil {
-		return nil, 0, err
-	}
-	q2 := `SELECT ` + srcProfileCols + ` FROM src_profiles p LEFT JOIN companies c ON c.id=p.company_id WHERE ` + kw +
-		fmt.Sprintf(` ORDER BY c.name, p.id LIMIT $%d OFFSET $%d`, len(args)+1, len(args)+2)
-	args = append(args, limit, offset)
-	rows, err := d.Query(q2, args...)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer rows.Close()
-	out := []*SRCProfile{}
-	for rows.Next() {
-		p, err := scanSRCProfile(rows)
-		if err != nil {
-			return nil, 0, err
-		}
-		out = append(out, p)
-	}
-	return out, total, rows.Err()
-}
-
-// GetSRCProfile 按 id 取规范;不存在返回 nil。
-func (d *DB) GetSRCProfile(id int64) (*SRCProfile, error) {
-	p, err := scanSRCProfile(d.QueryRow(`SELECT `+srcProfileCols+` FROM src_profiles p
-		LEFT JOIN companies c ON c.id=p.company_id WHERE p.id=$1`, id))
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return p, nil
-}
-
-// GetSRCProfileByCompany 按企业取规范(SRC 任务创建时自动关联)。
-func (d *DB) GetSRCProfileByCompany(companyID int64) (*SRCProfile, error) {
-	p, err := scanSRCProfile(d.QueryRow(`SELECT `+srcProfileCols+` FROM src_profiles p
-		LEFT JOIN companies c ON c.id=p.company_id WHERE p.company_id=$1 AND p.enabled`, companyID))
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return p, nil
-}
-
-// SRCProfileInput 是新建/更新规范的输入。
-type SRCProfileInput struct {
-	CompanyID    int64
-	Name         string
-	Platform     string
-	ScopeNote    string
-	Forbidden    string
-	AllowedTypes string
-	RateLimit    string
-	Rules        string
-	Enabled      bool
-}
-
-// UpsertSRCProfile 按企业 upsert(一个企业一套规范)。
-func (d *DB) UpsertSRCProfile(in SRCProfileInput) (*SRCProfile, error) {
-	if in.CompanyID <= 0 {
-		return nil, fmt.Errorf("必须选择企业")
-	}
-	var id int64
-	if err := d.QueryRow(`
-INSERT INTO src_profiles(company_id, name, platform, scope_note, forbidden, allowed_types, rate_limit, rules, enabled)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-ON CONFLICT (company_id) DO UPDATE SET
-	name=EXCLUDED.name, platform=EXCLUDED.platform, scope_note=EXCLUDED.scope_note,
-	forbidden=EXCLUDED.forbidden, allowed_types=EXCLUDED.allowed_types,
-	rate_limit=EXCLUDED.rate_limit, rules=EXCLUDED.rules, enabled=EXCLUDED.enabled, updated_at=now()
-RETURNING id`,
-		in.CompanyID, in.Name, in.Platform, in.ScopeNote, in.Forbidden, in.AllowedTypes,
-		in.RateLimit, in.Rules, in.Enabled).Scan(&id); err != nil {
-		return nil, err
-	}
-	return d.GetSRCProfile(id)
-}
-
-// DeleteSRCProfile 删除规范;返回是否删除。
-func (d *DB) DeleteSRCProfile(id int64) (bool, error) {
-	res, err := d.Exec(`DELETE FROM src_profiles WHERE id=$1`, id)
-	if err != nil {
-		return false, err
-	}
-	n, _ := res.RowsAffected()
-	return n > 0, nil
-}
-
-// SRCConstraintText 把规范渲染成注入 Agent 的约束文本。
-// 返回空串表示没有可用规范(调用方跳过注入)。
-func (p *SRCProfile) SRCConstraintText() string {
-	if p == nil || !p.Enabled {
-		return ""
-	}
-	var b strings.Builder
-	b.WriteString("【SRC 授权边界(最高优先级,不得违反)】\n")
-	if p.Platform != "" {
-		fmt.Fprintf(&b, "- 提交平台:%s\n", p.Platform)
-	}
-	if p.ScopeNote != "" {
-		fmt.Fprintf(&b, "- 授权范围:%s\n", p.ScopeNote)
-	}
-	if p.AllowedTypes != "" {
-		fmt.Fprintf(&b, "- 允许的测试类型:%s\n", p.AllowedTypes)
-	}
-	if p.RateLimit != "" {
-		fmt.Fprintf(&b, "- 速率/强度限制:%s\n", p.RateLimit)
-	}
-	if strings.TrimSpace(p.Forbidden) != "" {
-		b.WriteString("- 严格禁止(违反即越界,任何理由都不例外):\n")
-		for _, line := range strings.Split(p.Forbidden, "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-			fmt.Fprintf(&b, "  · %s\n", strings.TrimPrefix(line, "- "))
-		}
-	}
-	if strings.TrimSpace(p.Rules) != "" {
-		b.WriteString("- 补充规范:\n")
-		b.WriteString(p.Rules)
-		b.WriteString("\n")
-	}
-	b.WriteString("超出上述范围的任何动作一律不做;不确定是否越界时,选择不动作并说明。")
-	return b.String()
-}
-
 // ---- SRC 成果 ----
 
 // SRCReward 是一条 SRC 成果(可提交的漏洞产出)。
 type SRCReward struct {
-	ID          int64      `json:"id"`
-	CompanyID   *int64     `json:"company_id,omitempty"`
-	CompanyName string     `json:"company_name,omitempty"`
-	TaskID      *int64     `json:"task_id,omitempty"`
-	FindingID   *int64     `json:"finding_id,omitempty"`
-	EntryID     *int64     `json:"entry_id,omitempty"`
-	Title       string     `json:"title"`
-	Severity    string     `json:"severity"`
-	VulnClass   string     `json:"vuln_class"`
-	Status      string     `json:"status"`
-	PlatformRef string     `json:"platform_ref"`
-	Feedback    string     `json:"feedback"`
-	SubmittedAt *time.Time `json:"submitted_at,omitempty"`
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at"`
+	ID           int64      `json:"id"`
+	CompanyID    *int64     `json:"company_id,omitempty"`
+	CompanyName  string     `json:"company_name,omitempty"`
+	PlatformID   *int64     `json:"platform_id,omitempty"`
+	PlatformName string     `json:"platform_name,omitempty"`
+	TargetID     *int64     `json:"target_id,omitempty"`
+	TaskID       *int64     `json:"task_id,omitempty"`
+	FindingID    *int64     `json:"finding_id,omitempty"`
+	EntryID      *int64     `json:"entry_id,omitempty"`
+	Title        string     `json:"title"`
+	Severity     string     `json:"severity"`
+	VulnClass    string     `json:"vuln_class"`
+	Status       string     `json:"status"`
+	PlatformRef  string     `json:"platform_ref"`
+	Feedback     string     `json:"feedback"`
+	SubmittedAt  *time.Time `json:"submitted_at,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
 }
 
-const srcRewardCols = `r.id, r.company_id, COALESCE(c.name,''), r.task_id, r.finding_id, r.entry_id,
+const srcRewardCols = `r.id, r.company_id, COALESCE(c.name,''), r.platform_id, COALESCE(p.name,''), r.target_id,
+	r.task_id, r.finding_id, r.entry_id,
 	r.title, r.severity, r.vuln_class, r.status, r.platform_ref, r.feedback, r.submitted_at, r.created_at, r.updated_at`
 
 func scanSRCReward(sc interface{ Scan(...any) error }) (*SRCReward, error) {
 	var r SRCReward
 	var submitted sql.NullTime
-	if err := sc.Scan(&r.ID, &r.CompanyID, &r.CompanyName, &r.TaskID, &r.FindingID, &r.EntryID,
+	if err := sc.Scan(&r.ID, &r.CompanyID, &r.CompanyName, &r.PlatformID, &r.PlatformName, &r.TargetID,
+		&r.TaskID, &r.FindingID, &r.EntryID,
 		&r.Title, &r.Severity, &r.VulnClass, &r.Status, &r.PlatformRef, &r.Feedback,
 		&submitted, &r.CreatedAt, &r.UpdatedAt); err != nil {
 		return nil, err
@@ -235,15 +60,17 @@ func scanSRCReward(sc interface{ Scan(...any) error }) (*SRCReward, error) {
 
 // SRCRewardFilter 是成果列表的筛选条件。
 type SRCRewardFilter struct {
-	CompanyID int64
-	TaskID    int64
-	Status    string // pending | submitted | accepted | rejected | duplicate
-	Severity  string
-	Q         string // 标题/漏洞类别关键字
-	Sort      string // created | updated | severity
-	Desc      bool
-	Limit     int
-	Offset    int
+	CompanyID  int64
+	PlatformID int64
+	TargetID   int64
+	TaskID     int64
+	Status     string // pending | submitted | accepted | rejected | duplicate
+	Severity   string
+	Q          string // 标题/漏洞类别关键字
+	Sort       string // created | updated | severity
+	Desc       bool
+	Limit      int
+	Offset     int
 }
 
 // ListSRCRewards 分页检索成果,并返回状态计数(受其它筛选影响,不受 Status 影响)。
@@ -259,6 +86,14 @@ func (d *DB) ListSRCRewards(f SRCRewardFilter) ([]*SRCReward, int, map[string]in
 	if f.CompanyID > 0 {
 		where = append(where, fmt.Sprintf("r.company_id=$%d", len(args)+1))
 		args = append(args, f.CompanyID)
+	}
+	if f.PlatformID > 0 {
+		where = append(where, fmt.Sprintf("r.platform_id=$%d", len(args)+1))
+		args = append(args, f.PlatformID)
+	}
+	if f.TargetID > 0 {
+		where = append(where, fmt.Sprintf("r.target_id=$%d", len(args)+1))
+		args = append(args, f.TargetID)
 	}
 	if f.TaskID > 0 {
 		where = append(where, fmt.Sprintf("r.task_id=$%d", len(args)+1))
@@ -311,7 +146,9 @@ func (d *DB) ListSRCRewards(f SRCRewardFilter) ([]*SRCReward, int, map[string]in
 	case "severity":
 		order = `CASE r.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END ASC, r.created_at DESC`
 	}
-	q := `SELECT ` + srcRewardCols + ` FROM src_rewards r LEFT JOIN companies c ON c.id=r.company_id WHERE ` + filtered +
+	q := `SELECT ` + srcRewardCols + ` FROM src_rewards r
+	LEFT JOIN companies c ON c.id=r.company_id
+	LEFT JOIN src_platforms p ON p.id=r.platform_id WHERE ` + filtered +
 		` ORDER BY ` + order + fmt.Sprintf(` LIMIT $%d OFFSET $%d`, len(fargs)+1, len(fargs)+2)
 	fargs = append(fargs, f.Limit, f.Offset)
 	items, err := d.Query(q, fargs...)
@@ -333,7 +170,8 @@ func (d *DB) ListSRCRewards(f SRCRewardFilter) ([]*SRCReward, int, map[string]in
 // GetSRCReward 取一条成果。
 func (d *DB) GetSRCReward(id int64) (*SRCReward, error) {
 	r, err := scanSRCReward(d.QueryRow(`SELECT `+srcRewardCols+` FROM src_rewards r
-		LEFT JOIN companies c ON c.id=r.company_id WHERE r.id=$1`, id))
+	LEFT JOIN companies c ON c.id=r.company_id
+	LEFT JOIN src_platforms p ON p.id=r.platform_id WHERE r.id=$1`, id))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -346,6 +184,8 @@ func (d *DB) GetSRCReward(id int64) (*SRCReward, error) {
 // SRCRewardInput 是新建/更新成果的输入。
 type SRCRewardInput struct {
 	CompanyID   *int64
+	PlatformID  *int64
+	TargetID    *int64
 	TaskID      *int64
 	FindingID   *int64
 	EntryID     *int64
@@ -367,14 +207,24 @@ func (d *DB) CreateSRCReward(in SRCRewardInput) (*SRCReward, error) {
 	}
 	var id int64
 	err := d.QueryRow(`
-INSERT INTO src_rewards(company_id, task_id, finding_id, entry_id, title, severity, vuln_class, status, platform_ref, feedback)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
-		in.CompanyID, in.TaskID, in.FindingID, in.EntryID, strings.TrimSpace(in.Title),
+INSERT INTO src_rewards(company_id, platform_id, target_id, task_id, finding_id, entry_id, title, severity, vuln_class, status, platform_ref, feedback)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
+		nullableIDPtr(in.CompanyID), nullableIDPtr(in.PlatformID), nullableIDPtr(in.TargetID),
+		nullableIDPtr(in.TaskID), nullableIDPtr(in.FindingID), nullableIDPtr(in.EntryID),
+		strings.TrimSpace(in.Title),
 		in.Severity, in.VulnClass, in.Status, in.PlatformRef, in.Feedback).Scan(&id)
 	if err != nil {
 		return nil, err
 	}
 	return d.GetSRCReward(id)
+}
+
+// nullableIDPtr 把 *int64 里 <=0 的值转成 NULL(外键列不接受 0)。
+func nullableIDPtr(v *int64) any {
+	if v == nil || *v <= 0 {
+		return nil
+	}
+	return *v
 }
 
 // UpdateSRCReward 更新成果(提交状态/平台反馈等)。
@@ -402,7 +252,10 @@ func (d *DB) DeleteSRCReward(id int64) (bool, error) {
 
 // AutoCreateSRCReward 任务在 SRC 模式下产出 finding 时自动建成果(幂等:
 // 同一 finding 只建一条)。返回是否为新建。
-func (d *DB) AutoCreateSRCReward(companyID, taskID, findingID int64, title, severity, vulnClass string) (int64, bool, error) {
+//
+// platformID/targetID 取自任务本身的归属(任务建时就定了),这样成果自动带上
+// 「提交到哪个平台、打的哪个目标」,平台详情页与目标详情页无需再回查任务。
+func (d *DB) AutoCreateSRCReward(companyID, platformID, targetID, taskID, findingID int64, title, severity, vulnClass string) (int64, bool, error) {
 	var existing int64
 	err := d.QueryRow(`SELECT id FROM src_rewards WHERE finding_id=$1 LIMIT 1`, findingID).Scan(&existing)
 	if err == nil {
@@ -411,10 +264,21 @@ func (d *DB) AutoCreateSRCReward(companyID, taskID, findingID int64, title, seve
 	if err != sql.ErrNoRows {
 		return 0, false, err
 	}
-	r, err := d.CreateSRCReward(SRCRewardInput{
-		CompanyID: &companyID, TaskID: &taskID, FindingID: &findingID,
+	in := SRCRewardInput{
+		TaskID: &taskID, FindingID: &findingID,
 		Title: title, Severity: severity, VulnClass: vulnClass, Status: "pending",
-	})
+	}
+	// 归属用指针传:0 值表示「无该维度归属」,传进去会被转成 NULL 而不是写 0。
+	if companyID > 0 {
+		in.CompanyID = &companyID
+	}
+	if platformID > 0 {
+		in.PlatformID = &platformID
+	}
+	if targetID > 0 {
+		in.TargetID = &targetID
+	}
+	r, err := d.CreateSRCReward(in)
 	if err != nil {
 		return 0, false, err
 	}
@@ -440,18 +304,31 @@ type SRCCompanyStat struct {
 	Accepted    int    `json:"accepted"`
 }
 
-// SRCRewardStats 成果概览统计(企业模式/成果页头部卡片)。
+// SRCPlatformStat 是一个平台的成果统计。
+type SRCPlatformStat struct {
+	PlatformID   int64  `json:"platform_id"`
+	PlatformName string `json:"platform_name"`
+	Total        int    `json:"total"`
+	Accepted     int    `json:"accepted"`
+}
+
+// SRCRewardStats 成果概览统计(成果页头部卡片 + 平台详情页)。
 type SRCRewardStats struct {
-	Total     int              `json:"total"`
-	ByStatus  map[string]int   `json:"by_status"`
-	ByCompany []SRCCompanyStat `json:"by_company"`
+	Total      int               `json:"total"`
+	ByStatus   map[string]int    `json:"by_status"`
+	ByCompany  []SRCCompanyStat  `json:"by_company"`
+	ByPlatform []SRCPlatformStat `json:"by_platform"`
 }
 
 // SRCRewardOverview 成果概览。
 func (d *DB) SRCRewardOverview() (*SRCRewardStats, error) {
-	// ByCompany 必须是空数组而非 nil:Go 的 nil slice 序列化成 JSON null,
+	// ByCompany/ByPlatform 必须是空数组而非 nil:Go 的 nil slice 序列化成 JSON null,
 	// 前端读 .length 会直接崩(8787 的 rewards 页「This page couldn't load」就是这个)。
-	st := &SRCRewardStats{ByStatus: map[string]int{}, ByCompany: []SRCCompanyStat{}}
+	st := &SRCRewardStats{
+		ByStatus:   map[string]int{},
+		ByCompany:  []SRCCompanyStat{},
+		ByPlatform: []SRCPlatformStat{},
+	}
 	rows, err := d.Query(`SELECT status, COUNT(*) FROM src_rewards GROUP BY status`)
 	if err != nil {
 		return nil, err
@@ -478,13 +355,33 @@ SELECT COALESCE(r.company_id,0), COALESCE(c.name,'未关联企业'), COUNT(*),
 	if err != nil {
 		return nil, err
 	}
-	defer crows.Close()
 	for crows.Next() {
 		var row SRCCompanyStat
 		if err := crows.Scan(&row.CompanyID, &row.CompanyName, &row.Total, &row.Accepted); err != nil {
+			crows.Close()
 			return nil, err
 		}
 		st.ByCompany = append(st.ByCompany, row)
 	}
-	return st, crows.Err()
+	crows.Close()
+	if err := crows.Err(); err != nil {
+		return nil, err
+	}
+	prows, err := d.Query(`
+SELECT COALESCE(r.platform_id,0), COALESCE(p.name,'未关联平台'), COUNT(*),
+       COUNT(*) FILTER (WHERE r.status='accepted')
+  FROM src_rewards r LEFT JOIN src_platforms p ON p.id=r.platform_id
+ GROUP BY r.platform_id, p.name ORDER BY COUNT(*) DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer prows.Close()
+	for prows.Next() {
+		var row SRCPlatformStat
+		if err := prows.Scan(&row.PlatformID, &row.PlatformName, &row.Total, &row.Accepted); err != nil {
+			return nil, err
+		}
+		st.ByPlatform = append(st.ByPlatform, row)
+	}
+	return st, prows.Err()
 }

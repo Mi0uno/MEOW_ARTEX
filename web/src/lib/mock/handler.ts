@@ -48,6 +48,14 @@ const mockLLMRecords = structuredClone(D.llmRecords);
 const mockTaskTemplates = structuredClone(D.taskTemplates);
 const mockTaskCategories = structuredClone(D.taskCategories);
 const mockConversations = structuredClone(D.conversations);
+// SRC 平台选择:运行期副本,让 demo 里的新建/编辑有反馈而不污染导出夹具。
+const mockSRCPlatforms = structuredClone(D.srcPlatforms);
+const mockSRCPlatformFiles = structuredClone(D.srcPlatformFiles);
+const mockSRCTargets = structuredClone(D.srcTargets);
+const mockSRCTargetLinks = structuredClone(D.srcTargetLinks);
+const mockSRCTargetAssets = structuredClone(D.srcTargetAssets);
+const mockSRCTargetImportSources = structuredClone(D.srcTargetImportSources);
+const mockSRCRewards = structuredClone(D.srcRewards);
 const mockRetests: FindingRetest[] = [];
 const mockRetestMessages: Record<number, Activity[]> = {};
 
@@ -2469,6 +2477,113 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (seg.at(-1) === "side-questions") {
     if (m === "GET") return { items: [], current: null, next_cursor: 0, snapshot: null };
     if (m === "POST") throw new Error("演示模式不支持旁路提问");
+  }
+
+  // ── SRC 平台选择(平台 → 目标 → 资产) ──
+  // 这些路径必须显式命中:读兜底会把 /src/platforms/1 这类单对象路径判成 {}，
+  // 详情页拿到 undefined 直接崩(平台其它模块踩过同样的坑)。
+  if (path === "/src/platforms" && m === "GET") {
+    const enabled = q.get("enabled") ?? "";
+    const kw = (q.get("q") ?? "").trim().toLowerCase();
+    const filtered = mockSRCPlatforms.filter(
+      (p) =>
+        (enabled === "" || (enabled === "enabled") === p.enabled) &&
+        (!kw || p.name.toLowerCase().includes(kw) || p.description.toLowerCase().includes(kw)),
+    );
+    const limit = Number(q.get("limit")) || 50;
+    const offset = Number(q.get("offset")) || 0;
+    return {
+      platforms: filtered.slice(offset, offset + limit),
+      total: filtered.length,
+      counts: { all: mockSRCPlatforms.length, enabled: mockSRCPlatforms.filter((p) => p.enabled).length },
+    };
+  }
+  if (path === "/src/platforms" && m === "POST") return { platform: { ...mockSRCPlatforms[0], id: 99, ...b } };
+  if (seg[0] === "src" && seg[1] === "platforms" && seg.length === 3 && m === "GET") {
+    const p = mockSRCPlatforms.find((x) => String(x.id) === seg[2]);
+    return p ? { platform: p } : {};
+  }
+  if (seg[0] === "src" && seg[1] === "platforms" && seg.length === 3 && (m === "PUT" || m === "DELETE")) {
+    return m === "DELETE" ? { deleted: true } : { platform: { ...mockSRCPlatforms[0], ...b } };
+  }
+  // 平台下的目标列表
+  if (seg[0] === "src" && seg[1] === "platforms" && seg[3] === "targets" && seg.length === 4) {
+    if (m === "GET") {
+      const links = mockSRCTargetLinks.filter((l) => String(l.platform_id) === seg[2]);
+      const targets = links
+        .map((l) => mockSRCTargets.find((t) => t.id === l.target_id))
+        .filter((t): t is (typeof mockSRCTargets)[number] => !!t);
+      return { targets, total: targets.length };
+    }
+    if (m === "POST") return { target: mockSRCTargets[0], link: mockSRCTargetLinks[0] };
+  }
+  if (seg[0] === "src" && seg[1] === "platforms" && seg[3] === "targets" && seg.length === 5 && m === "DELETE")
+    return { deleted: true };
+  // 平台规范附件
+  if (seg[0] === "src" && seg[1] === "platforms" && seg[3] === "files") {
+    if (m === "GET") return { files: mockSRCPlatformFiles.filter((f) => String(f.platform_id) === seg[2]) };
+    if (m === "POST") return { file: { ...mockSRCPlatformFiles[0], id: 99, kind: String(b.kind ?? "rules") } };
+    if (m === "DELETE") return { deleted: true };
+  }
+  if (path === "/src/targets" && m === "GET") {
+    const kw = (q.get("q") ?? "").trim().toLowerCase();
+    const filtered = mockSRCTargets.filter((t) => !kw || t.name.toLowerCase().includes(kw));
+    return { targets: filtered, total: filtered.length };
+  }
+  if (seg[0] === "src" && seg[1] === "targets" && seg.length === 3) {
+    if (m === "GET") {
+      const t = mockSRCTargets.find((x) => String(x.id) === seg[2]);
+      return t ? { target: t } : {};
+    }
+    if (m === "PUT") return { target: { ...mockSRCTargets[0], ...b } };
+    if (m === "DELETE") return { deleted: true };
+  }
+  // 目标所属平台的关联(授权范围挂这一层)
+  if (seg[0] === "src" && seg[1] === "targets" && seg[3] === "links") {
+    const links = mockSRCTargetLinks.filter((l) => String(l.target_id) === seg[2]);
+    if (seg.length === 4) return { links };
+    if (seg.length === 5) {
+      if (m === "DELETE") return { deleted: true };
+      return { link: links.find((l) => String(l.platform_id) === seg[4]) ?? links[0] };
+    }
+  }
+  // 目标资产
+  if (seg[0] === "src" && seg[1] === "targets" && seg[3] === "assets") {
+    if (m === "GET") {
+      const assets = mockSRCTargetAssets.filter((a) => String(a.target_id) === seg[2]);
+      return { assets, total: assets.length, counts: { all: assets.length } };
+    }
+    if (m === "POST") {
+      const staged = Array.isArray(b.staged_ids) ? (b.staged_ids as number[]).length : 0;
+      const existing = Array.isArray(b.asset_ids) ? (b.asset_ids as number[]).length : 0;
+      const manual = Array.isArray(b.assets) ? (b.assets as unknown[]).length : 0;
+      const added = staged + existing + manual;
+      return { added, skipped: 0, assets: mockSRCTargetAssets.slice(0, added), errors: [] };
+    }
+    if (m === "DELETE") return { deleted: 1 };
+  }
+  // 可导入来源(信息搜集暂存区 + 已有资产)
+  if (seg[0] === "src" && seg[1] === "targets" && seg[3] === "import-sources" && m === "GET") {
+    const kind = q.get("kind") ?? "";
+    return { sources: mockSRCTargetImportSources.filter((s) => !kind || s.kind === kind) };
+  }
+  // 成果:平台/目标详情页的「成果」页签都要用;不给显式分支会被读兜底判成 [] 而永远空态。
+  if (path === "/src/rewards" && m === "GET") {
+    const platformId = q.get("platform_id");
+    const targetId = q.get("target_id");
+    const rewards = mockSRCRewards.filter(
+      (r) =>
+        (!platformId || String(r.platform_id) === platformId) && (!targetId || String(r.target_id) === targetId),
+    );
+    return { rewards, total: rewards.length, counts: { pending: rewards.length } };
+  }
+  if (path === "/src/overview" && m === "GET") {
+    return {
+      total: mockSRCRewards.length,
+      by_status: { pending: mockSRCRewards.length },
+      by_company: [],
+      by_platform: [],
+    };
   }
 
   // ── 写操作兜底：成功但不落库 ──

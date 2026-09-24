@@ -18,8 +18,11 @@ export interface Task {
   stage?: TaskStage; // 三阶段平台;缺省=exploit
   kind?: "agent" | "pipeline"; // agent=现有引擎;pipeline=信息搜集确定性步骤任务
   step_key?: string; // recon 单步骤任务:收集器 key(手动录入/证书透明日志/…)
-  src_mode?: boolean; // SRC 模式:产出计入 SRC 成果,并按企业 SRC 规范约束 AI 边界
-  src_profile_id?: number;
+  src_mode?: boolean; // SRC 模式:产出计入 SRC 成果,并按平台/目标规范约束 AI 边界
+  /** 任务归属的 SRC 平台(新三级结构);旧任务的 src_profile_id 仅作历史回显 */
+  src_platform_id?: number;
+  /** 任务归属的 SRC 目标(平台×目标) */
+  src_target_id?: number;
   /** 出网方式(任务级覆盖):""=跟随全局 / "direct"=强制直连 / "pool"=强制走代理池 */
   proxy_mode?: string;
   /** 仅 pool 时有效:指定用哪个代理组;0/缺省=用全局选中的组 */
@@ -197,14 +200,80 @@ export interface VulnSyncRun {
   finished_at?: string;
 }
 
-// ---- SRC 模式 ----
+// ---- SRC 平台选择 ----
+//
+// 三级结构:平台 → 目标 → 资产。平台是顶层实体(SRC 提交平台,如补天/漏洞盒子),
+// 目标是被测试的对象(厂商/学校),资产是目标下的具体资产。
+// 平台与目标是多对多:同一家企业可能同时收录在多个平台,各平台下的授权范围与
+// 规范各不相同,所以授权范围字段挂在「平台×目标」关联(src_platform_targets)上。
 
-export interface SRCProfile {
+/** 平台级规范文件的四类用途,与后端 src_platform_files.kind 同取值。 */
+export type SRCPlatformFileKind = "reward_standard" | "scoring_standard" | "code_of_conduct" | "rules";
+
+export const SRC_PLATFORM_FILE_KINDS: { value: SRCPlatformFileKind; label: string }[] = [
+  { value: "reward_standard", label: "奖励标准" },
+  { value: "scoring_standard", label: "评分标准" },
+  { value: "code_of_conduct", label: "守则" },
+  { value: "rules", label: "规范" },
+];
+
+export interface SRCPlatform {
   id: number;
-  company_id: number;
-  company_name?: string;
   name: string;
-  platform: string;
+  nkey?: string;
+  homepage: string;
+  description: string;
+  reward_standard: string;
+  scoring_standard: string;
+  code_of_conduct: string;
+  rules: string;
+  enabled: boolean;
+  // 统计(列表页与详情页概览用;后端聚合,避免前端逐个拉列表)
+  target_count?: number;
+  asset_count?: number;
+  file_count?: number;
+  reward_count?: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** 平台规范附件。content_text 是解析出的正文,会与四类文本域一起注入 AI 约束。 */
+export interface SRCPlatformFile {
+  id: number;
+  platform_id: number;
+  kind: SRCPlatformFileKind | string;
+  filename: string;
+  byte_size: number;
+  content_text: string;
+  // parsed=已解析出正文并注入约束 / skipped=格式不支持,仅存档 / failed=解析报错
+  parse_status: "parsed" | "skipped" | "failed" | string;
+  parse_note: string;
+  created_at: string;
+}
+
+/** 目标:被测试的对象。company_id 可空——平台下可以先只有名字,等资产进来再关联企业。 */
+export interface SRCTarget {
+  id: number;
+  name: string;
+  company_id?: number;
+  company_name?: string;
+  description: string;
+  enabled: boolean;
+  // 统计
+  platform_count?: number;
+  asset_count?: number;
+  reward_count?: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** 平台×目标关联:授权范围与规范挂这一层(同一目标在不同平台下规范不同)。 */
+export interface SRCTargetLink {
+  id: number;
+  platform_id: number;
+  platform_name?: string;
+  target_id: number;
+  target_name?: string;
   scope_note: string;
   forbidden: string;
   allowed_types: string;
@@ -215,10 +284,45 @@ export interface SRCProfile {
   updated_at: string;
 }
 
+/** 目标资产:资产本体仍在 assets 表,这里只记「该平台该目标纳入了哪些资产」。 */
+export interface SRCTargetAsset {
+  id: number;
+  platform_id: number;
+  target_id: number;
+  asset_id: number;
+  source: "manual" | "recon" | "existing" | string;
+  note: string;
+  created_at: string;
+  // 联表带出的资产详情(展示用)
+  type?: string;
+  value?: string;
+  port?: number;
+  company_id?: number;
+}
+
+/** 从信息搜集/已有资产导入时的候选来源。 */
+export interface SRCTargetImportSource {
+  // staged=信息搜集暂存区待采纳 / asset=资产图里已有的资产
+  kind: "staged" | "asset" | string;
+  id: number;
+  type: string;
+  value: string;
+  port?: number;
+  // staged 专用:所属任务与产出收集器
+  task_id?: number;
+  task_name?: string;
+  collector?: string;
+  // 是否已在该目标下(前端置灰已导入项)
+  imported?: boolean;
+}
+
 export interface SRCReward {
   id: number;
   company_id?: number;
   company_name?: string;
+  platform_id?: number;
+  platform_name?: string;
+  target_id?: number;
   task_id?: number;
   finding_id?: number;
   entry_id?: number;
@@ -237,6 +341,8 @@ export interface SRCOverview {
   total: number;
   by_status: Record<string, number>;
   by_company: { company_id: number; company_name: string; total: number; accepted: number }[];
+  // 平台维度聚合。可选:旧后端不返回该字段时前端按空数组处理。
+  by_platform?: { platform_id: number; platform_name: string; total: number; accepted: number }[];
 }
 
 // ---- 报告中心 ----

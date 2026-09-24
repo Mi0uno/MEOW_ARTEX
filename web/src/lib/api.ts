@@ -35,9 +35,9 @@ import type {
   Edge,
   EvidenceBodyPreview,
   ExplorationNodePage,
+  ExplorationNodeQuery,
   JevThresholds,
   JevThresholdsResponse,
-  ExplorationNodeQuery,
   ExternalAPIConfig,
   ExternalAPIProviderDesc,
   Finding,
@@ -103,8 +103,13 @@ import type {
   StagedDecideResult,
   Stats,
   SRCOverview,
-  SRCProfile,
+  SRCPlatform,
+  SRCPlatformFile,
   SRCReward,
+  SRCTarget,
+  SRCTargetAsset,
+  SRCTargetImportSource,
+  SRCTargetLink,
   Task,
   VulnEntry,
   VulnPoc,
@@ -307,7 +312,9 @@ export const api = {
     planHeartbeatSeconds?: number;
     coverageEnabled?: boolean;
     stage?: "recon" | "exploit" | "post" | "report"; // recon=信息搜集步骤任务;report=报告中心 AI 识别任务(系统创建)
-    srcMode?: boolean; // SRC 模式:产出计入 SRC 成果,并按企业 SRC 规范约束 AI 边界
+    srcMode?: boolean; // SRC 模式:产出计入 SRC 成果,并按平台/目标规范约束 AI 边界
+    srcPlatformId?: number; // SRC 平台归属:决定注入哪套平台规范(奖励/评分/守则)
+    srcTargetId?: number; // SRC 目标归属:决定注入该平台下目标的授权范围
     proxyMode?: string; // 出网方式:""=跟随全局 / "direct"=强制直连 / "pool"=强制走代理池
     proxyGroupId?: number; // 仅 pool 时有效:指定代理组;0/缺省=用全局选中的组
     guardMode?: string; // 监管门限:""=跟随全局 / "off"=本任务不跑监管 / "enforce"=强制启用
@@ -330,6 +337,8 @@ export const api = {
       coverage_enabled: input.coverageEnabled ?? true, // 默认开;false=关闭资产覆盖度功能
       stage: input.stage,
       src_mode: input.srcMode ?? false,
+      src_platform_id: input.srcPlatformId ?? 0,
+      src_target_id: input.srcTargetId ?? 0,
       proxy_mode: input.proxyMode ?? "",
       proxy_group_id: input.proxyGroupId ?? 0,
       guard_mode: input.guardMode ?? "",
@@ -1023,22 +1032,132 @@ export const api = {
   triggerVulnSync: () => post<{ status: string }>("/vulndb/sync", {}),
   setVulnSyncConfig: (input: { enabled?: boolean; interval_hours?: number }) =>
     put<{ ok: boolean }>("/vulndb/sync/config", input),
-  // ---- SRC 模式 ----
-  srcProfiles: (input?: { companyId?: number; q?: string; limit?: number; offset?: number }) => {
+  // ---- SRC 平台选择(平台 → 目标 → 资产) ----
+  srcPlatforms: (input?: { q?: string; enabled?: string; limit?: number; offset?: number }) => {
     const p = new URLSearchParams();
-    if (input?.companyId) p.set("company_id", String(input.companyId));
+    if (input?.q) p.set("q", input.q);
+    if (input?.enabled && input.enabled !== "all") p.set("enabled", input.enabled);
+    p.set("limit", String(input?.limit ?? 50));
+    p.set("offset", String(input?.offset ?? 0));
+    return get<{ platforms: SRCPlatform[]; total: number; counts: Record<string, number> }>(
+      `/src/platforms?${p.toString()}`,
+    ).then((r) => ({ platforms: arr(r.platforms), total: r.total ?? 0, counts: r.counts ?? {} }));
+  },
+  getSRCPlatform: (id: number) =>
+    get<{ platform: SRCPlatform }>(`/src/platforms/${id}`).then((r) => r.platform),
+  saveSRCPlatform: (input: Partial<SRCPlatform>) => {
+    // 有 id 走 PUT(更新),无 id 走 POST(新建)——与平台其它模块一致的语义。
+    if (input.id) return put<{ platform: SRCPlatform }>(`/src/platforms/${input.id}`, input);
+    return post<{ platform: SRCPlatform }>("/src/platforms", input);
+  },
+  deleteSRCPlatform: (id: number) => del<{ deleted: boolean }>(`/src/platforms/${id}`),
+  // 平台下的目标列表
+  srcPlatformTargets: (platformId: number, input?: { q?: string; limit?: number; offset?: number }) => {
+    const p = new URLSearchParams();
     if (input?.q) p.set("q", input.q);
     p.set("limit", String(input?.limit ?? 50));
     p.set("offset", String(input?.offset ?? 0));
-    return get<{ profiles: SRCProfile[]; total: number }>(`/src/profiles?${p.toString()}`).then((r) => ({
-      profiles: arr(r.profiles),
+    return get<{ targets: SRCTarget[]; total: number }>(`/src/platforms/${platformId}/targets?${p.toString()}`).then(
+      (r) => ({ targets: arr(r.targets), total: r.total ?? 0 }),
+    );
+  },
+  // 在平台下新增目标(可同时挂链);target_id 非 0 表示挂已有目标
+  addSRCPlatformTarget: (
+    platformId: number,
+    input: { target_id?: number; name?: string; company_id?: number; description?: string; scope_note?: string },
+  ) => post<{ target: SRCTarget; link: SRCTargetLink }>(`/src/platforms/${platformId}/targets`, input),
+  removeSRCPlatformTarget: (platformId: number, targetId: number) =>
+    del<{ deleted: boolean }>(`/src/platforms/${platformId}/targets/${targetId}`),
+  // 平台规范附件
+  srcPlatformFiles: (platformId: number) =>
+    get<{ files: SRCPlatformFile[] }>(`/src/platforms/${platformId}/files`).then((r) => arr(r.files)),
+  uploadSRCPlatformFile: (platformId: number, file: File, kind: string) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("kind", kind);
+    const token = getToken();
+    return fetch(`/api/src/platforms/${platformId}/files`, {
+      method: "POST",
+      // 不能设 Content-Type:必须让浏览器自己带 multipart boundary。
+      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      body: fd,
+    }).then(async (r) => {
+      if (!r.ok) throw new Error(await r.text());
+      return r.json() as Promise<{ file: SRCPlatformFile }>;
+    });
+  },
+  deleteSRCPlatformFile: (platformId: number, fileId: number) =>
+    del<{ deleted: boolean }>(`/src/platforms/${platformId}/files/${fileId}`),
+  // 附件下载走原生导航(带 token 的 fetch 拿不到浏览器下载语义)
+  srcPlatformFileDownloadUrl: (platformId: number, fileId: number) =>
+    `/api/src/platforms/${platformId}/files/${fileId}/download`,
+
+  // 目标
+  srcTargets: (input?: { q?: string; platformId?: number; limit?: number; offset?: number }) => {
+    const p = new URLSearchParams();
+    if (input?.q) p.set("q", input.q);
+    if (input?.platformId) p.set("platform_id", String(input.platformId));
+    p.set("limit", String(input?.limit ?? 50));
+    p.set("offset", String(input?.offset ?? 0));
+    return get<{ targets: SRCTarget[]; total: number }>(`/src/targets?${p.toString()}`).then((r) => ({
+      targets: arr(r.targets),
       total: r.total ?? 0,
     }));
   },
-  saveSRCProfile: (input: Partial<SRCProfile>) => post<{ profile: SRCProfile }>("/src/profiles", input),
-  deleteSRCProfile: (id: number) => del<{ deleted: boolean }>(`/src/profiles/${id}`),
+  getSRCTarget: (id: number) => get<{ target: SRCTarget }>(`/src/targets/${id}`).then((r) => r.target),
+  saveSRCTarget: (input: Partial<SRCTarget>) => {
+    if (input.id) return put<{ target: SRCTarget }>(`/src/targets/${input.id}`, input);
+    return post<{ target: SRCTarget }>("/src/targets", input);
+  },
+  deleteSRCTarget: (id: number) => del<{ deleted: boolean }>(`/src/targets/${id}`),
+  // 目标所属的平台关联(含各平台下的授权范围)
+  srcTargetLinks: (targetId: number) =>
+    get<{ links: SRCTargetLink[] }>(`/src/targets/${targetId}/links`).then((r) => arr(r.links)),
+  saveSRCTargetLink: (targetId: number, platformId: number, input: Partial<SRCTargetLink>) =>
+    put<{ link: SRCTargetLink }>(`/src/targets/${targetId}/links/${platformId}`, input),
+  unlinkSRCTarget: (targetId: number, platformId: number) =>
+    del<{ deleted: boolean }>(`/src/targets/${targetId}/links/${platformId}`),
+  // 目标资产
+  srcTargetAssets: (targetId: number, input?: { platformId?: number; type?: string; q?: string; limit?: number; offset?: number }) => {
+    const p = new URLSearchParams();
+    if (input?.platformId) p.set("platform_id", String(input.platformId));
+    if (input?.type && input.type !== "all") p.set("type", input.type);
+    if (input?.q) p.set("q", input.q);
+    p.set("limit", String(input?.limit ?? 50));
+    p.set("offset", String(input?.offset ?? 0));
+    return get<{ assets: SRCTargetAsset[]; total: number; counts: Record<string, number> }>(
+      `/src/targets/${targetId}/assets?${p.toString()}`,
+    ).then((r) => ({ assets: arr(r.assets), total: r.total ?? 0, counts: r.counts ?? {} }));
+  },
+  addSRCTargetAssets: (
+    targetId: number,
+    input: {
+      platform_id: number;
+      // 手工录入:直接给 type/value/port;导入:给 asset_ids(已有资产)或 staged_ids(暂存区)
+      assets?: { type: string; value: string; port?: number }[];
+      asset_ids?: number[];
+      staged_ids?: number[];
+      source?: string;
+    },
+  ) => post<{ added: number; skipped: number; assets: SRCTargetAsset[]; errors: string[] }>(`/src/targets/${targetId}/assets`, input),
+  removeSRCTargetAssets: (targetId: number, ids: number[]) =>
+    del<{ deleted: number }>(`/src/targets/${targetId}/assets?ids=${ids.join(",")}`),
+  // 可导入来源:该目标关联企业下的信息搜集暂存区 + 已有资产
+  srcTargetImportSources: (targetId: number, platformId: number, input?: { kind?: string; q?: string; limit?: number }) => {
+    const p = new URLSearchParams();
+    p.set("platform_id", String(platformId));
+    if (input?.kind) p.set("kind", input.kind);
+    if (input?.q) p.set("q", input.q);
+    p.set("limit", String(input?.limit ?? 200));
+    return get<{ sources: SRCTargetImportSource[] }>(`/src/targets/${targetId}/import-sources?${p.toString()}`).then((r) =>
+      arr(r.sources),
+    );
+  },
+
   srcRewards: (input?: {
     companyId?: number;
+    platformId?: number;
+    targetId?: number;
     taskId?: number;
     status?: string;
     severity?: string;
@@ -1049,6 +1168,8 @@ export const api = {
   }) => {
     const p = new URLSearchParams();
     if (input?.companyId) p.set("company_id", String(input.companyId));
+    if (input?.platformId) p.set("platform_id", String(input.platformId));
+    if (input?.targetId) p.set("target_id", String(input.targetId));
     if (input?.taskId) p.set("task_id", String(input.taskId));
     if (input?.status) p.set("status", input.status);
     if (input?.severity) p.set("severity", input.severity);

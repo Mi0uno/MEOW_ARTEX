@@ -1,6 +1,9 @@
 package server
 
-// SRC 模式 API:企业 SRC 规范 CRUD + 成果 CRUD + 概览。
+// SRC 平台选择:成果 CRUD + 概览,以及「平台/目标规范 → 任务硬约束」的注入。
+//
+// 平台/目标本身的 CRUD 在 src_platform_api.go(平台)与 src_target_api.go(目标),
+// 本文件只保留成果与注入两部分。
 
 import (
 	"encoding/json"
@@ -12,106 +15,19 @@ import (
 	"github.com/Autumn-27/artex/db"
 )
 
-// ---- SRC 规范 ----
-
-// listSRCProfiles GET /api/src/profiles?company_id=&q=&limit=&offset=
-func (s *Server) listSRCProfiles(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	companyID, _ := strconv.ParseInt(q.Get("company_id"), 10, 64)
-	limit, _ := strconv.Atoi(q.Get("limit"))
-	offset, _ := strconv.Atoi(q.Get("offset"))
-	items, total, err := s.m.PG().ListSRCProfiles(companyID, q.Get("q"), limit, offset)
-	if err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	if items == nil {
-		items = []*db.SRCProfile{}
-	}
-	writeJSON(w, 200, map[string]any{"profiles": items, "total": total})
-}
-
-// getSRCProfile GET /api/src/profiles/{id}
-func (s *Server) getSRCProfile(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil || id <= 0 {
-		writeErr(w, 400, "bad profile id")
-		return
-	}
-	p, err := s.m.PG().GetSRCProfile(id)
-	if err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	if p == nil {
-		writeErr(w, 404, "profile not found")
-		return
-	}
-	writeJSON(w, 200, map[string]any{"profile": p})
-}
-
-// srcProfilePayload 是新建/更新规范的请求体。
-type srcProfilePayload struct {
-	CompanyID    int64  `json:"company_id"`
-	Name         string `json:"name"`
-	Platform     string `json:"platform"`
-	ScopeNote    string `json:"scope_note"`
-	Forbidden    string `json:"forbidden"`
-	AllowedTypes string `json:"allowed_types"`
-	RateLimit    string `json:"rate_limit"`
-	Rules        string `json:"rules"`
-	Enabled      *bool  `json:"enabled"`
-}
-
-// saveSRCProfile POST /api/src/profiles — 按企业 upsert。
-func (s *Server) saveSRCProfile(w http.ResponseWriter, r *http.Request) {
-	var p srcProfilePayload
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&p); err != nil {
-		writeErr(w, 400, "invalid JSON: "+err.Error())
-		return
-	}
-	enabled := true
-	if p.Enabled != nil {
-		enabled = *p.Enabled
-	}
-	prof, err := s.m.PG().UpsertSRCProfile(db.SRCProfileInput{
-		CompanyID: p.CompanyID, Name: p.Name, Platform: p.Platform, ScopeNote: p.ScopeNote,
-		Forbidden: p.Forbidden, AllowedTypes: p.AllowedTypes, RateLimit: p.RateLimit,
-		Rules: p.Rules, Enabled: enabled,
-	})
-	if err != nil {
-		writeErr(w, 400, err.Error())
-		return
-	}
-	writeJSON(w, 200, map[string]any{"profile": prof})
-}
-
-// deleteSRCProfile DELETE /api/src/profiles/{id}
-func (s *Server) deleteSRCProfile(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil || id <= 0 {
-		writeErr(w, 400, "bad profile id")
-		return
-	}
-	deleted, err := s.m.PG().DeleteSRCProfile(id)
-	if err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	writeJSON(w, 200, map[string]any{"deleted": deleted})
-}
-
 // ---- SRC 成果 ----
 
-// listSRCRewards GET /api/src/rewards?company_id=&task_id=&status=&severity=&q=&sort=&limit=&offset=
+// listSRCRewards GET /api/src/rewards?company_id=&platform_id=&target_id=&task_id=&status=&severity=&q=&sort=&limit=&offset=
 func (s *Server) listSRCRewards(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	companyID, _ := strconv.ParseInt(q.Get("company_id"), 10, 64)
+	platformID, _ := strconv.ParseInt(q.Get("platform_id"), 10, 64)
+	targetID, _ := strconv.ParseInt(q.Get("target_id"), 10, 64)
 	taskID, _ := strconv.ParseInt(q.Get("task_id"), 10, 64)
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	offset, _ := strconv.Atoi(q.Get("offset"))
 	items, total, counts, err := s.m.PG().ListSRCRewards(db.SRCRewardFilter{
-		CompanyID: companyID, TaskID: taskID,
+		CompanyID: companyID, PlatformID: platformID, TargetID: targetID, TaskID: taskID,
 		Status: strings.TrimSpace(q.Get("status")), Severity: strings.TrimSpace(q.Get("severity")),
 		Q: strings.TrimSpace(q.Get("q")), Sort: strings.TrimSpace(q.Get("sort")),
 		Limit: limit, Offset: offset,
@@ -135,6 +51,8 @@ type srcRewardPayload struct {
 	PlatformRef string `json:"platform_ref"`
 	Feedback    string `json:"feedback"`
 	CompanyID   *int64 `json:"company_id"`
+	PlatformID  *int64 `json:"platform_id"`
+	TargetID    *int64 `json:"target_id"`
 	TaskID      *int64 `json:"task_id"`
 	FindingID   *int64 `json:"finding_id"`
 	EntryID     *int64 `json:"entry_id"`
@@ -148,7 +66,8 @@ func (s *Server) createSRCReward(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rw, err := s.m.PG().CreateSRCReward(db.SRCRewardInput{
-		CompanyID: p.CompanyID, TaskID: p.TaskID, FindingID: p.FindingID, EntryID: p.EntryID,
+		CompanyID: p.CompanyID, PlatformID: p.PlatformID, TargetID: p.TargetID,
+		TaskID: p.TaskID, FindingID: p.FindingID, EntryID: p.EntryID,
 		Title: p.Title, Severity: p.Severity, VulnClass: p.VulnClass, Status: p.Status,
 		PlatformRef: p.PlatformRef, Feedback: p.Feedback,
 	})
@@ -201,7 +120,7 @@ func (s *Server) deleteSRCReward(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"deleted": deleted})
 }
 
-// srcOverview GET /api/src/overview — 成果概览(状态分布 + 企业维度)。
+// srcOverview GET /api/src/overview — 成果概览(状态分布 + 企业维度 + 平台维度)。
 func (s *Server) srcOverview(w http.ResponseWriter, r *http.Request) {
 	st, err := s.m.PG().SRCRewardOverview()
 	if err != nil {
@@ -211,57 +130,88 @@ func (s *Server) srcOverview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, st)
 }
 
-// applySRCConstraints 把企业的 SRC 规范转成任务的 deny/allow 约束写入 task_constraints。
+// applySRCConstraints 把「平台规范 + 该平台下目标的授权范围」转成任务的
+// allow/deny 约束写入 task_constraints。
+//
 // 这是「防止 AI 越界」的落地点:约束经既有机制注入 Planner/Worker 系统提示
 // (agent/constraints.go 的 constraintBlock),对模型是最高优先级边界。
-// 创建 SRC 任务时调用;幂等由调用方保证(只在建任务时写一次)。
-func (s *Server) applySRCConstraints(t *Task, companyID int64) {
-	if t == nil || companyID <= 0 {
+//
+// 两段规范分开注入的理由:平台规范(奖励/评分/守则)与目标授权范围(能打哪些域名)
+// 对模型是同等重要的边界信息,合成一条会让「哪条来自平台、哪条来自目标」不可分辨,
+// 事后排查越界时无法定位约束来源。
+//
+// 平台与目标都可为空(只给平台 = 只注入平台规范),全空则什么都不做。
+func (s *Server) applySRCConstraints(t *Task, platformID, targetID int64) {
+	if t == nil {
 		return
 	}
-	prof, err := s.m.PG().GetSRCProfileByCompany(companyID)
-	if err != nil {
-		log.Printf("[src] 读取企业 #%d 的 SRC 规范失败: %v", companyID, err)
-		return
-	}
-	if prof == nil {
-		log.Printf("[src] 企业 #%d 没有 SRC 规范,任务将不受 SRC 边界约束", companyID)
+	if platformID <= 0 && targetID <= 0 {
+		log.Printf("[src] 任务 %s 标记了 SRC 模式但未指定平台/目标,无法注入约束", t.ID)
 		return
 	}
 	store := s.m.PG().Exploration(t.ExpID)
 	written := 0
-	// 授权范围与允许类型 → allow 约束(明确能做什么)。
-	if strings.TrimSpace(prof.ScopeNote) != "" {
-		if _, err := store.AddConstraint("allow", "SRC 授权范围:"+prof.ScopeNote, "system"); err == nil {
+	addConstraint := func(kind, text string) {
+		if strings.TrimSpace(text) == "" {
+			return
+		}
+		if _, err := store.AddConstraint(kind, text, "system"); err == nil {
 			written++
+		} else {
+			log.Printf("[src] 任务 %s 写入 %s 约束失败: %v", t.ID, kind, err)
 		}
 	}
-	if strings.TrimSpace(prof.AllowedTypes) != "" {
-		if _, err := store.AddConstraint("allow", "允许的测试类型:"+prof.AllowedTypes, "system"); err == nil {
-			written++
+
+	// 平台规范(奖励标准/评分标准/守则/规范 + 附件解析正文):作为 allow 注入,
+	// 它描述的是「这个平台下做什么是被鼓励/允许的」。
+	if platformID > 0 {
+		text, err := s.m.PG().SRCPlatformSpecText(platformID)
+		if err != nil {
+			log.Printf("[src] 读取平台 #%d 规范失败: %v", platformID, err)
+		} else {
+			addConstraint("allow", text)
 		}
 	}
-	if strings.TrimSpace(prof.RateLimit) != "" {
-		if _, err := store.AddConstraint("deny", "速率/强度限制(不得超出):"+prof.RateLimit, "system"); err == nil {
-			written++
+
+	// 目标授权范围:拆成 allow(授权范围/允许类型)与 deny(禁止事项/速率限制)注入。
+	// 逐条拆开而非整段塞入,是为了让规划者能逐条对照——整段文本容易被模型概括后丢掉细节。
+	if platformID > 0 && targetID > 0 {
+		link, err := s.m.PG().GetSRCTargetLink(platformID, targetID)
+		if err != nil {
+			log.Printf("[src] 读取平台 #%d/目标 #%d 关联失败: %v", platformID, targetID, err)
+		} else if link != nil && link.Enabled {
+			addConstraint("allow", prefixed("SRC 授权范围:", link.ScopeNote))
+			addConstraint("allow", prefixed("允许的测试类型:", link.AllowedTypes))
+			addConstraint("deny", prefixed("速率/强度限制(不得超出):", link.RateLimit))
+			// 禁止事项逐行 → 独立 deny 约束(每条都单独注入,便于规划者逐条遵守)。
+			for _, line := range splitConstraintLines(link.Forbidden) {
+				addConstraint("deny", line)
+			}
+			addConstraint("deny", prefixed("SRC 平台规范补充:", link.Rules))
+		} else if link == nil {
+			log.Printf("[src] 目标 #%d 未挂在平台 #%d 下,跳过授权范围注入", targetID, platformID)
 		}
 	}
-	// 禁止事项逐行 → 独立 deny 约束(每条都单独注入,便于规划者逐条遵守)。
-	for _, line := range strings.Split(prof.Forbidden, "\n") {
+
+	log.Printf("[src] 任务 %s 已注入 SRC 约束(平台=%d 目标=%d),共 %d 条", t.ID, platformID, targetID, written)
+}
+
+// prefixed 拼接约束前缀;正文为空时返回空串(调用方据此跳过)。
+func prefixed(prefix, body string) string {
+	if strings.TrimSpace(body) == "" {
+		return ""
+	}
+	return prefix + strings.TrimSpace(body)
+}
+
+// splitConstraintLines 把多行文本拆成非空行,并去掉行首的列表符号。
+func splitConstraintLines(text string) []string {
+	out := []string{}
+	for _, line := range strings.Split(text, "\n") {
 		line = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "-"))
-		if line == "" {
-			continue
-		}
-		if _, err := store.AddConstraint("deny", line, "system"); err == nil {
-			written++
+		if line != "" {
+			out = append(out, line)
 		}
 	}
-	// 额外规范正文整体作为一条 deny 约束(兜底,包含平台特有规则)。
-	if strings.TrimSpace(prof.Rules) != "" {
-		if _, err := store.AddConstraint("deny", "SRC 平台规范:"+prof.Rules, "system"); err == nil {
-			written++
-		}
-	}
-	log.Printf("[src] 任务 %s 已注入企业 #%d 的 SRC 规范(平台=%s),%d 条约束",
-		t.ID, companyID, prof.Platform, written)
+	return out
 }

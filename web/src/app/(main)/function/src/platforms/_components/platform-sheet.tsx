@@ -1,0 +1,147 @@
+"use client";
+
+// 新建/编辑平台的抽屉。列表页与详情页共用同一个表单,避免「列表里能填的字段、
+// 详情页里少一个」这类漂移——四类规范文本域在两边都必须能编辑。
+//
+// 用 Sheet 而不是 Dialog:字段有 8 个(含四个多行文本域),Dialog 的固定高度
+// 会把文本域挤成滚动小窗口,抽屉可以从上到下滚。
+
+import * as React from "react";
+
+import { Loader2Icon } from "lucide-react";
+import { toast } from "sonner";
+
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Separator } from "@/components/ui/separator";
+import { Sheet, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { Switch } from "@/components/ui/switch";
+import { api } from "@/lib/api";
+import type { SRCPlatform } from "@/lib/types";
+
+import { Field, SPEC_FIELDS, SpecTextarea } from "./platform-shared";
+
+// PlatformSheet 的 form 只装「用户改过的字段」,提交时整体发给后端(全量覆盖语义)。
+export function PlatformSheet({
+  platform,
+  open,
+  onOpenChange,
+  onSaved,
+}: {
+  platform: SRCPlatform | null;
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+  onSaved: (p: SRCPlatform) => void;
+}) {
+  const [form, setForm] = React.useState<Partial<SRCPlatform>>({});
+  const [busy, setBusy] = React.useState(false);
+
+  // 每次打开都从入参重置:上次编辑到一半关掉再打开,不该看到上次的残留值。
+  React.useEffect(() => {
+    if (!open) return;
+    setForm(
+      platform ?? {
+        name: "",
+        homepage: "",
+        description: "",
+        reward_standard: "",
+        scoring_standard: "",
+        code_of_conduct: "",
+        rules: "",
+        enabled: true,
+      },
+    );
+  }, [open, platform]);
+
+  const set = (patch: Partial<SRCPlatform>) => setForm((f) => ({ ...f, ...patch }));
+
+  const submit = async () => {
+    const name = (form.name ?? "").trim();
+    if (!name) {
+      toast.error("平台名称必填");
+      return;
+    }
+    setBusy(true);
+    try {
+      const r = await api.saveSRCPlatform({ ...form, name });
+      toast.success(platform ? "平台已保存" : "平台已创建");
+      onSaved(r.platform);
+    } catch (e) {
+      // 重名由后端判 409,这里把原文透出去(「同名平台已存在」比「保存失败」有用得多)。
+      toast.error(`保存失败:${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Sheet open={open} onOpenChange={onOpenChange}>
+      <SheetContent side="right" className="flex flex-col gap-0 p-0 sm:max-w-xl">
+        <SheetHeader className="border-b px-6 py-4">
+          <SheetTitle>{platform ? "编辑平台" : "新建平台"}</SheetTitle>
+          <SheetDescription className="text-xs">
+            平台规范(奖励标准/评分标准/守则/规范)会在建 SRC 任务时渲染成 AI 的硬约束;附件在详情页上传
+          </SheetDescription>
+        </SheetHeader>
+
+        <div className="min-h-0 flex-1 space-y-5 overflow-y-auto px-6 py-5">
+          <Field label="平台名称">
+            <Input
+              value={form.name ?? ""}
+              onChange={(e) => set({ name: e.target.value })}
+              placeholder="补天 / 漏洞盒子 / 教育 SRC"
+            />
+          </Field>
+
+          <Field label="主页">
+            <Input
+              value={form.homepage ?? ""}
+              onChange={(e) => set({ homepage: e.target.value })}
+              placeholder="https://www.butian.net"
+              className="font-mono"
+            />
+          </Field>
+
+          <Field label="描述">
+            <Input
+              value={form.description ?? ""}
+              onChange={(e) => set({ description: e.target.value })}
+              placeholder="国内主流众测平台，厂商自行发布众测项目与奖励标准。"
+            />
+          </Field>
+
+          <Separator />
+
+          {SPEC_FIELDS.map((f) => (
+            <SpecTextarea key={f.key} field={f} value={form[f.key] ?? ""} onChange={(v) => set({ [f.key]: v })} />
+          ))}
+
+          <Separator />
+
+          {/* Switch 渲染成 button,<label> 关联不到它(可访问名由 aria-label 提供),故用 div 排版。 */}
+          <div className="flex items-center gap-3">
+            <Switch
+              checked={form.enabled ?? true}
+              onCheckedChange={(v) => set({ enabled: v })}
+              aria-label="启用此平台"
+            />
+            <div>
+              <p className="font-medium text-sm">启用此平台</p>
+              <p className="text-muted-foreground text-xs">停用后该平台不出现在建单选择里，已有目标与成果保留</p>
+            </div>
+          </div>
+        </div>
+
+        <SheetFooter className="flex-row justify-end gap-2 border-t px-6 py-4">
+          <Button variant="outline" onClick={() => onOpenChange(false)}>
+            取消
+          </Button>
+          <Button disabled={busy} onClick={() => void submit()}>
+            {busy && <Loader2Icon className="size-4 animate-spin" />}
+            {busy ? "保存中…" : "保存"}
+          </Button>
+        </SheetFooter>
+      </SheetContent>
+    </Sheet>
+  );
+}

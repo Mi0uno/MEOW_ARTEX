@@ -783,11 +783,32 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/vulndb/sync", s.vulnDBSyncStatus)
 	mux.HandleFunc("POST /api/vulndb/sync", s.triggerVulnDBSync)
 	mux.HandleFunc("PUT /api/vulndb/sync/config", s.setVulnDBSyncConfig)
-	// ---- SRC 模式 ----
-	mux.HandleFunc("GET /api/src/profiles", s.listSRCProfiles)
-	mux.HandleFunc("POST /api/src/profiles", s.saveSRCProfile)
-	mux.HandleFunc("GET /api/src/profiles/{id}", s.getSRCProfile)
-	mux.HandleFunc("DELETE /api/src/profiles/{id}", s.deleteSRCProfile)
+	// ---- SRC 平台选择(平台 → 目标 → 资产) ----
+	mux.HandleFunc("GET /api/src/platforms", s.listSRCPlatforms)
+	mux.HandleFunc("POST /api/src/platforms", s.createSRCPlatform)
+	mux.HandleFunc("GET /api/src/platforms/{id}", s.getSRCPlatform)
+	mux.HandleFunc("PUT /api/src/platforms/{id}", s.updateSRCPlatform)
+	mux.HandleFunc("DELETE /api/src/platforms/{id}", s.deleteSRCPlatform)
+	mux.HandleFunc("GET /api/src/platforms/{id}/targets", s.srcPlatformTargets)
+	mux.HandleFunc("POST /api/src/platforms/{id}/targets", s.addSRCPlatformTarget)
+	mux.HandleFunc("DELETE /api/src/platforms/{id}/targets/{tid}", s.removeSRCPlatformTarget)
+	mux.HandleFunc("GET /api/src/platforms/{id}/files", s.srcPlatformFiles)
+	mux.HandleFunc("POST /api/src/platforms/{id}/files", s.uploadSRCPlatformFile)
+	mux.HandleFunc("GET /api/src/platforms/{id}/files/{fid}/download", s.downloadSRCPlatformFile)
+	mux.HandleFunc("DELETE /api/src/platforms/{id}/files/{fid}", s.deleteSRCPlatformFile)
+	mux.HandleFunc("GET /api/src/targets", s.srcTargets)
+	mux.HandleFunc("POST /api/src/targets", s.createSRCTarget)
+	mux.HandleFunc("GET /api/src/targets/{id}", s.getSRCTarget)
+	mux.HandleFunc("PUT /api/src/targets/{id}", s.updateSRCTarget)
+	mux.HandleFunc("DELETE /api/src/targets/{id}", s.deleteSRCTarget)
+	mux.HandleFunc("GET /api/src/targets/{id}/links", s.srcTargetLinks)
+	mux.HandleFunc("PUT /api/src/targets/{id}/links/{platformId}", s.saveSRCTargetLink)
+	mux.HandleFunc("DELETE /api/src/targets/{id}/links/{platformId}", s.unlinkSRCTarget)
+	mux.HandleFunc("GET /api/src/targets/{id}/assets", s.srcTargetAssets)
+	mux.HandleFunc("POST /api/src/targets/{id}/assets", s.addSRCTargetAssets)
+	mux.HandleFunc("DELETE /api/src/targets/{id}/assets", s.removeSRCTargetAssets)
+	mux.HandleFunc("GET /api/src/targets/{id}/import-sources", s.srcTargetImportSources)
+	// ---- SRC 成果 ----
 	mux.HandleFunc("GET /api/src/rewards", s.listSRCRewards)
 	mux.HandleFunc("POST /api/src/rewards", s.createSRCReward)
 	mux.HandleFunc("PUT /api/src/rewards/{id}", s.updateSRCReward)
@@ -1623,11 +1644,15 @@ type createTaskReq struct {
 	// 单步骤任务模型:step_key=收集器 key,step_config=该步骤配置(推荐);
 	// pipeline 为兼容保留的多步编排(与新模型互斥,step_key 优先)。
 	Stage string `json:"stage,omitempty"`
-	// SRC 模式:任务产出计入 SRC 成果,并按企业 SRC 规范约束 AI 边界(防越界)。
-	SRCMode    bool            `json:"src_mode,omitempty"`
-	StepKey    string          `json:"step_key,omitempty"`
-	StepConfig json.RawMessage `json:"step_config,omitempty"`
-	Pipeline   json.RawMessage `json:"pipeline,omitempty"`
+	// SRC 模式:任务产出计入 SRC 成果,并按平台/目标规范约束 AI 边界(防越界)。
+	// src_platform_id + src_target_id 决定注入哪套规范;只给平台不给目标时
+	// 只注入平台级规范(奖励标准/守则等)。
+	SRCMode       bool            `json:"src_mode,omitempty"`
+	SRCPlatformID int64           `json:"src_platform_id,omitempty"`
+	SRCTargetID   int64           `json:"src_target_id,omitempty"`
+	StepKey       string          `json:"step_key,omitempty"`
+	StepConfig    json.RawMessage `json:"step_config,omitempty"`
+	Pipeline      json.RawMessage `json:"pipeline,omitempty"`
 	// 出网方式(任务级覆盖):省略/""=跟随全局;direct=强制直连;pool=强制走代理池。
 	// proxy_group_id 仅在 pool 时有效(0/省略=用全局选中的代理组)。
 	ProxyMode    string `json:"proxy_mode,omitempty"`
@@ -1743,6 +1768,7 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		Stage:           req.Stage, Pipeline: req.Pipeline,
 		StepKey: req.StepKey, StepConfig: req.StepConfig,
 		SRCMode: req.SRCMode,
+		SRCPlatformID: req.SRCPlatformID, SRCTargetID: req.SRCTargetID,
 		// 出网方式(任务级覆盖):建任务时就定下来,agent 与流水线都按它取出口。
 		ProxyMode: req.ProxyMode, ProxyGroupID: req.ProxyGroupID,
 		// 监管门限(任务级覆盖):同上,建任务时就定下来,拦截链路按 taskID 解析。
@@ -1769,10 +1795,10 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		logTaskGuardChange(t.ID, req.GuardMode, req.GuardRuleIDs)
 	}
 	log.Printf("[task] 新建任务 #%s «%s» 目标: %s", t.ID, req.Description, req.Goal)
-	// SRC 模式:把企业 SRC 规范转成任务约束(防 AI 越界),再启动任务。
+	// SRC 模式:把平台规范 + 目标授权范围转成任务约束(防 AI 越界),再启动任务。
 	// 必须在 launchTask 之前写:约束要赶在首轮 Planner 之前就位。
-	if req.SRCMode && len(req.CompanyIDs) > 0 {
-		s.applySRCConstraints(t, req.CompanyIDs[0])
+	if req.SRCMode {
+		s.applySRCConstraints(t, req.SRCPlatformID, req.SRCTargetID)
 	}
 	// 共享的建后流程(seed + 种子意图 + 后台目标分解 + engine.Run),与 spawn_task 复用同一段。
 	// launchTask 内部异步,不阻塞 UI —— 目标分解在后台可见地进行。

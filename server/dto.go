@@ -65,9 +65,12 @@ type TaskDTO struct {
 	Pipeline           json.RawMessage `json:"pipeline,omitempty"`
 	StepKey            string          `json:"step_key,omitempty"` // recon 单步骤任务:收集器 key
 	StepConfig         json.RawMessage `json:"step_config,omitempty"`
-	// SRC 模式:产出计入 SRC 成果,并按企业 SRC 规范约束 AI 边界。
-	SRCMode      bool  `json:"src_mode,omitempty"`
-	SRCProfileID int64 `json:"src_profile_id,omitempty"`
+	// SRC 模式:产出计入 SRC 成果,并按平台/目标规范约束 AI 边界。
+	// SRCProfileID 是旧「企业模式」的规范 id,仅为存量任务回显保留。
+	SRCMode       bool  `json:"src_mode,omitempty"`
+	SRCProfileID  int64 `json:"src_profile_id,omitempty"`
+	SRCPlatformID int64 `json:"src_platform_id,omitempty"`
+	SRCTargetID   int64 `json:"src_target_id,omitempty"`
 	// 出网方式(任务级覆盖):''=跟随全局;direct=强制直连;pool=强制走代理池。
 	ProxyMode    string `json:"proxy_mode,omitempty"`
 	ProxyGroupID int64  `json:"proxy_group_id,omitempty"`
@@ -152,6 +155,8 @@ func taskDTO(t *Task, status string) TaskDTO {
 		StepConfig:         t.StepConfig,
 		SRCMode:            t.SRCMode,
 		SRCProfileID:       t.SRCProfileID,
+		SRCPlatformID:      t.SRCPlatformID,
+		SRCTargetID:        t.SRCTargetID,
 		ProxyMode:          t.ProxyMode,
 		ProxyGroupID:       t.ProxyGroupID,
 		GuardMode:          guardMode,

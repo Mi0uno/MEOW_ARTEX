@@ -193,9 +193,10 @@ export const sidebarItems: NavGroup[] = [
         title: "SRC 模式",
         icon: Award,
         subItems: [
-          // 企业模式:选企业 → 配置 SRC 规范(防 AI 越界) → 进入任务页建 SRC 任务。
-          { id: "src-enterprise", title: "企业模式", url: "/function/src/enterprise", icon: Building2 },
-          // 平台批量:按 SRC 平台聚合企业,勾选多家批量建 SRC 任务。
+          // 平台选择:选平台 → 进入平台添加目标 → 进入目标添加资产。平台的奖励标准/
+          // 评分标准/守则/规范(含上传的附件)会转成 AI 硬约束,防止越界。
+          { id: "src-platforms", title: "平台选择", url: "/function/src/platforms", icon: Building2 },
+          // 平台批量:按平台聚合目标,勾选多个目标批量建 SRC 任务。
           { id: "src-batch", title: "平台批量", url: "/function/src/batch", icon: Layers },
           // 成果产出:SRC 任务产出的可提交成果与提交状态跟踪。
           { id: "src-rewards", title: "成果产出", url: "/function/src/rewards", icon: Award },
