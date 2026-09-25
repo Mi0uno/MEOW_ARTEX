@@ -2462,6 +2462,14 @@ export interface C2Listener {
   session_count?: number;
   created_at: string;
   updated_at: string;
+  /** 载体:local=平台本机;vps=经 SSH 远程转发以 VPS 机器为出入口(二期)。 */
+  host_kind: "local" | "vps";
+  /** vps 载体绑定的机器 id,0 = 无。 */
+  vps_machine_id: number;
+  /** vps 载体在机器公网侧的转发端口。 */
+  remote_port: number;
+  /** vps 载体机器名(JOIN 补齐,前端展示用)。 */
+  vps_machine_name?: string;
 }
 
 export interface C2ListenerInput {
@@ -2471,6 +2479,9 @@ export interface C2ListenerInput {
   callback?: string;
   url_path?: string;
   notes?: string;
+  host_kind?: "local" | "vps";
+  vps_machine_id?: number;
+  remote_port?: number;
 }
 
 /** 上线主机。sid 是 beacon 令牌;listener_id+beacon_uid 幂等复活。 */
@@ -2557,6 +2568,71 @@ export interface C2Payload {
   oneliner: string;
   created_by: string;
   created_at: string;
+  /** 变形来源免杀档案,0 = 无(一期直出)。 */
+  evasion_profile_id: number;
+  /** gosrc 是否已在本平台指派 VPS 上编译出二进制。 */
+  built_on_vps: boolean;
+}
+
+// ── C2 二期:免杀工作台与异步作业(契约 §13/§14)──
+
+/** defender/360/huorong/generic/custom。 */
+export type C2EvasionTargetAV = "defender" | "360" | "huorong" | "generic" | "custom";
+
+export interface C2EvasionProfile {
+  id: number;
+  name: string;
+  target_av: C2EvasionTargetAV;
+  payload_format: C2PayloadFormat;
+  /** 技术开关与参数(自由 JSON),前端按对象展示。 */
+  techniques: Record<string, unknown>;
+  /** 附加指示(喂给 LLM)。 */
+  instructions: string;
+  /** manual(手工)/llm(AI 生成)。 */
+  source: "manual" | "llm";
+  notes: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface C2EvasionProfileInput {
+  name: string;
+  target_av?: C2EvasionTargetAV;
+  payload_format?: C2PayloadFormat;
+  techniques?: Record<string, unknown>;
+  instructions?: string;
+  notes?: string;
+}
+
+export type C2JobKind = "evasion" | "build";
+export type C2JobStatus = "queued" | "running" | "done" | "error";
+
+/** 静态自测报告(c2_jobs.result 的约定形状,gosrc 构建作业另有 build_log)。 */
+export interface C2StaticReport {
+  hits: { marker: string; count: number }[];
+  entropy: number;
+  risk: "low" | "medium" | "high";
+  rounds?: number;
+  plan?: string;
+  build_log?: string;
+}
+
+/** C2 异步作业:免杀变形(evasion)/VPS 构建(build)。 */
+export interface C2Job {
+  id: number;
+  kind: C2JobKind;
+  profile_id: number;
+  payload_id: number;
+  listener_id: number;
+  vps_machine_id: number;
+  /** stage=post 监看任务 id,0 = 无。 */
+  task_id: number;
+  status: C2JobStatus;
+  input: Record<string, unknown>;
+  result: C2StaticReport & Record<string, unknown>;
+  error: string;
+  created_at: string;
+  done_at?: string;
 }
 
 /** 总览仪表盘一条请求取齐。 */

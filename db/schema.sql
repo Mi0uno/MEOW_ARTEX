@@ -2281,3 +2281,69 @@ CREATE INDEX IF NOT EXISTS idx_c2_payloads_listener ON c2_payloads(listener_id);
 DROP TRIGGER IF EXISTS trg_c2_payloads_upd ON c2_payloads;
 CREATE TRIGGER trg_c2_payloads_upd BEFORE UPDATE ON c2_payloads
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ───────────────────────── C2 中心二期（契约 C2_CONTRACTS.md §11-§16）─────────────────────────
+-- 监听器载体扩展:local=平台本机(一期行为);vps=以 VPS 机器为出入口,平台经 SSH 远程端口
+-- 转发把 VPS公网:remote_port 的流量转回本机监听器(host_kind='vps' 时 vps_machine_id 必填)。
+ALTER TABLE c2_listeners ADD COLUMN IF NOT EXISTS host_kind TEXT NOT NULL DEFAULT 'local';
+ALTER TABLE c2_listeners ADD COLUMN IF NOT EXISTS vps_machine_id BIGINT;
+ALTER TABLE c2_listeners ADD COLUMN IF NOT EXISTS remote_port INT NOT NULL DEFAULT 0;
+ALTER TABLE c2_listeners DROP CONSTRAINT IF EXISTS c2_listeners_host_check;
+ALTER TABLE c2_listeners ADD CONSTRAINT c2_listeners_host_check
+    CHECK (host_kind IN ('local','vps') AND (host_kind <> 'vps' OR vps_machine_id IS NOT NULL));
+CREATE INDEX IF NOT EXISTS idx_c2_listeners_vps ON c2_listeners(vps_machine_id) WHERE vps_machine_id IS NOT NULL;
+
+-- 载荷二期列:变形来源档案 / 是否经 VPS 构建出二进制。
+ALTER TABLE c2_payloads ADD COLUMN IF NOT EXISTS evasion_profile_id BIGINT;
+ALTER TABLE c2_payloads ADD COLUMN IF NOT EXISTS built_on_vps BOOLEAN NOT NULL DEFAULT false;
+
+-- 免杀档案:目标 AV 环境 + 技术配置(LLM 变形与静态自测的输入)。techniques 是自由 JSONB
+-- (混淆层级/字符串编码/加载器形态等),语义由 server 侧管线解释。
+CREATE TABLE IF NOT EXISTS c2_evasion_profiles (
+    id             BIGSERIAL PRIMARY KEY,
+    name           TEXT NOT NULL,
+    -- defender/360/huorong/generic/custom
+    target_av      TEXT NOT NULL DEFAULT 'generic',
+    -- 适用载荷格式: ps1/bash/py/gosrc
+    payload_format TEXT NOT NULL DEFAULT 'ps1',
+    techniques     JSONB NOT NULL DEFAULT '{}',
+    instructions   TEXT NOT NULL DEFAULT '',
+    -- manual(手工)/llm(AI 生成)
+    source         TEXT NOT NULL DEFAULT 'manual',
+    notes          TEXT NOT NULL DEFAULT '',
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (target_av IN ('defender','360','huorong','generic','custom')),
+    CHECK (payload_format IN ('ps1','bash','py','gosrc')),
+    CHECK (source IN ('manual','llm'))
+);
+DROP TRIGGER IF EXISTS trg_c2_evasion_profiles_upd ON c2_evasion_profiles;
+CREATE TRIGGER trg_c2_evasion_profiles_upd BEFORE UPDATE ON c2_evasion_profiles
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- C2 异步作业:免杀变形(evasion)与 VPS 构建(build)共用。task_id 挂 stage=post 监看任务
+-- (任务中心/对话自动收录,仿报告中心 AI 管线);result 存静态自测报告/构建日志摘要。
+CREATE TABLE IF NOT EXISTS c2_jobs (
+    id             BIGSERIAL PRIMARY KEY,
+    -- evasion(载荷变形)/build(gosrc 经 VPS 编译)
+    kind           TEXT NOT NULL,
+    profile_id     BIGINT,
+    payload_id     BIGINT,
+    listener_id    BIGINT,
+    vps_machine_id BIGINT,
+    task_id        BIGINT,
+    -- queued/running/done/error
+    status         TEXT NOT NULL DEFAULT 'queued',
+    input          JSONB NOT NULL DEFAULT '{}',
+    result         JSONB NOT NULL DEFAULT '{}',
+    error          TEXT NOT NULL DEFAULT '',
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    done_at        TIMESTAMPTZ,
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (kind IN ('evasion','build')),
+    CHECK (status IN ('queued','running','done','error'))
+);
+CREATE INDEX IF NOT EXISTS idx_c2_jobs_kind_status ON c2_jobs(kind, status, id DESC);
+DROP TRIGGER IF EXISTS trg_c2_jobs_upd ON c2_jobs;
+CREATE TRIGGER trg_c2_jobs_upd BEFORE UPDATE ON c2_jobs
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();

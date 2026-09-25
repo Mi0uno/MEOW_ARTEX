@@ -73,6 +73,11 @@ import type {
   PromptVar,
   PromptVersion,
   ProxyCheckRun,
+  C2EvasionProfile,
+  C2EvasionProfileInput,
+  C2Job,
+  C2JobKind,
+  C2JobStatus,
   C2Listener,
   C2ListenerInput,
   C2Loot,
@@ -2266,8 +2271,44 @@ export const api = {
       total: r.total,
     }));
   },
-  c2GeneratePayload: (input: { listener_id: number; format: C2PayloadFormat; target?: C2PayloadTarget; name?: string }) =>
-    post<{ id: number; oneliner: string }>("/c2/payloads", input),
+  c2GeneratePayload: (input: { listener_id: number; format: C2PayloadFormat; target?: C2PayloadTarget; name?: string; evasion_profile_id?: number; build_vps_machine_id?: number }) =>
+    post<{ id: number; oneliner: string; job_id?: number }>("/c2/payloads", input),
   c2DeletePayload: (id: number) => del<{ deleted: boolean }>(`/c2/payloads/${id}`),
   c2PayloadDownloadUrl: (id: number) => `/api/c2/payloads/${id}/download`,
+
+  // ── C2 二期(契约 §11-§16):免杀工作台 / 异步作业 / loot 转发现 ──
+  // 免杀档案 CRUD。
+  c2EvasionProfiles: (input?: { av?: string; format?: string }) => {
+    const p = new URLSearchParams();
+    if (input?.av) p.set("target_av", input.av);
+    if (input?.format) p.set("payload_format", input.format);
+    return get<{ profiles: C2EvasionProfile[]; total: number }>(`/c2/evasion/profiles?${p.toString()}`).then((r) => ({
+      profiles: arr(r.profiles),
+      total: r.total,
+    }));
+  },
+  c2CreateEvasionProfile: (input: C2EvasionProfileInput) => post<{ id: number }>("/c2/evasion/profiles", input),
+  c2UpdateEvasionProfile: (id: number, input: Partial<C2EvasionProfileInput>) =>
+    put<C2EvasionProfile>(`/c2/evasion/profiles/${id}`, input),
+  c2DeleteEvasionProfile: (id: number) => del<{ deleted: boolean }>(`/c2/evasion/profiles/${id}`),
+  // AI 变形生成:异步 job,202 返回 job_id;同档案+监听器已有 running 作业时 409。
+  c2EvasionGenerate: (input: { listener_id: number; format: C2PayloadFormat; target?: C2PayloadTarget; name?: string; profile_id?: number; instructions?: string }) =>
+    post<{ job_id: number }>("/c2/evasion/generate", input),
+  // 异步作业(evasion|build)。
+  c2Jobs: (input?: { kind?: C2JobKind; status?: C2JobStatus; listenerId?: number; limit?: number; offset?: number }) => {
+    const p = new URLSearchParams();
+    if (input?.kind) p.set("kind", input.kind);
+    if (input?.status) p.set("status", input.status);
+    if (input?.listenerId) p.set("listener_id", String(input.listenerId));
+    p.set("limit", String(input?.limit ?? 50));
+    p.set("offset", String(input?.offset ?? 0));
+    return get<{ jobs: C2Job[]; total: number }>(`/c2/jobs?${p.toString()}`).then((r) => ({
+      jobs: arr(r.jobs),
+      total: r.total,
+    }));
+  },
+  c2Job: (id: number) => get<C2Job>(`/c2/jobs/${id}`),
+  c2RetryJob: (id: number) => post<{ job_id: number }>(`/c2/jobs/${id}/retry`),
+  // 战利品转发现(需会话已绑定任务;重复转换 409)。
+  c2LootToFinding: (id: number) => post<{ finding_id: number }>(`/c2/loot/${id}/to-finding`),
 };

@@ -235,8 +235,10 @@ export const sidebarItems: NavGroup[] = [
           { id: "c2-listeners", title: "监听器", url: "/function/c2/listeners", icon: Radio },
           // 会话:上线主机列表与详情(交互/文件/流水/档案)。
           { id: "c2-sessions", title: "会话", url: "/function/c2/sessions", icon: MonitorSmartphone },
-          // 载荷与免杀:beacon 载荷生成与投递(免杀工作台二期)。
+          // 载荷与免杀:beacon 载荷生成与投递。
           { id: "c2-payloads", title: "载荷与免杀", url: "/function/c2/payloads", icon: PackageOpen },
+          // 免杀工作台:免杀档案管理 + AI 变形生成 + 本地静态自测报告(二期)。
+          { id: "c2-evasion", title: "免杀工作台", url: "/function/c2/evasion", icon: ShieldAlert },
           // 战利品:凭据/哈希/文件归档(二期联动发现与报告)。
           { id: "c2-loot", title: "战利品", url: "/function/c2/loot", icon: Gem },
         ],

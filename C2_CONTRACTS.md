@@ -1,4 +1,4 @@
-# C2_CONTRACTS.md — C2 中心契约（冻结版 v1，2026-09-26）
+# C2_CONTRACTS.md — C2 中心契约（**v2，2026-09-26**：§0-§10 为一期冻结稿存档，§11 起为二期增量）
 
 多 agent 并行开发的唯一规范。**本文件由主会话冻结；实现中若必须增改接口，只允许追加方法/字段并在提交说明里列出，禁止改名/改签名/删字段。**
 
@@ -229,12 +229,15 @@ server 侧职责：`c2Store` 适配器实现 c2center.Store（薄桥 db，含 se
 
 api.ts 调用只准用主会话冻结的 `c2*` 区段；发现缺接口→报告，不准自己加。
 
-## 9. 二期占位（本期不实现，别写死阻碍）
+## 9. 二期占位（v2 起按 §11 逐项落地；隧道/https/post 内置 agent 挪三期）
 
-- 免杀工作台 `/function/c2/evasion`：`c2_evasion_profiles`/`c2_jobs` 表、LLM 变形管线（仿 report_pipeline.go 异步 job+瞬态重试）、本地静态自测（特征串/熵）。**不接任何外部沙箱（载荷上传第三方=泄漏）**。
-- 编译型载荷：经指派 VPS 的 SSH 执行 go build（vpscenter.ExecCommand 现成）——这是 os/exec 禁令下的编译路径。
-- 隧道：socks5/转发多路复用在长轮询信道上，全模块最重，独立里程碑。
-- loot→finding：走 exploration 节点创建；post 内置 agent（promptcatalog 补 post_worker）。
+- 免杀工作台 `/function/c2/evasion`：`c2_evasion_profiles`/`c2_jobs` 表、LLM 变形管线（仿 report_pipeline.go 异步 job+瞬态重试）、本地静态自测（特征串/熵）。**不接任何外部沙箱（载荷上传第三方=泄漏）**。→ **二期做，见 §13**。
+- 编译型载荷：经指派 VPS 的 SSH 执行 go build（vpscenter.ExecCommand 现成）——这是 os/exec 禁令下的编译路径。→ **二期做，见 §14**。
+- 隧道：socks5/转发多路复用在长轮询信道上，全模块最重 → **三期**。
+- https 监听器：应用层信封已是 AES-GCM 端到端加密，TLS 只剩流量伪装价值 → 与隧道同批（三期）。
+- loot→finding：走 exploration 节点创建。→ **二期做，见 §15**。
+- post 内置 agent（promptcatalog 补 post_worker）→ 三期。
+- **VPS 载体监听器（v2 新增需求，用户指定）**：新建监听器可选 VPS 机器作为载体 → **二期做，见 §12**。
 
 ## 10. 验收标准（集成阶段主会话执行）
 
@@ -242,3 +245,63 @@ api.ts 调用只准用主会话冻结的 `c2*` 区段；发现缺接口→报告
 2. `GOSUMDB="sum.golang.org" ./build-local.sh out/artex-local` 构建成功（先停 8787+8799 两实例）。
 3. 8799 冒烟：建监听器→启停→生成 ps1/bash 载荷→本机跑 bash beacon→会话上线→shell 往返→files_list→loot 记录→overview 计数正确。
 4. 前端 6 页可打开、四件套齐全、无 console 崩溃。
+
+---
+
+# 二期增量（v2，2026-09-26 冻结）
+
+## 11. 二期范围与所有权矩阵（v2）
+
+**范围**：① VPS 载体监听器（SSH 远程转发）② 免杀工作台（LLM 变形+静态自测+job 管线）③ 编译型载荷经 VPS 构建 ④ loot→finding 联动。**明确不做（三期）**：隧道 socks5、https 监听器、post 内置 agent。
+
+一期所有硬约束（§0）全部沿用：禁 os/exec、c2center/vpscenter 不 import db/server、运行时视图必须 json tag、nil slice 防御、密文纪律、测试只连 5499、源码走 Write/Edit。**禁改一期冻结文件**（types.ts/api.ts/schema.sql 的 v1 段/sidebar 既有条目）；v2 新增段同样主会话已改完，agents 只读。
+
+| 文件/目录 | 所有者 |
+|---|---|
+| C2_CONTRACTS.md、schema.sql、types.ts、api.ts、sidebar-items.ts | 主会话（冻结） |
+| `vpscenter/forward.go`（新）、`vpscenter/manager.go`（仅追加 forward 相关方法/字段/生命周期接线）、`vpscenter/forward_test.go` | Agent A |
+| `c2center/listener.go`（载体抽象+启停编排）、`c2center/beacon.go`（仅 new listener 字段注入回调）、`c2center/manager.go`（仅追加 Carrier 接口与 StartListener 参数，不改既有签名）、`c2center/*_test.go`（对应用例） | Agent A |
+| `db/c2.go`（c2_listeners 新列访问器+载体校验查询+payloads 新列）、`server/c2_center.go`（载体启停编排+initC2 尾部追加 `s.initC2Evasion()` 一行）、`server/c2_api.go`（监听器/载荷路由的 v2 扩展） | Agent A |
+| `db/c2_evasion.go`（新）、`server/c2_evasion.go`（新：profiles/jobs 路由+LLM 变形 runner+静态自测+stage=post 监看任务）、`server/c2_loot_finding.go`（新） | Agent B |
+| `web/src/app/(main)/function/c2/evasion/**`（新）、`web/src/components/c2-evasion-*.tsx`（新）、既有 C2 页面的二期增强（listeners 载体选择/payloads 生成选项/loot 转发现按钮） | Agent C |
+
+**跨 agent 编译耦合（契约钉死）**：`server/c2_evasion.go` 必须提供 `func (s *Server) registerC2EvasionRoutes(mux *http.ServeMux)` 与 `func (s *Server) initC2Evasion()`；Agent A 在 `registerC2Routes` 尾部调用前者、`initC2` 尾部调用后者（各一行，写进 A 的任务）。
+
+## 12. VPS 载体监听器（Agent A）
+
+**机制**：平台进程内的监听器逻辑完全不变（仍绑定本机 127.0.0.1 随机端口），VPS 只做出入口——平台经 **SSH 远程端口转发**（x/crypto/ssh 的 `tcpip-forward` 全局请求 + `forwarded-tcpip` 通道接受，手写实现，**禁 shell 出 ssh 命令**）把 `VPS公网:remote_port` 的流量经 SSH 连接转回本地监听器。流量路径：beacon → VPS:remote_port → SSH 隧道 → 平台 listener。平台掉线=隧道断（与现状一致，beacon 自动重连）。
+
+- **vpscenter/forward.go**：`func (m *Manager) OpenRemoteForward(machineID int64, remotePort int, localAddr string) (*RemoteForward, error)`；`RemoteForward` 持 SSH 连接，`Stop()` 发 `cancel-tcpip-forward` 并关连接；错误回报 channel。拨号/凭据**复用 vpscenter 现有路径**（ExecCommand 同源的连接构造，含 secretbox 解封入口）。转发的每条 TCP 连接 dial localAddr 双向拷贝。单测用进程内 ssh server（照 vpscenter 既有进程内 SSH server 回归测试模式）验证转发往返与 Stop 语义。
+- **数据模型（schema 已落）**：`c2_listeners.host_kind('local'|'vps')` / `vps_machine_id` / `remote_port`；`host_kind='vps'` 时 vps_machine_id 必填且 remote_port>0（db 白名单校验兜底 + server 400）。
+- **启停编排（server/c2_center.go）**：start：local 直接起；vps 先 `mgr.StartListener`（拿到 127.0.0.1 实际地址）→ `OpenRemoteForward(machineID, remotePort, localAddr)` → forwarder 存 map（keyed by listener id）。stop/进程退出：先 Stop forwarder 再 StopListener。boot 恢复（mgr.Start 拉起 enabled）同样编排。SSH 断开→forwarder 报错→监听器状态标注（日志+runtime 状态），beacon 重试机制兜底。
+- **API 面**：`POST/PUT /api/c2/listeners` 增加 `host_kind/vps_machine_id/remote_port` 字段；vps 载体的 `callback` 校验放宽（可空→前端用机器 host 拼）；start 失败原样报 SSH 错误；删除被载体引用的 VPS 机器→409（vps 删除路径加检查，若 vps 删除在 vps_api.go——**那是一期冻结文件，不碰**，改为在报告里提出，主会话处理）。
+- **UI（Agent C）**：监听器新建/编辑 Dialog 增加「载体」选择：本机 / VPS 机器（下拉列 `api.vpsMachines()` 的机器，显示名称+host+在线状态）；选 VPS 后出现 remote_port 必填框与 callback 预填（`http://<host>:<port>`，可改）；列表增加载体列（本机 / 机器名）。
+
+## 13. 免杀工作台（Agent B）
+
+**数据模型（schema 已落）**：`c2_evasion_profiles`（name/target_av: defender|360|huorong|generic|custom / payload_format: ps1|bash|py|gosrc / techniques JSONB / instructions / source: manual|llm / notes）；`c2_jobs`（kind: evasion|build / profile_id / payload_id / listener_id / vps_machine_id / task_id / status: queued|running|done|error / input JSONB / result JSONB / error）；`c2_payloads.evasion_profile_id`。
+
+**管线（仿 report_pipeline.go 模式）**：
+1. `POST /api/c2/evasion/generate` {listener_id, format, target, name, profile_id?, instructions?} → 建 `c2_jobs`(kind=evasion, queued) + **stage='post' 监看任务行**（真任务，任务中心/对话自动收录，复用报告中心那套；conversation 挂 post）→ 202 {job_id}。防重入：同 profile+listener 有 running job → 409。
+2. runner（initC2Evasion 启动，单并发 sem，`analyzeWithRetry` 同款瞬态重试 429/5xx/timeout，最多 2 轮退避）：`c2center.RenderPayload` 出基础载荷 → LLM 变形 → 本地静态自测 → 命中 ≥3 且轮次 <2 则把命中清单喂回再变形一轮 → 满意或轮次用尽 → 落盘 `<BaseDir>/c2/payloads/`、CreatePayload(带 evasion_profile_id)、job done（result 存静态报告+变形轮次）。LLM 无配置 → job error("未配置 LLM")。**LLM 调用全程不动 c2center 包**——变形只发生在 server 侧对已渲染文本的变换。
+3. **LLM 提示词（冻结语义）**：系统提示声明角色为「载荷变形引擎」，输入=原始载荷+格式+目标 AV+技术配置+附加指示+上轮命中；输出严格两段 `<PLAN>变形说明</PLAN>` 与 `<CODE>变形后完整载荷</CODE>`；铁律：**信道行为逐字节等价**（CB/UP/KEY/URL_PATH 占位符原样保留、加密与轮询逻辑不动），只允许改变量名/常量编码方式/代码结构/插入无效佐料/字符串拆分，禁止引入外部依赖、禁止改变执行入口与用法、禁止输出解释性文字之外的内容。解析失败（两段缺失）→ 重试一次 → 仍失败 job error。剥围栏逻辑照抄报告管线。
+4. **本地静态自测（冻结清单，只本地，永不外传）**：按格式的特征串扫描——ps1: `[-]enc/DownloadString/DownloadFile/IEX/Invoke-Expression/FromBase64String/Set-MpPreference/Add-Type/Win32_Process/Net.WebClient/schtasks/reg add`；py: `[exec(/eval(/urllib/requests./socket./subprocess/base64.b64decode/__import__/pty]`；bash: `[curl/wget//dev/tcp/nc -e/base64 -d/python3 -c/chmod +x]`；gosrc 跳过（走 §14 构建路径）。加 Shanon 熵（>5.5 标高）。结果 {hits:[{marker,count}], entropy, risk: low(<3)|medium(3-5)|high(>5)} 存 job.result。
+5. **API**：`GET/POST /api/c2/evasion/profiles`、`PUT/DELETE /api/c2/evasion/profiles/{id}`；`GET /api/c2/jobs?kind=&status=&limit=&offset=`、`GET /api/c2/jobs/{id}`（含 result）、`POST /api/c2/jobs/{id}/retry`（仅 error 可重试，新建 queued job）。
+
+## 14. 编译型载荷经 VPS（Agent A）
+
+- `POST /api/c2/payloads` 的 format=gosrc 新增可选 `build_vps_machine_id`：给了就走构建 job（`c2_jobs` kind=build），不给保持一期行为（只出源码 zip）。
+- 构建 runner（server 侧，与免杀 runner 并列但独立 sem）：把 gosrc zip 经 **ExecCommand + base64 分块**写到 VPS 工作区（`<workspace_base>/c2build_<payloadID>/`，`printf '%s' '<chunk>' >> src.b64` 追加→`base64 -d src.b64 > src.zip && unzip`；**禁 os/exec，不引 sftp 新依赖**）→ `go build -trimpath -ldflags "-s -w" -o beacon_<id> ./...`（工作目录内）→ 构建产物 `base64 <二进制>` 分块读回（每块 ≤4MB 原始字节）拼装落盘 → sha256/size 回填 payload 行，`built_on_vps=true`，下载端点照常。VPS 无 go（`command -v go` 探测）→ job error 明确提示先装 Go。构建日志尾部 2KB 存 job.result。
+- 超时：单次 ExecCommand 沿用 vpscenter 默认；整个 job 上限 10 分钟。
+- **UI（Agent C）**：载荷页 format 选 gosrc 时出现「在 VPS 上编译」可选机器下拉 + 生成后 job 进度展示（轮询 GET /api/c2/jobs/{id}）。
+
+## 15. loot→finding（Agent B）
+
+- `POST /api/c2/loot/{id}/to-finding`：会话必须已绑定任务（否则 400「先在会话页绑定任务」）→ 复用既有发现登记路径（先调研 `report_finding` 登记/`OnFindingRecorded` 链路与 exploration 节点创建代码，**优先复用现成函数**，不自建平行路径）→ 创建 finding（标题=loot name，正文=类型+内容(credential 脱敏提示)+来源路径+会话信息）→ 回填 `c2_loot.finding_id` → 200 {finding_id}。重复转换（finding_id 已非空）→ 409。**联动钩子自动生效**（漏洞库归类/SRC 成果创建走 wireFindingHooks，不要绕过）。
+- **UI（Agent C）**：loot 页行操作加「转发现」（已转的显示 finding 徽标可点击跳发现详情）。
+
+## 16. 二期验收（集成阶段主会话执行）
+
+1. vet 三包干净；`go test ./c2center/ ./db/`（5499）全绿；tsc 零错误；全量构建成功。
+2. 8799 冒烟：VPS 载体监听器创建/启停（无真机则以进程内 ssh server 的单测为准 + 真机如有则实测）；免杀 generate 在 LLM 无配置时走 error 路径、静态自测 API 直接可验；gosrc 只出源码 zip（无 VPS go 环境）；loot→finding 在绑定任务的会话上真实转换成功。
+3. 免杀工作台页/监听器载体 UI/payloads 新选项/loot 转发现按钮可用；一期六页无回归。
