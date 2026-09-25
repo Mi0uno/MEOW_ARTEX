@@ -228,10 +228,16 @@ export const sidebarItems: NavGroup[] = [
       },
       {
         id: "vps",
-        title: "VPS",
+        title: "VPS 中心",
         icon: Server,
-        badge: "soon",
-        subItems: [{ id: "vps-todo", title: "建设中", url: "#", disabled: true }],
+        subItems: [
+          // 仪表盘:机器状态总览 + 执行量趋势 + 占用与最近流水。
+          { id: "vps-dashboard", title: "仪表盘", url: "/function/vps", icon: Activity },
+          // 机器池:录入/测活/指派,任务级执行环境的来源。
+          { id: "vps-machines", title: "机器池", url: "/function/vps/list", icon: Server },
+          // 工具集:初始化脚本模板,一键把裸机器武装成渗透节点(agent 也知道检测结果)。
+          { id: "vps-toolsets", title: "工具集", url: "/function/vps/toolsets", icon: Wrench },
+        ],
       },
       {
         id: "system",

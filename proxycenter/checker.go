@@ -40,6 +40,10 @@ type CheckOutcome struct {
 type Checker struct {
 	// TestURL 是测活目标,需能回显出口 IP 才能采到 exit_ip。
 	TestURL string
+	// ConnectProbeTarget 是 HTTPS 隧道能力探测的对端(host:port)。
+	// 留空时按 TestURL 推导(其 host 的 443);TestURL 本身是 https 或代理是
+	// socks5 时不需要探测(那两种情况已经/天然覆盖了 CONNECT)。
+	ConnectProbeTarget string
 	// Timeout 是单条代理的测活超时。
 	Timeout time.Duration
 	// Concurrency 是并发度。
@@ -130,11 +134,54 @@ func (c *Checker) checkOne(ctx context.Context, t CheckTarget) CheckOutcome {
 		out.Err = fmt.Sprintf("目标返回 HTTP %d", resp.StatusCode)
 		return out
 	}
+	// 明文 test_url 只证明了「能转发明文」,而任务流量几乎全是 HTTPS:必须再确认
+	// 这条代理能建 CONNECT 隧道,否则「alive」是个会误导调度的结论——实测组内
+	// 30 条 alive 里只有 6 条真能建隧道,任务侧表现为「切了代理池反而不通」。
+	if probeErr := c.probeTLSConnect(ctx, pu); probeErr != nil {
+		out.Err = probeErr.Error()
+		return out
+	}
 	out.Alive = true
 	out.LatencyMs = int(elapsed.Milliseconds())
 	out.ExitIP = parseExitIP(body)
 	out.Anonymity = c.judgeAnonymity(resp, out.ExitIP)
 	return out
+}
+
+// probeTLSConnect 验证这条代理能否建立 HTTPS 隧道(CONNECT)。
+//
+// 只在 test_url 是明文 http 时才需要:test_url 本身是 https 时,上面的 GET 已经
+// 走了一次 CONNECT,隧道能力已被证明。socks5 同理——它的 http/https 请求都经
+// SOCKS5 建连,不存在「只能转发明文」这个失败模式。
+//
+// 只做 CONNECT 握手、不校验证书内容:这里要判的是「隧道能不能建起来」,而不是
+// 目标证书是谁签的。带自签 CA 的自建 MITM 代理同样能建隧道,不该被误杀
+// (证书是否可信由上面那次 GET 的 TLS 校验负责)。
+func (c *Checker) probeTLSConnect(ctx context.Context, pu *url.URL) error {
+	if pu.Scheme != "http" && pu.Scheme != "https" {
+		return nil // socks5:无此失败模式
+	}
+	target := strings.TrimSpace(c.ConnectProbeTarget)
+	if target == "" {
+		// 默认拿 test_url 的 host:443 当对端——用户已经指定并信任这个站点。
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(c.TestURL)), "https://") {
+			return nil // 上面的 GET 已经走过 CONNECT
+		}
+		u, err := url.Parse(c.TestURL)
+		if err != nil || u.Hostname() == "" {
+			return nil // test_url 不规整就不探,不拿猜测当结论
+		}
+		target = net.JoinHostPort(u.Hostname(), "443")
+	}
+
+	pctx, cancel := context.WithTimeout(ctx, c.Timeout)
+	defer cancel()
+	conn, err := dialViaHTTPProxy(pctx, pu, target, c.Timeout)
+	if err != nil {
+		return fmt.Errorf("不支持 HTTPS 隧道(CONNECT):%s", shortErr(err))
+	}
+	_ = conn.Close()
+	return nil
 }
 
 // clientFor 按代理协议构造 http.Client。

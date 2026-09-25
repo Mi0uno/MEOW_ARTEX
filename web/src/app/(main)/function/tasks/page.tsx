@@ -20,6 +20,7 @@ import {
 import {
   ArchiveIcon,
   ArrowDownIcon,
+  ArrowLeftIcon,
   ArrowUpDownIcon,
   ArrowUpIcon,
   Building2Icon,
@@ -52,10 +53,13 @@ import {
 import { toast } from "sonner";
 
 import { CompanyPickerPage } from "@/components/company-picker-page";
+import { type ProxyEgressMode, ProxyEgressSelect } from "@/components/proxy-egress-select";
+import { CreateSRCTaskDialog } from "@/components/src-create-task-dialog";
 import { StatusBadge } from "@/components/status-badge";
 import { TablePagination } from "@/components/table-pagination";
 import { TaskLLMProfileChain } from "@/components/task-llm-profile-chain";
 import { TaskTemplateControls } from "@/components/task-template-controls";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -67,7 +71,6 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -126,10 +129,10 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { CreateSRCTaskDialog } from "@/components/src-create-task-dialog";
 import { api } from "@/lib/api";
 import { getLocalStorageValue, setLocalStorageValue } from "@/lib/local-storage.client";
 import { type SortDirection, useStoredSortPreference } from "@/lib/sort-preference";
+import { tasksListContextQuery } from "@/lib/task-list-context";
 import type {
   ChatAttachment,
   Company,
@@ -142,6 +145,7 @@ import type {
   TaskCategory,
   TaskStage,
   TaskStatus,
+  VpsMachine,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -858,6 +862,26 @@ function TasksPageInner() {
     [router, searchParams],
   );
 
+  // 返回主体选择页 = 只去掉 company 的当前 URL:选择页本身就是「无 company」状态,
+  // 从那里再挑一个主体时,src/stage 必须还在,否则 SRC 视图/阶段锁定会被静默丢掉。
+  const backToCompanyPicker = React.useCallback(() => {
+    const p = new URLSearchParams(searchParams.toString());
+    p.delete("company");
+    router.push(`/function/tasks?${p.toString()}`);
+  }, [router, searchParams]);
+
+  // 详情链接要拼上的上下文参数(company/src/stage),详情页的返回按钮靠它回到当前列表视图。
+  const returnQuery = React.useMemo(() => tasksListContextQuery(searchParams), [searchParams]);
+
+  // 返回按钮旁的小字:标明正在看哪个主体的任务,回选择页前用户能确认当前落点。
+  const currentCompanyLabel = React.useMemo(() => {
+    if (companyID === null) return "";
+    if (companyID === 0) return "全部资产主体";
+    if (companyID === -1) return "未关联企业";
+    const company = companies.find((c) => c.id === companyID);
+    return company?.name ?? `企业 #${companyID}`;
+  }, [companyID, companies]);
+
   // 未选资产主体时先进入选择页(先进入选择资产的页面,再看该主体下的任务)。
   // 顶部固定提供「全部资产主体」「未关联企业」——历史任务大多没有企业归属,
   // 这两个出口保证用户永远能看到全部任务,不会被筛选藏起来。
@@ -928,6 +952,23 @@ function TasksPageInner() {
           </div>
         </div>
       )}
+      {/* 走过选择页才需要返回入口(SRC 视图没经过选择页,返回无处可去):
+          与工具栏的「切换资产主体」同路,区别只在位置——顶部为不带工具栏语义的纯导航。 */}
+      {companyID !== null && !srcOnly && (
+        <div className="mx-4 flex items-center gap-1.5 lg:mx-6">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-7"
+            onClick={backToCompanyPicker}
+            aria-label="返回资产主体选择"
+            title="返回资产主体选择"
+          >
+            <ArrowLeftIcon />
+          </Button>
+          {currentCompanyLabel && <span className="text-muted-foreground text-sm">{currentCompanyLabel}</span>}
+        </div>
+      )}
       <TabsList className="mx-4 lg:mx-6">
         <TabsTrigger value="current">当前任务</TabsTrigger>
         <TabsTrigger value="archived">已归档</TabsTrigger>
@@ -975,11 +1016,7 @@ function TasksPageInner() {
                   SRC 视图下 companyID 为 null(没走选择页),兜底显示「全部」。 */}
               <Select
                 value={
-                  companyID === null || companyID === 0
-                    ? "all"
-                    : companyID === -1
-                      ? "unassigned"
-                      : String(companyID)
+                  companyID === null || companyID === 0 ? "all" : companyID === -1 ? "unassigned" : String(companyID)
                 }
                 onValueChange={switchCompany}
               >
@@ -998,9 +1035,9 @@ function TasksPageInner() {
                   </SelectGroup>
                 </SelectContent>
               </Select>
-              {/* SRC 视图不显示「切换资产主体」:那会跳到不带 ?src=1 的页面,丢掉 SRC 过滤。 */}
+              {/* SRC 视图不显示「切换资产主体」:SRC 没有企业维度,按钮只该出现在走过选择页的视图。 */}
               {!srcOnly && (
-                <Button variant="outline" size="sm" onClick={() => router.push("/function/tasks")}>
+                <Button variant="outline" size="sm" onClick={backToCompanyPicker}>
                   <Building2Icon className="size-4" />
                   切换资产主体
                 </Button>
@@ -1215,6 +1252,7 @@ function TasksPageInner() {
                       // running 任务才吃 nowSec;其余行传 0 —— props 不变,memo 就能拦下每秒 tick
                       // 带来的整表重渲染,只让在跑的那几行走时长。
                       nowSec={task.status === "running" ? nowSec : 0}
+                      returnQuery={returnQuery}
                       onDelete={deleteTask}
                       onControl={controlTask}
                       onRename={renameTask}
@@ -1390,6 +1428,7 @@ function ConcurrencySettingsDialog() {
 const TaskRow = React.memo(function TaskRow({
   task,
   nowSec,
+  returnQuery,
   onDelete,
   onControl,
   onRename,
@@ -1400,6 +1439,8 @@ const TaskRow = React.memo(function TaskRow({
 }: {
   task: Task;
   nowSec: number;
+  // 任务列表上下文 query(company/src/stage),拼在详情链接后,详情页返回才回得来。
+  returnQuery: string;
   onDelete: (id: string, options: DeleteTaskOptions) => Promise<void>;
   onControl: (id: string, action: "pause" | "resume") => Promise<void>;
   onRename: (task: Task, name: string) => Promise<void>;
@@ -1422,7 +1463,7 @@ const TaskRow = React.memo(function TaskRow({
       </TableCell>
       <TableCell className="font-medium">
         <div className="flex max-w-xs items-center gap-2">
-          <TaskNameEditor task={task} onRename={onRename} />
+          <TaskNameEditor task={task} returnQuery={returnQuery} onRename={onRename} />
           {task.active && <StarIcon className="size-4 shrink-0 fill-amber-400 text-amber-400" />}
           {taskIsPinned(task) && <PinIcon className="text-primary size-4 shrink-0" aria-label="已置顶" />}
           {/* 出网方式标记:任务级覆盖才显示(跟随全局是默认,不必占位)。 */}
@@ -1449,11 +1490,7 @@ const TaskRow = React.memo(function TaskRow({
               监管已关
             </Badge>
           ) : task.guard_mode === "enforce" ? (
-            <Badge
-              variant="outline"
-              className="shrink-0 text-xs"
-              title="本任务强制启用监管,不受全局开关影响"
-            >
+            <Badge variant="outline" className="shrink-0 text-xs" title="本任务强制启用监管,不受全局开关影响">
               <ShieldCheckIcon className="size-3" />
               强制监管
             </Badge>
@@ -1462,7 +1499,7 @@ const TaskRow = React.memo(function TaskRow({
       </TableCell>
       <TableCell className="text-muted-foreground max-w-xs">
         <Link
-          href={`/function/tasks/detail?id=${encodeURIComponent(task.id)}`}
+          href={`/function/tasks/detail?id=${encodeURIComponent(task.id)}${returnQuery ? `&${returnQuery}` : ""}`}
           className="block truncate rounded-sm hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           title={task.description}
         >
@@ -1524,7 +1561,9 @@ const TaskRow = React.memo(function TaskRow({
       <TableCell className="sticky right-0 z-10 bg-card text-right shadow-[-1px_0_0_0_hsl(var(--border))] group-hover:bg-muted/50">
         <div className="flex items-center justify-end gap-0.5">
           <Button size="icon" variant="ghost" asChild aria-label="查看任务详情" title="查看任务详情">
-            <Link href={`/function/tasks/detail?id=${encodeURIComponent(task.id)}`}>
+            <Link
+              href={`/function/tasks/detail?id=${encodeURIComponent(task.id)}${returnQuery ? `&${returnQuery}` : ""}`}
+            >
               <EyeIcon />
             </Link>
           </Button>
@@ -1538,7 +1577,15 @@ const TaskRow = React.memo(function TaskRow({
   );
 });
 
-function TaskNameEditor({ task, onRename }: { task: Task; onRename: (task: Task, name: string) => Promise<void> }) {
+function TaskNameEditor({
+  task,
+  returnQuery,
+  onRename,
+}: {
+  task: Task;
+  returnQuery: string;
+  onRename: (task: Task, name: string) => Promise<void>;
+}) {
   const [editing, setEditing] = React.useState(false);
   const [name, setName] = React.useState(task.name ?? "");
   const [saving, setSaving] = React.useState(false);
@@ -1608,7 +1655,7 @@ function TaskNameEditor({ task, onRename }: { task: Task; onRename: (task: Task,
   return (
     <div className="flex min-w-0 items-center gap-1">
       <Link
-        href={`/function/tasks/detail?id=${encodeURIComponent(task.id)}`}
+        href={`/function/tasks/detail?id=${encodeURIComponent(task.id)}${returnQuery ? `&${returnQuery}` : ""}`}
         className="min-w-0 truncate rounded-sm hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         title={task.name?.trim() ? task.name : task.description}
       >
@@ -3342,27 +3389,28 @@ function CreateTaskSheet({
   const sheetContentRef = React.useRef<HTMLDivElement>(null);
 
   // 出网方式(任务级覆盖):""=跟随全局 / "direct"=强制直连 / "pool"=强制走代理池。
-  // 代理组列表只在需要选组时拉取。
-  const [proxyMode, setProxyMode] = React.useState("");
+  // 代理组列表由 ProxyEgressSelect 自己按需拉取。
+  const [proxyMode, setProxyMode] = React.useState<ProxyEgressMode>("");
   const [proxyGroupID, setProxyGroupID] = React.useState(0);
-  const [proxyGroups, setProxyGroups] = React.useState<
-    { id: number; name: string; alive_count: number; proxy_count: number }[]
-  >([]);
-  React.useEffect(() => {
-    if (!open || proxyMode !== "pool" || proxyGroups.length > 0) return;
-    api
-      .proxyGroups({ limit: 200 })
-      .then((r) =>
-        setProxyGroups(
-          r.groups.map((g) => ({ id: g.id, name: g.name, alive_count: g.alive_count, proxy_count: g.proxy_count })),
-        ),
-      )
-      .catch(() => setProxyGroups([]));
-  }, [open, proxyMode, proxyGroups.length]);
 
   // 监管门限(任务级覆盖):""=跟随全局 / "off"=本任务不跑监管 / "enforce"=强制启用。
   // 规则集限定(guard_rule_ids)本次不做 UI,一律留空 = 用全部已启用规则。
   const [guardMode, setGuardMode] = React.useState("");
+
+  // 执行环境(高级设置):"local"=平台本机(默认) / "machine"=指定机器 / "auto"=自动分配。
+  // 指定机器的下拉只列「在线且空闲」的机器(online 且未被任务占用),打开抽屉时按需拉取。
+  const [vpsMode, setVpsMode] = React.useState<"local" | "machine" | "auto">("local");
+  const [vpsMachineID, setVpsMachineID] = React.useState("__pick__");
+  const [vpsMachines, setVpsMachines] = React.useState<VpsMachine[]>([]);
+
+  // 选了「指定机器」才拉候选;接口 404/500(VPS 服务未就绪)静默降级为空下拉。
+  React.useEffect(() => {
+    if (!open || vpsMode !== "machine") return;
+    api
+      .vpsMachines({ status: "online", limit: 200 })
+      .then((r) => setVpsMachines((r.machines ?? []).filter((m) => m.assigned_task_id === 0)))
+      .catch(() => setVpsMachines([]));
+  }, [open, vpsMode]);
 
   // load LLM profiles once for the create-task profile picker.
   React.useEffect(() => {
@@ -3436,6 +3484,12 @@ function CreateTaskSheet({
         // 监管门限:默认跟随全局;guard_rule_ids 留空 = 用全部已启用规则。
         guardMode,
         guardRuleIds: [],
+        // 执行环境(创建即指派):vps 字段随创建请求一起提交,指派发生在任务启动之前,
+        // 消除「先建任务再补指派」的竞态。指派失败后端不阻断建任务(任务照常本机跑,
+        // 可在任务详情「执行环境」tab 重新指派)。
+        vpsMachineId:
+          vpsMode === "machine" && vpsMachineID !== "__pick__" ? Number(vpsMachineID) : undefined,
+        vpsAuto: vpsMode === "auto",
       });
       toast.success("任务已创建");
       setName("");
@@ -3453,6 +3507,8 @@ function CreateTaskSheet({
       setProxyMode("");
       setProxyGroupID(0);
       setGuardMode("");
+      setVpsMode("local");
+      setVpsMachineID("__pick__");
       setUploadCount(0);
       draftIdRef.current = "";
       setOpen(false);
@@ -3667,53 +3723,75 @@ function CreateTaskSheet({
                     态势图仅展示资产不显示进度，agent 也不再获得范围类工具。关闭不影响「关联企业资产范围」。
                   </p>
                 </div>
-                {/* 出网方式:本任务的流量走哪条路。默认跟随全局,可单独覆盖。 */}
+                {/* 出网方式:本任务的流量走哪条路。默认跟随全局,可单独覆盖。
+                    与 SRC 对话框 / 批量建任务共用同一组件,避免某个入口漏掉代理池选项。 */}
+                <ProxyEgressSelect
+                  mode={proxyMode}
+                  groupId={proxyGroupID}
+                  onChange={(v) => {
+                    setProxyMode(v.mode);
+                    setProxyGroupID(v.groupId);
+                  }}
+                />
+                {/* 执行环境:任务的 Bash 命令在哪跑。默认平台本机;可指定一台在线空闲机器
+                    或让平台自动分配。指派发生在任务创建成功之后(契约 §6),失败不阻断建任务。 */}
                 <div className="grid gap-2">
-                  <Label htmlFor="proxy-mode">出网方式</Label>
+                  <Label htmlFor="vps-mode">执行环境</Label>
                   <Select
-                    value={proxyMode === "" ? "inherit" : proxyMode}
-                    onValueChange={(v) => setProxyMode(v === "inherit" ? "" : v)}
+                    value={vpsMode}
+                    onValueChange={(v) => {
+                      setVpsMode(v === "machine" ? "machine" : v === "auto" ? "auto" : "local");
+                      if (v !== "machine") setVpsMachineID("__pick__");
+                    }}
                   >
-                    <SelectTrigger id="proxy-mode" className="w-full">
+                    <SelectTrigger id="vps-mode" className="w-full">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
                       <SelectGroup>
-                        <SelectItem value="inherit">跟随全局（默认）</SelectItem>
-                        <SelectItem value="direct">强制直连（不走代理池）</SelectItem>
-                        <SelectItem value="pool">走代理池</SelectItem>
+                        <SelectItem value="local">平台本机（默认）</SelectItem>
+                        <SelectItem value="machine">指定机器</SelectItem>
+                        <SelectItem value="auto">自动分配</SelectItem>
                       </SelectGroup>
                     </SelectContent>
                   </Select>
-                  {proxyMode === "pool" ? (
-                    <Select
-                      value={proxyGroupID === 0 ? "auto" : String(proxyGroupID)}
-                      onValueChange={(v) => setProxyGroupID(v === "auto" ? 0 : Number(v))}
-                    >
+                  {vpsMode === "machine" ? (
+                    <Select value={vpsMachineID} onValueChange={setVpsMachineID}>
                       <SelectTrigger className="w-full">
-                        <SelectValue placeholder="代理组" />
+                        <SelectValue placeholder={vpsMachines.length === 0 ? "暂无在线空闲机器" : "选择执行机器"} />
                       </SelectTrigger>
                       <SelectContent>
                         <SelectGroup>
-                          <SelectItem value="auto">用全局选中的代理组</SelectItem>
-                          {proxyGroups.map((g) => (
-                            <SelectItem key={g.id} value={String(g.id)}>
-                              {g.name}（可用 {g.alive_count}/{g.proxy_count}）
+                          <SelectItem value="__pick__" disabled>
+                            请选择机器…
+                          </SelectItem>
+                          {vpsMachines.map((m) => (
+                            <SelectItem key={m.id} value={String(m.id)}>
+                              {m.name} · {m.host}
                             </SelectItem>
                           ))}
                         </SelectGroup>
                       </SelectContent>
                     </Select>
                   ) : null}
+                  {vpsMode === "machine" && vpsMachines.length === 0 ? (
+                    <p className="text-amber-600 text-xs dark:text-amber-400">
+                      没有可指派的机器。请先到「VPS 中心 → 机器池」录入并测活通过(状态=在线空闲)。
+                    </p>
+                  ) : null}
                   <p className="text-muted-foreground text-xs">
-                    本任务的 agent 与信息搜集流水线都按这里出网。选「走代理池」后请求会经代理组按策略轮换出口；
-                    代理池不可用时回落到全局出口而不是静默直连，避免真实 IP 意外暴露。
+                    「指定机器 / 自动分配」只影响 Bash 命令的执行位置:命令将在该 Linux 机器的独立 shell
+                    里跑、工作目录固定为远程任务工作区;Read/Write
+                    等文件工具仍操作平台本地工作区。创建成功后才会实际指派, 失败时任务照常在本机执行。
                   </p>
                 </div>
                 {/* 监管门限:AI 监管是否管这个任务。默认跟随全局,可单独覆盖。 */}
                 <div className="grid gap-2">
                   <Label htmlFor="guard-mode">监管门限</Label>
-                  <Select value={guardMode === "" ? "inherit" : guardMode} onValueChange={(v) => setGuardMode(v === "inherit" ? "" : v)}>
+                  <Select
+                    value={guardMode === "" ? "inherit" : guardMode}
+                    onValueChange={(v) => setGuardMode(v === "inherit" ? "" : v)}
+                  >
                     <SelectTrigger id="guard-mode" className="w-full">
                       <SelectValue />
                     </SelectTrigger>

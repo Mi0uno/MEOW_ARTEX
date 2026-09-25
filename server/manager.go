@@ -825,6 +825,35 @@ func (m *Manager) ProxyAddr() string {
 // ProxyCenter 返回代理中心运行时(可能为 nil:未初始化)。
 func (m *Manager) ProxyCenter() *proxycenter.Manager { return m.proxyCenter }
 
+// ProxyAddrForTaskTagged 是 ProxyAddrForTask 的「带任务身份」版本,供任务自己的
+// agent 与流水线取出口地址用。
+//
+// 为什么需要身份:代理池是「一组一个监听端口」的共享出口,池侧只看到一条来自
+// 127.0.0.1 的连接,无法知道它属于哪个任务——于是 proxy_requests.task_id 永远为空,
+// 界面上「这个任务到底走没走代理」就无从核对。把任务标识编进代理 URL 的 userinfo
+// (http://t43:exploit@127.0.0.1:18080),Go 的 Transport 与 curl 都会自动转成
+// Proxy-Authorization,池侧解出来即可归因(见 proxycenter.taskTag)。
+//
+// taskID 在 wire 上是字符串(见 Task.ID 约定),解不出来就不带标返回——归因缺失
+// 只是少一条审计,绝不能因此让任务取不到出口地址。
+//
+// 只对**池监听地址**打标:直连为空、全局代理/MITM 都不是池出口,打了标也没人解,
+// 反而会把一个不存在的主机名塞进地址里。
+func (m *Manager) ProxyAddrForTaskTagged(mode string, groupID int64, taskID, stage string) string {
+	addr := m.ProxyAddrForTask(mode, groupID)
+	if addr == "" || m.proxyCenter == nil {
+		return addr
+	}
+	id, err := strconv.ParseInt(strings.TrimSpace(taskID), 10, 64)
+	if err != nil || id <= 0 {
+		return addr
+	}
+	if !m.proxyCenter.OwnsAddr(addr) {
+		return addr // 回落到了全局出口/MITM:不是池,不带标
+	}
+	return proxycenter.TagProxyAddr(addr, id, stage)
+}
+
 // ProxyAddrForTask 返回某个任务该用的出网代理地址(任务级覆盖优先于全局模式)。
 //
 // 语义:
@@ -834,6 +863,9 @@ func (m *Manager) ProxyCenter() *proxycenter.Manager { return m.proxyCenter }
 //
 // 代理池不可用时**退回全局模式而不是静默直连**:用户明确要求走代理池,
 // 悄悄放直连会把真实 IP 暴露出去,比报错更危险。
+//
+// 本函数返回**不带任务标识**的地址(用于回显/DTO)。任务自己的 agent 与流水线应
+// 用 ProxyAddrForTaskTagged,把出网流水归因到任务。
 func (m *Manager) ProxyAddrForTask(mode string, groupID int64) string {
 	switch mode {
 	case "direct":
@@ -1045,6 +1077,12 @@ func (m *Manager) CreateTaskWithOptions(description, goal string, opts pgdb.Task
 	m.tasks[t.ID] = t
 	m.active = t.ID
 	m.mu.Unlock()
+	// VPS 创建即指派(契约 §6):任务行已落库、尚未进入 running,在这里把机器占上,
+	// 消除「任务先于指派启动」的竞态。失败不阻断建任务(assignVPSOnCreate 只记
+	// warning,任务照常按本机模式跑)。
+	if opts.VPSAuto || opts.VPSMachineID > 0 {
+		assignVPSOnCreate(t, opts.VPSMachineID, opts.VPSAuto)
+	}
 	return t, nil
 }
 

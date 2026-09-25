@@ -23,6 +23,7 @@ import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
 import { statusMeta } from "@/lib/status";
+import { tasksListContextQuery } from "@/lib/task-list-context";
 import type { Finding, FindingStatus, Severity } from "@/lib/types";
 
 import { FindingLineageView } from "./lineage";
@@ -58,6 +59,19 @@ function FindingDetailInner() {
   const searchParams = useSearchParams();
   const id = searchParams.get("id") ?? "";
   const contextTaskId = searchParams.get("context_task") ?? "";
+  // 任务列表上下文(资产主体筛选 company/src/stage),返回任务详情时原样带回去。
+  const listContext = tasksListContextQuery(searchParams);
+
+  // 返回目标:从任务详情进入(context_task 非空)时回该任务详情的「发现」页签,
+  // 否则(仪表盘等入口)回全局发现列表。左上箭头与空态按钮共用同一目标和文案。
+  let backHref = "/function/findings";
+  let backLabel = "返回发现列表";
+  if (contextTaskId) {
+    backHref = `/function/tasks/detail?id=${encodeURIComponent(contextTaskId)}&tab=findings`;
+    backLabel = "返回任务详情";
+    if (listContext) backHref += `&${listContext}`;
+  }
+
   const [finding, setFinding] = React.useState<Finding | null>(null);
   const [loaded, setLoaded] = React.useState(false);
   const [tab, setTab] = React.useState("overview");
@@ -131,8 +145,8 @@ function FindingDetailInner() {
         <p className="text-muted-foreground">{loaded ? `未找到发现 ${id}` : "加载中…"}</p>
         {loaded && (
           <Button asChild variant="outline">
-            <Link href="/function/findings">
-              <ArrowLeftIcon /> 返回发现列表
+            <Link href={backHref}>
+              <ArrowLeftIcon /> {backLabel}
             </Link>
           </Button>
         )}
@@ -149,7 +163,7 @@ function FindingDetailInner() {
         <div className="flex flex-wrap items-center gap-2">
           <SidebarTrigger className="-ml-1" />
           <Button asChild variant="ghost" size="icon" className="size-7">
-            <Link href="/function/findings">
+            <Link href={backHref} aria-label={backLabel} title={backLabel}>
               <ArrowLeftIcon />
             </Link>
           </Button>
@@ -326,7 +340,7 @@ function FindingDetailInner() {
                 <FieldRow label="所属任务">
                   {finding.task_id ? (
                     <Link
-                      href={`/function/tasks/detail?id=${finding.task_id}`}
+                      href={`/function/tasks/detail?id=${finding.task_id}&tab=findings`}
                       className="inline-flex max-w-[16rem] items-center gap-1 text-primary hover:underline"
                       title={finding.task_description}
                     >

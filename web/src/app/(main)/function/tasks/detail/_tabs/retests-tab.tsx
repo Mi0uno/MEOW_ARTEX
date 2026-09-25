@@ -3,6 +3,7 @@
 import * as React from "react";
 
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 
 import { ArrowUpRightIcon, ChevronLeftIcon, ChevronRightIcon } from "lucide-react";
 
@@ -15,15 +16,27 @@ import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/u
 import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { api } from "@/lib/api";
+import { tasksListContextQuery } from "@/lib/task-list-context";
 import type { Finding, FindingsPage } from "@/lib/types";
 
 const PAGE_SIZE = 20;
+
+// 与 findings-tab 的详情链接约定一致:带上来源任务 context_task 与任务列表上下文
+// (company/src/stage),详情页返回按钮才能回到本任务详情页而非全局发现列表。
+function findingDetailHref(findingId: string, contextTaskId: string, listContext: string): string {
+  let href = `/function/findings/detail?id=${findingId}&context_task=${contextTaskId}`;
+  if (listContext) href += `&${listContext}`;
+  return href;
+}
 
 function findingLabel(finding: Finding) {
   return finding.name?.trim() || finding.vulnclass.trim() || "未分类";
 }
 
 export function RetestsTab({ taskId }: { taskId: string }) {
+  const searchParams = useSearchParams();
+  // 透传任务列表上下文(资产主体筛选 company/src/stage),详情页返回后才能停在同一筛选下。
+  const listContext = tasksListContextQuery(searchParams);
   const [page, setPage] = React.useState(1);
   const [data, setData] = React.useState<FindingsPage | null>(null);
   const [selectedId, setSelectedId] = React.useState("");
@@ -147,7 +160,7 @@ export function RetestsTab({ taskId }: { taskId: string }) {
               <div className="flex flex-wrap items-start justify-between gap-2">
                 <h2 className="min-w-0 flex-1 break-words font-medium">{findingLabel(selected)}</h2>
                 <Button asChild variant="ghost" size="sm">
-                  <Link href={`/function/findings/detail?id=${selected.finding_id || selected.id}`}>
+                  <Link href={findingDetailHref(selected.finding_id || selected.id, taskId, listContext)}>
                     漏洞详情 <ArrowUpRightIcon data-icon="inline-end" />
                   </Link>
                 </Button>

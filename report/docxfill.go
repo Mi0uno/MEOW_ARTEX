@@ -1,10 +1,7 @@
 package report
 
 import (
-	"archive/zip"
-	"bytes"
 	"fmt"
-	"io"
 	"regexp"
 	"strings"
 
@@ -22,13 +19,27 @@ import (
 //   行内: {{title}} {{date}} {{summary}} {{assets_summary}}
 //   独占段落(整段只有这一个标记): {{content}} {{findings_table}} {{findings_detail}}
 //
-// 块标记替换:{{content}}/{{findings_detail}} 展开为一组段落(继承标记段落的
-// 段落属性,标题行加粗);{{findings_table}} 展开为带边框的 Word 表格(表头加粗)。
+// 块标记替换:段落文本剥掉 {{}} 后能命中 Blocks 里的【任意键】即展开(不限于内置
+// 变量名),这让模板可以自定义块标记。展开形态:DocxBlock.Table 优先渲染成 Word
+// 表格(首行表头加粗);否则 Lines 逐段展开(继承标记段落的段落属性,标题行加粗);
+// 传入的 Lines 整块是一张 markdown 表格文本(如 findings_table 的 md 表格)时,
+// 自动解析成 Word 表格,不再以 "| a | b |" 字面段落残留。
 
 // DocxBlock 是一个块级变量的内容。
 type DocxBlock struct {
 	Lines []string   // 逐段落文本(# 开头的行渲染为加粗标题)
 	Table [][]string // 非空 = 渲染为 Word 表格(首行表头加粗)
+}
+
+// DocxBlockFromMarkdown 把一段 markdown 文本组装成块变量:整块是一张 md 表格
+// (如 findings_table 的渲染产物)时解析成 Table(填充时渲染为 Word 表格),
+// 否则整块按行段落展开。供 server 侧组装 FillDocx 的 Blocks 使用。
+func DocxBlockFromMarkdown(md string) DocxBlock {
+	lines := strings.Split(strings.ReplaceAll(md, "\r\n", "\n"), "\n")
+	if rows := mdTableRows(lines); rows != nil {
+		return DocxBlock{Table: rows}
+	}
+	return DocxBlock{Lines: lines}
 }
 
 // DocxData 是 docx 填充数据集。
@@ -41,62 +52,15 @@ var docxVarRe = regexp.MustCompile(`\{\{\s*([a-z_]+)\s*\}\}`)
 
 // FillDocx 在原始 docx 上做变量替换,返回新 docx 字节流。
 func FillDocx(orig []byte, data DocxData) ([]byte, error) {
-	zr, err := zip.NewReader(bytes.NewReader(orig), int64(len(orig)))
+	docXML, parts, err := readDocxParts(orig)
 	if err != nil {
-		return nil, fmt.Errorf("不是有效的 docx(zip) 文件: %w", err)
+		return nil, err
 	}
-	type fileCopy struct {
-		name   string
-		method uint16
-		body   []byte
-	}
-	var docXML []byte
-	files := make([]fileCopy, 0, len(zr.File))
-	for _, f := range zr.File {
-		rc, err := f.Open()
-		if err != nil {
-			return nil, err
-		}
-		var buf bytes.Buffer
-		if _, err := io.Copy(&buf, rc); err != nil {
-			rc.Close()
-			return nil, err
-		}
-		rc.Close()
-		if f.Name == "word/document.xml" {
-			docXML = buf.Bytes()
-		}
-		files = append(files, fileCopy{name: f.Name, method: f.Method, body: buf.Bytes()})
-	}
-	if docXML == nil {
-		return nil, fmt.Errorf("docx 缺少 word/document.xml")
-	}
-
 	filled, err := FillDocxXML(docXML, data)
 	if err != nil {
 		return nil, err
 	}
-
-	out := &bytes.Buffer{}
-	zw := zip.NewWriter(out)
-	for _, f := range files {
-		body, method := f.body, f.method
-		if f.name == "word/document.xml" {
-			body, method = filled, zip.Deflate
-		}
-		hdr := &zip.FileHeader{Name: f.name, Method: method}
-		fw, err := zw.CreateHeader(hdr)
-		if err != nil {
-			return nil, err
-		}
-		if _, err := fw.Write(body); err != nil {
-			return nil, err
-		}
-	}
-	if err := zw.Close(); err != nil {
-		return nil, err
-	}
-	return out.Bytes(), nil
+	return writeDocxParts(parts, filled)
 }
 
 // FillDocxXML 对 document.xml 字节流做变量替换,返回新的 XML 字节流。
@@ -134,6 +98,7 @@ func FillDocxXML(docXML []byte, data DocxData) ([]byte, error) {
 }
 
 // appendLinesBeforeSectPr 把一组文本段落追加到 body 末尾(w:sectPr 之前)。
+// 无标记段落可捕获基底样式,走空基底(行为与历史版本一致:标题行加粗,正文无格式)。
 func appendLinesBeforeSectPr(root *etree.Element, lines []string) {
 	body := findWChild(root, "body")
 	if body == nil {
@@ -147,7 +112,11 @@ func appendLinesBeforeSectPr(root *etree.Element, lines []string) {
 		}
 	}
 	for _, line := range lines {
-		np := newPara(body, nil, line, isHeadingLine(line))
+		kind := paraPlain
+		if isHeadingLine(line) {
+			kind = paraHeading
+		}
+		np := newStyledPara(docxBaseStyle{}, kind, line)
 		body.InsertChildAt(idx, np)
 		idx++
 	}
@@ -268,16 +237,19 @@ func replaceInlineInPara(p *etree.Element, vars map[string]string) {
 	}
 }
 
-// replaceBlocks 定位「整段恰为块标记」的段落并展开:
-//   - {{content}}/{{findings_detail}} → 一组段落(继承标记段落的段落属性,标题行加粗)
-//   - {{findings_table}}              → 带边框表格(表头加粗)
+// replaceBlocks 定位「整段恰为块标记」的段落并展开。标记名 = 段落文本剥掉 {{}}
+// 后的任意键(命中 Blocks 即展开,不限于内置变量名,模板可自定义块标记):
+//   - DocxBlock.Table 非空(或 Lines 整块是 md 表格文本)→ 带边框表格(表头加粗)
+//   - 否则 Lines 逐段展开(继承标记段落的段落属性与首 run 字符属性,标题行加粗)
+//
+// 构建走 D2 的样式化构建器:标记段落周边捕获基底样式,正文段继承基底字体/字号/
+// 颜色;标记段无样式可捕获时退回无格式段落(与历史行为一致)。
 //
 // 表格内不展开块标记(不支持嵌套)。
 func replaceBlocks(root *etree.Element, data DocxData) {
 	var process func(parent *etree.Element)
 	process = func(parent *etree.Element) {
-		children := parent.ChildElements()
-		for _, p := range children {
+		for _, p := range parent.ChildElements() {
 			if !isW(p, "p") {
 				continue
 			}
@@ -286,27 +258,34 @@ func replaceBlocks(root *etree.Element, data DocxData) {
 			if !ok {
 				continue
 			}
-			ppr := findWChild(p, "pPr")
 			idx := childIndex(parent, p)
 			if idx < 0 {
 				continue
 			}
+			// 基底样式捕获:标记段落的 pPr + 首个带 rPr 的 run(展开内容继承格式)。
+			base := captureParaStyle(p)
 			ins := idx
-			if block.Table != nil {
-				for _, row := range block.Table {
-					tbl := newTable(parent, row)
-					ins++
-					parent.InsertChildAt(ins, tbl)
-				}
-			} else {
-				for _, line := range block.Lines {
-					np := newPara(parent, ppr, line, isHeadingLine(line))
-					ins++
-					parent.InsertChildAt(ins, np)
+			// 传入 Lines 是纯 md 表格文本时自动升级为 Word 表格(如 findings_table
+			// 以 md 文本组装传入的场景);混有非表格行则整块按段落展开,不丢行。
+			table, lines := block.Table, block.Lines
+			if len(table) == 0 {
+				if rows := mdTableRows(lines); rows != nil {
+					table, lines = rows, nil
 				}
 			}
+			if len(table) > 0 {
+				ins++
+				parent.InsertChildAt(ins, newStyledTable(base, table))
+			}
+			for _, line := range lines {
+				kind := paraPlain
+				if isHeadingLine(line) {
+					kind = paraHeading
+				}
+				ins++
+				parent.InsertChildAt(ins, newStyledPara(base, kind, line))
+			}
 			parent.RemoveChild(p)
-			_ = ins
 		}
 		for _, ch := range parent.ChildElements() {
 			if isW(ch, "tbl") {
@@ -316,6 +295,70 @@ func replaceBlocks(root *etree.Element, data DocxData) {
 		}
 	}
 	process(root)
+}
+
+// mdTableRows 判断一组文本行是否「整块是一张 markdown 表格」,是则解析出行数据
+// (跳过 |---|---| 分隔行),否则返回 nil(调用方回退按段落展开)。
+func mdTableRows(lines []string) [][]string {
+	var rows [][]string
+	for _, ln := range lines {
+		t := strings.TrimSpace(ln)
+		if t == "" {
+			continue
+		}
+		if !strings.HasPrefix(t, "|") {
+			return nil
+		}
+		if isMdTableSeparator(t) {
+			continue
+		}
+		rows = append(rows, splitMdTableRow(t))
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	return rows
+}
+
+// isMdTableSeparator 识别 markdown 表格的分隔行(| --- | :---: |)。
+func isMdTableSeparator(t string) bool {
+	return strings.HasPrefix(t, "|") && strings.Contains(t, "---")
+}
+
+// splitMdTableRow 拆一行 "| a | b |" 为单元格文本;处理 \| 转义(还原为 |),
+// 其余反斜杠原样保留,避免吞掉 Windows 路径等真实内容。
+func splitMdTableRow(t string) []string {
+	t = strings.TrimSpace(t)
+	t = strings.TrimPrefix(t, "|")
+	t = strings.TrimSuffix(t, "|")
+	var cells []string
+	var cur strings.Builder
+	esc := false
+	for i := 0; i < len(t); i++ {
+		c := t[i]
+		if esc {
+			if c != '|' {
+				cur.WriteByte('\\')
+			}
+			cur.WriteByte(c)
+			esc = false
+			continue
+		}
+		switch c {
+		case '\\':
+			esc = true
+		case '|':
+			cells = append(cells, strings.TrimSpace(cur.String()))
+			cur.Reset()
+		default:
+			cur.WriteByte(c)
+		}
+	}
+	if esc {
+		cur.WriteByte('\\')
+	}
+	cells = append(cells, strings.TrimSpace(cur.String()))
+	return cells
 }
 
 func findWChild(p *etree.Element, tag string) *etree.Element {
@@ -349,44 +392,4 @@ func stripHeadingMark(line string) string {
 		n++
 	}
 	return strings.TrimSpace(t[n:])
-}
-
-// newPara 在 parent 下构造段落(自动挂载,返回引用)。
-// pprTemplate 继承标记段落的段落属性;heading=true 时文本加粗并去掉 # 记号。
-func newPara(parent *etree.Element, pprTemplate *etree.Element, text string, heading bool) *etree.Element {
-	p := parent.CreateElement("w:p")
-	if pprTemplate != nil {
-		p.InsertChildAt(0, pprTemplate.Copy())
-	}
-	r := p.CreateElement("w:r")
-	if heading {
-		rpr := r.CreateElement("w:rPr")
-		rpr.CreateElement("w:b")
-	}
-	t := r.CreateElement("w:t")
-	t.CreateAttr("xml:space", "preserve")
-	t.SetText(stripHeadingMark(text))
-	return p
-}
-
-// newTable 在 parent 下构造一个带边框表格(首行表头加粗)。row 是一行单元格文本。
-func newTable(parent *etree.Element, row []string) *etree.Element {
-	tbl := parent.CreateElement("w:tbl")
-	pr := tbl.CreateElement("w:tblPr")
-	borders := pr.CreateElement("w:tblBorders")
-	for _, side := range []string{"top", "left", "bottom", "right", "insideH", "insideV"} {
-		b := borders.CreateElement("w:" + side)
-		b.CreateAttr("w:val", "single")
-		b.CreateAttr("w:sz", "4")
-	}
-	tr := tbl.CreateElement("w:tr")
-	for _, cell := range row {
-		tc := tr.CreateElement("w:tc")
-		p := tc.CreateElement("w:p")
-		r := p.CreateElement("w:r")
-		t := r.CreateElement("w:t")
-		t.CreateAttr("xml:space", "preserve")
-		t.SetText(cell)
-	}
-	return tbl
 }

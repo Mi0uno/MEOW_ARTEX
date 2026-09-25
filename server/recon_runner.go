@@ -98,9 +98,10 @@ func (s *Server) launchReconTask(t *Task) {
 	}
 	ctx, cancel := context.WithCancel(s.ctx)
 	// 出网代理按任务解析后挂进 ctx:流水线里的收集器(16+ 家 provider + crt.sh +
-	// 字典爆破)都从 ctx 读它,无需逐个改造签名。
+	// 字典爆破)都从 ctx 读它,无需逐个改造签名。地址带任务标识,池侧据此把
+	// 收集器的出网也归因到本任务,而不是变成一条无主的流水。
 	ctx = recon.WithProxy(ctx,
-		s.m.ProxyAddrForTask(t.ProxyMode, t.ProxyGroupID),
+		s.m.ProxyAddrForTaskTagged(t.ProxyMode, t.ProxyGroupID, t.ID, t.Stage),
 		s.m.ProxyCACertForTask(t.ProxyMode, t.ProxyGroupID))
 	if !s.recon.register(taskID, cancel) {
 		cancel()

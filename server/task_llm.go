@@ -576,7 +576,9 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	mainRuntime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "mainagent"}
 	// 出网地址按任务解析:创建任务时可指定「跟随全局 / 强制直连 / 强制走代理池」。
 	// 三个 agent(worker/planner/main)共用同一出口,保证任务内行为一致。
-	proxyAddr := s.m.ProxyAddrForTask(t.ProxyMode, t.ProxyGroupID)
+	// 取带任务标识的地址:池侧据此把每条出网流水归因到本任务
+	// (proxy_requests.task_id),界面才能回答「这个任务到底走没走代理」。
+	proxyAddr := s.m.ProxyAddrForTaskTagged(t.ProxyMode, t.ProxyGroupID, t.ID, t.Stage)
 	proxyCA := s.m.ProxyCACertForTask(t.ProxyMode, t.ProxyGroupID)
 	tx := transcript.NewStore(filepath.Join(s.m.dir, "transcripts"))
 	window := workerRuntime.CompactionWindow()
@@ -590,6 +592,11 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetProxy(proxyAddr, proxyCA)
 	wk.SetWebSearch(s.webSearchFor("worker"))
 	wk.SetConstraintInject(s.constraintInjectWorker) // 操作约束注入 worker(可配置,默认开)
+	// VPS 执行环境(契约 §6):任务指派了机器时,worker 的 Bash 换成 SSH 版、系统提示词
+	// 追加机器档案。与上面 ProxyAddrForTask 同一位置、同一模式——resolver 在这里定义
+	// 并一次下传,worker 每 run 开头解析一次(晚指派/改派的下一个意图即生效),不在
+	// worker 工具执行路径上散落 MachineForTask 查询。
+	wk.SetVPSContext(s.vpsContextResolver())
 	pl := agent.NewPlanner(plannerRuntime, "task-router", s.m.dir, tx, plannerRuntime.CompactionWindow(), s.agentMaxTurns("planner"))
 	pl.SetFindingRecorder(s.evidenceStore())
 	pl.SetCompactionWindowResolver(plannerRuntime.CompactionWindow)

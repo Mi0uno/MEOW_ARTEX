@@ -28,6 +28,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,6 +36,14 @@ import (
 
 	xproxy "golang.org/x/net/proxy"
 )
+
+// maxProxyAttempts 是单次请求最多尝试的候选数。
+//
+// 为什么必须重试而不能试一条就报错:池里装的是公开/在野代理,单条随时失效。
+// 只试一条时,整个池的可用性等于「本次恰好抽到的那条」,一次抽坏就是一次任务
+// 出网失败——实测组内 30 条「alive」里只有 6 条能建 HTTPS 隧道,round_robin
+// 一条不重试的失败率因此接近一半,任务侧表现为「切了代理池反而连不上」。
+const maxProxyAttempts = 3
 
 // Candidate 是调度候选:一条可用于出网的代理。
 type Candidate struct {
@@ -306,11 +315,63 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.handleForward(w, r)
 }
 
+// taskTag 从一个代理请求里解出「这是哪个任务的出网」。
+//
+// 池是组级共享监听器(一个组一个端口),所以任务身份只能由请求自己带:调用方把
+// 任务标识写进代理 URL 的 userinfo(形如 http://t43:exploit@127.0.0.1:18080),
+// Go 的 Transport 与 curl 都会把它转成 Proxy-Authorization: Basic。解不出来就
+// 返回 0(非任务流量:手工 curl、浏览器、平台自身的探测),不臆断归因。
+//
+// 编码侧是 TagProxyAddr——两者必须成对改动,所以放在同一个文件里。
+func taskTag(r *http.Request) (taskID int64, stage string) {
+	raw := r.Header.Get("Proxy-Authorization")
+	const prefix = "Basic "
+	if len(raw) <= len(prefix) || !strings.EqualFold(raw[:len(prefix)], prefix) {
+		return 0, ""
+	}
+	dec, err := base64.StdEncoding.DecodeString(raw[len(prefix):])
+	if err != nil {
+		return 0, ""
+	}
+	user, pass, _ := strings.Cut(string(dec), ":")
+	if !strings.HasPrefix(user, "t") {
+		return 0, ""
+	}
+	id, err := strconv.ParseInt(user[1:], 10, 64)
+	if err != nil || id <= 0 {
+		return 0, ""
+	}
+	return id, pass
+}
+
+// TagProxyAddr 把一个池监听地址打上任务身份,返回可直接用作 HTTP_PROXY 的地址。
+//
+// 形如 http://127.0.0.1:18080 → http://t43:exploit@127.0.0.1:18080。
+// taskID<=0 或地址不合法时原样返回(归因缺失只是少一条审计,不能因此让调用方
+// 拿不到出口地址)。stage 作为密码位传递,可为空。
+//
+// 「谁能打标」由 server 判定:只有确认是本池监听地址时才调用本函数——全局代理
+// 与 MITM 出口不是本池的流量,打了标也没人解。
+func TagProxyAddr(addr string, taskID int64, stage string) string {
+	if taskID <= 0 {
+		return addr
+	}
+	u, err := url.Parse(addr)
+	if err != nil || u.Host == "" {
+		return addr
+	}
+	u.User = url.UserPassword(fmt.Sprintf("t%d", taskID), stage)
+	return u.String()
+}
+
 // handleConnect 处理 CONNECT 隧道。
 //
-// failover 策略下会依次尝试候选,直到某条能建起隧道(最多试 3 条,避免长尾卡死)。
+// 建立隧道失败时依次换候选重试(最多 maxProxyAttempts 条)。重试对 CONNECT 是
+// 安全的:握手失败意味着到目标的字节一个都没发出去,不会重复投递。只试一条会让
+// 池的可用性退化成「抽到的那条」的可用性——公开代理池里这个值很低。
 func (p *Pool) handleConnect(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+	taskID, stage := taskTag(r)
 	target := r.Host
 	if !strings.Contains(target, ":") {
 		target += ":443"
@@ -328,12 +389,8 @@ func (p *Pool) handleConnect(w http.ResponseWriter, r *http.Request) {
 	defer clientConn.Close()
 
 	exclude := map[int64]bool{}
-	maxTry := 1
-	if p.opts.Strategy == "failover" {
-		maxTry = 3
-	}
 	var lastErr error
-	for attempt := 0; attempt < maxTry; attempt++ {
+	for attempt := 0; attempt < maxProxyAttempts; attempt++ {
 		cand, found := p.pick(exclude)
 		if !found {
 			break
@@ -342,7 +399,7 @@ func (p *Pool) handleConnect(w http.ResponseWriter, r *http.Request) {
 		if derr != nil {
 			lastErr = derr
 			exclude[cand.ID] = true
-			p.noteFailure(cand, r, "CONNECT "+target, derr, time.Since(start))
+			p.noteFailure(cand, r, "CONNECT "+target, derr, time.Since(start), taskID, stage)
 			continue
 		}
 		p.markActive(cand)
@@ -380,7 +437,7 @@ func (p *Pool) handleConnect(w http.ResponseWriter, r *http.Request) {
 			Method: "CONNECT", Host: hostOnly(target), URL: "https://" + target,
 			StatusCode: 200, LatencyMs: int(time.Since(start).Milliseconds()),
 			BytesOut: atomic.LoadInt64(&up), BytesIn: atomic.LoadInt64(&down),
-			OK: true,
+			OK: true, TaskID: taskID, Stage: stage,
 		})
 		return
 	}
@@ -395,23 +452,21 @@ func (p *Pool) handleConnect(w http.ResponseWriter, r *http.Request) {
 		GroupID: p.opts.GroupID, Method: "CONNECT", Host: hostOnly(target),
 		URL: "https://" + target, StatusCode: 502,
 		LatencyMs: int(time.Since(start).Milliseconds()), OK: false, Error: msg,
+		TaskID: taskID, Stage: stage,
 	})
 }
 
 // handleForward 处理普通 HTTP 请求(绝对 URI 形式)。
 func (p *Pool) handleForward(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+	taskID, stage := taskTag(r)
 	if !r.URL.IsAbs() {
 		http.Error(w, "代理需要绝对 URI 请求", http.StatusBadRequest)
 		return
 	}
 	exclude := map[int64]bool{}
-	maxTry := 1
-	if p.opts.Strategy == "failover" {
-		maxTry = 3
-	}
 	var lastErr error
-	for attempt := 0; attempt < maxTry; attempt++ {
+	for attempt := 0; attempt < maxProxyAttempts; attempt++ {
 		cand, found := p.pick(exclude)
 		if !found {
 			break
@@ -425,7 +480,7 @@ func (p *Pool) handleForward(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			lastErr = err
 			exclude[cand.ID] = true
-			p.noteFailure(cand, r, r.URL.String(), err, time.Since(start))
+			p.noteFailure(cand, r, r.URL.String(), err, time.Since(start), taskID, stage)
 			continue
 		}
 		p.markActive(cand)
@@ -447,6 +502,7 @@ func (p *Pool) handleForward(w http.ResponseWriter, r *http.Request) {
 			Method: r.Method, Host: r.URL.Host, URL: r.URL.String(),
 			StatusCode: resp.StatusCode, LatencyMs: int(time.Since(start).Milliseconds()),
 			BytesIn: n, BytesOut: reqLen, OK: resp.StatusCode < 400,
+			TaskID: taskID, Stage: stage,
 		})
 		return
 	}
@@ -458,6 +514,7 @@ func (p *Pool) handleForward(w http.ResponseWriter, r *http.Request) {
 	p.record(RequestRecord{
 		GroupID: p.opts.GroupID, Method: r.Method, Host: r.URL.Host, URL: r.URL.String(),
 		StatusCode: 502, LatencyMs: int(time.Since(start).Milliseconds()), OK: false, Error: msg,
+		TaskID: taskID, Stage: stage,
 	})
 }
 
@@ -571,7 +628,7 @@ func (p *Pool) markActive(c *Candidate) {
 }
 
 // noteFailure 记一次失败流水并回调(累计失败计数由回调方负责)。
-func (p *Pool) noteFailure(cand *Candidate, r *http.Request, target string, err error, elapsed time.Duration) {
+func (p *Pool) noteFailure(cand *Candidate, r *http.Request, target string, err error, elapsed time.Duration, taskID int64, stage string) {
 	host, method := "", ""
 	if r != nil {
 		method = r.Method
@@ -581,7 +638,7 @@ func (p *Pool) noteFailure(cand *Candidate, r *http.Request, target string, err 
 		GroupID: p.opts.GroupID, ProxyID: cand.ID, ProxyURL: cand.Raw,
 		Method: method, Host: host, URL: target,
 		StatusCode: 0, LatencyMs: int(elapsed.Milliseconds()),
-		OK: false, Error: err.Error(),
+		OK: false, Error: err.Error(), TaskID: taskID, Stage: stage,
 	})
 	if p.opts.OnProxyFailure != nil {
 		p.opts.OnProxyFailure(cand.ID)

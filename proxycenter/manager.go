@@ -222,6 +222,24 @@ func (m *Manager) PoolAddr(groupID int64) string {
 	return p.ProxyURL()
 }
 
+// OwnsAddr 报告 addr 是不是本管理器某个池监听器的地址。
+//
+// 调用方(server)用它区分「这个出口确实归池管」与「已回落到全局代理/MITM」:
+// 只有前者值得把任务标识编进代理 URL——池侧才解得出,也才有人记录归因。
+func (m *Manager) OwnsAddr(addr string) bool {
+	if addr == "" {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, p := range m.pools {
+		if p.ProxyURL() == addr {
+			return true
+		}
+	}
+	return false
+}
+
 // DefaultGroupID 返回「任务要求走代理池但全局没开池」时该用哪个组:
 // 优先全局选中的那个,否则第一个已启动监听的组。
 // 都没有时返回 0(调用方退回全局出口)。

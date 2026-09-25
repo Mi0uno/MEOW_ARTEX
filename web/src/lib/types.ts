@@ -208,7 +208,12 @@ export interface VulnSyncRun {
 // 规范各不相同,所以授权范围字段挂在「平台×目标」关联(src_platform_targets)上。
 
 /** 平台级规范文件的四类用途,与后端 src_platform_files.kind 同取值。 */
-export type SRCPlatformFileKind = "reward_standard" | "scoring_standard" | "code_of_conduct" | "rules";
+export type SRCPlatformFileKind =
+  | "reward_standard"
+  | "scoring_standard"
+  | "code_of_conduct"
+  | "rules"
+  | "other"; // other=统一上传入口先收文件,AI 识别/手动改派后再归类
 
 export const SRC_PLATFORM_FILE_KINDS: { value: SRCPlatformFileKind; label: string }[] = [
   { value: "reward_standard", label: "奖励标准" },
@@ -399,10 +404,29 @@ export interface ReportTemplate {
   analyze_status?: "" | "running" | "done" | "failed" | string;
   analyze_error?: string;
   suggested_content?: string; // AI 草稿(仅详情返回,由用户确认采用)
+  // 导出写作指令:与占位模板配套,AI 按模板导出时注入 LLM(识别产出/手工编辑,仅详情返回)
+  export_prompt?: string;
   analyze_task_id?: number;
   analyze_conv_id?: number;
   analyzed_at?: string;
   created_at: string;
+}
+
+// 报告生成作业:走 LLM 的报告产出(AI 按模板导出 / 任务报告 AI 撰写)的统一进度实体。
+// monitor_task_id/conv_id 指向报告中心的监看任务与会话(过程可回看)。
+export interface ReportJob {
+  id: number;
+  kind: "export" | "task_report_ai" | string;
+  report_id: number;
+  template_id?: number;
+  source_task_id?: number;
+  monitor_task_id?: number;
+  conv_id?: number;
+  format?: string; // export: md | docx
+  status: "running" | "done" | "failed" | string;
+  error?: string;
+  created_at: string;
+  updated_at: string;
 }
 
 // ---- 报告生成过程事件流 ----
@@ -411,7 +435,17 @@ export interface ReportEvent {
   id: number;
   report_id?: number;
   template_id?: number;
-  kind: "created" | "archived" | "updated" | "exported" | "uploaded" | "deleted" | string;
+  // ai_enhanced/ai_enhance_failed:报告 agent 重写任务总结报告(成功/失败)
+  kind:
+    | "created"
+    | "archived"
+    | "updated"
+    | "exported"
+    | "uploaded"
+    | "deleted"
+    | "ai_enhanced"
+    | "ai_enhance_failed"
+    | string;
   actor: "user" | "agent" | "system" | string;
   task_id?: number;
   detail?: Record<string, unknown>;
@@ -1909,8 +1943,44 @@ export interface InterceptRule {
   timeout_enabled: boolean;
   timeout_seconds: number;
   timeout_action: "deny" | "allow";
+  /** 适用范围:""=全部任务(缺省,既有行为);"src"=仅 SRC 模式任务 */
+  scope?: "" | "src" | string;
   created_at: string;
   updated_at: string;
+}
+
+// ---- SRC 监管聚合(监管&规则中心 · SRC 板块) ----
+
+export interface SRCGuardOverview {
+  /** SRC 模式任务总数(src_mode=true) */
+  src_task_count: number;
+  /** 运行中/已创建的 SRC 任务数细分 */
+  src_task_active: number;
+  /** 仅 SRC 适用的拦截规则数 */
+  rules_scoped_src: number;
+  /** 全部拦截规则数 */
+  rules_total: number;
+  /** SRC 任务最近被拦截/判疑的调用(时间倒序,截断条数由后端定) */
+  recent_blocks: {
+    id: number;
+    task_id?: string;
+    task_name?: string;
+    agent_name?: string;
+    tool_name?: string;
+    action: string;
+    message?: string;
+    created_at?: string;
+  }[];
+}
+
+// AI 识别填入的建议(后端 LLM 结构化输出;前端预填表单,人工检查后保存)
+export interface SPECAIFillSuggestion {
+  reward_standard: string;
+  scoring_standard: string;
+  code_of_conduct: string;
+  rules: string;
+  /** 识别依据说明(用了哪些附件/置信提示),展示给用户 */
+  note?: string;
 }
 
 export interface InterceptPending {
@@ -2202,4 +2272,160 @@ export interface InterceptExecution {
   session: string;
   seq: number;
   items: Activity[];
+}
+
+// ============================================================
+// VPS 中心:任务级执行环境(自有 VPS 手动录入,agent 命令经 SSH 远程执行)
+// ============================================================
+
+/** 机器状态:online(在线空闲)/ busy(被任务占用)/ offline(测活失败)/ maintenance(维护,不参与自动指派)/ unknown(未测活)。 */
+export type VpsStatus = "online" | "offline" | "unknown" | "busy" | "maintenance";
+/** manual(手动录入)/ cloud(云 API 开通,二期)。 */
+export type VpsProvider = "manual" | "cloud";
+/** password(密码认证)/ key(私钥认证)。 */
+export type VpsAuthType = "password" | "key";
+
+/** 执行流水来源:agent(worker 工具)/ terminal(Web 终端会话)/ toolset(工具集脚本)/ manual(单命令试跑)/ detect(系统与工具探测)。 */
+export type VpsExecSource = "agent" | "terminal" | "toolset" | "manual" | "detect";
+
+export interface VpsMachine {
+  id: number;
+  name: string;
+  host: string;
+  port: number;
+  username: string;
+  auth_type: VpsAuthType | string;
+  status: VpsStatus | string;
+  os_name: string;
+  os_version: string;
+  kernel: string;
+  arch: string;
+  cpu_cores: number;
+  memory_mb: number;
+  disk_gb: number;
+  region: string;
+  provider: VpsProvider | string;
+  tags: string[];
+  workspace_base: string;
+  /** 当前占用该机器的任务 id;0 = 空闲。 */
+  assigned_task_id: number;
+  /** 占用任务名(详情/列表回显用,后端 JOIN 补齐)。 */
+  assigned_task_name?: string;
+  last_error: string;
+  last_check_at?: string;
+  last_online_at?: string;
+  notes: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** 录入/编辑机器的请求体。凭据只在创建时或显式更新时提交,永不回显。 */
+export interface VpsMachineInput {
+  name: string;
+  host: string;
+  port?: number;
+  username: string;
+  auth_type: VpsAuthType | string;
+  /** 明文仅出现在请求里;服务端加密入库,响应永不回传。 */
+  password?: string;
+  private_key?: string;
+  key_passphrase?: string;
+  region?: string;
+  tags?: string[];
+  workspace_base?: string;
+  notes?: string;
+  /** 更新时=改状态;创建时忽略。 */
+  status?: VpsStatus | string;
+}
+
+/** 单个工具的探测结果(机器详情「工具检测」矩阵一行)。 */
+export interface VpsToolDetection {
+  tool_name: string;
+  installed: boolean;
+  version: string;
+  detected_at: string;
+}
+
+/** 一条执行流水。 */
+export interface VpsExecution {
+  id: number;
+  machine_id: number;
+  /** 0 = 非任务触发(终端/手动/探测)。 */
+  task_id: number;
+  source: VpsExecSource | string;
+  toolset_id: number;
+  command: string;
+  exit_code: number | null;
+  duration_ms: number;
+  output_size: number;
+  output_path: string;
+  error: string;
+  created_at: string;
+}
+
+export interface VpsToolset {
+  id: number;
+  name: string;
+  description: string;
+  script: string;
+  builtin: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+/** 一次指派(含历史;released_at 为空 = 进行中)。 */
+export interface VpsAssignment {
+  id: number;
+  machine_id: number;
+  task_id: number;
+  /** 任务名(后端 JOIN 补齐)。 */
+  task_name?: string;
+  /** 机器名(按任务维度查看时补齐)。 */
+  machine_name?: string;
+  assigned_by: string;
+  assigned_at: string;
+  released_at?: string;
+  release_reason: string;
+}
+
+/** 机器详情 = 机器本体 + 工具检测矩阵 + 当前占用任务。 */
+export interface VpsMachineDetail {
+  machine: VpsMachine;
+  detections: VpsToolDetection[];
+  current_task: { id: number; name: string } | null;
+}
+
+/** 仪表盘一条请求取齐(仿 proxy/dashboard)。 */
+export interface VpsDashboard {
+  summary: {
+    total: number;
+    online: number;
+    offline: number;
+    busy: number;
+    maintenance: number;
+    executions_today: number;
+    active_tasks: number;
+  };
+  /** 命令执行量时间序列(按小时桶)。 */
+  series: { ts: string; count: number }[];
+  /** 当前被占用的机器(谁在用、用了多久)。 */
+  busy_machines: VpsMachine[];
+  /** 最近执行流水。 */
+  recent: VpsExecution[];
+}
+
+/** 单命令执行结果(手动试跑框 / agent 工具共用)。 */
+export interface VpsExecResult {
+  exit_code: number | null;
+  duration_ms: number;
+  output: string;
+  /** 输出被截断时为 true(完整输出走流水详情)。 */
+  truncated: boolean;
+}
+
+/** 任务详情页「执行环境」tab 的聚合数据。 */
+export interface TaskVpsEnvironment {
+  machine: VpsMachine | null;
+  /** 该任务在此机器的执行流水。 */
+  executions: VpsExecution[];
 }

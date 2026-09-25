@@ -3,6 +3,7 @@
 import * as React from "react";
 
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 
 import { ArrowDownIcon, ArrowUpIcon, ArrowUpRightIcon, ChevronRightIcon } from "lucide-react";
 import { toast } from "sonner";
@@ -14,6 +15,7 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger } from "@
 import { api } from "@/lib/api";
 import { useStoredSortPreference } from "@/lib/sort-preference";
 import { statusMeta } from "@/lib/status";
+import { tasksListContextQuery } from "@/lib/task-list-context";
 import type { Finding, FindingStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -21,6 +23,14 @@ type FindingSortField = "time";
 
 const FINDING_SORT_FIELDS: readonly FindingSortField[] = ["time"];
 const FINDING_SORT_PREFERENCE_KEY = "artex_task_findings_sort";
+
+// 漏洞详情链接必须带上来源任务 context_task 与任务列表上下文(company/src/stage):
+// 详情页返回按钮按这两个参数决定回任务详情页还是发现列表,丢任何一个都会退到全局列表。
+function findingDetailHref(findingId: string, contextTaskId: string, listContext: string): string {
+  let href = `/function/findings/detail?id=${findingId}&context_task=${contextTaskId}`;
+  if (listContext) href += `&${listContext}`;
+  return href;
+}
 
 function findingLabel(finding: Finding): string {
   if (finding.name?.trim()) return finding.name;
@@ -43,10 +53,12 @@ const FINDING_STATUSES: FindingStatus[] = [
 function Row({
   f,
   contextTaskId,
+  listContext,
   onStatus,
 }: {
   f: Finding;
   contextTaskId: string;
+  listContext: string;
   onStatus: (f: Finding, next: FindingStatus) => void;
 }) {
   const [open, setOpen] = React.useState(false);
@@ -112,11 +124,7 @@ function Row({
         </span>
         {f.finding_id && (
           <Link
-            href={
-              f.inherited
-                ? `/function/findings/detail?id=${f.finding_id}&context_task=${contextTaskId}`
-                : `/function/findings/detail?id=${f.finding_id}`
-            }
+            href={findingDetailHref(f.finding_id, contextTaskId, listContext)}
             className="text-muted-foreground hover:text-primary inline-flex shrink-0 items-center gap-0.5 text-xs"
             title="查看漏洞详情"
           >
@@ -138,6 +146,9 @@ function Row({
 }
 
 export function FindingsTab({ taskId }: { taskId: string }) {
+  const searchParams = useSearchParams();
+  // 透传任务列表上下文(资产主体筛选 company/src/stage),详情页返回后才能停在同一筛选下。
+  const listContext = tasksListContextQuery(searchParams);
   const [findings, setFindings] = React.useState<Finding[]>([]);
   const [sortPreference, setSortPreference] = useStoredSortPreference(
     FINDING_SORT_PREFERENCE_KEY,
@@ -212,7 +223,7 @@ export function FindingsTab({ taskId }: { taskId: string }) {
           </button>
         </div>
         {items.map((f) => (
-          <Row key={f.id} f={f} contextTaskId={taskId} onStatus={onStatus} />
+          <Row key={f.id} f={f} contextTaskId={taskId} listContext={listContext} onStatus={onStatus} />
         ))}
         {items.length === 0 && (
           <p className="px-4 py-8 text-center text-sm text-muted-foreground">本任务及直接关联任务暂无确认发现。</p>

@@ -36,6 +36,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { ProxyEgressSelect, proxyGroupIdForSubmit, type ProxyEgressMode } from "@/components/proxy-egress-select";
 import { api } from "@/lib/api";
 import type { SRCPlatform, SRCTarget } from "@/lib/types";
 
@@ -76,6 +77,10 @@ export function CreateSRCTaskDialog({
   const [platforms, setPlatforms] = React.useState<SRCPlatform[]>([]);
   const [targets, setTargets] = React.useState<SRCTarget[]>([]);
   const [loadingTargets, setLoadingTargets] = React.useState(false);
+  // 出网方式(任务级覆盖):SRC 任务的靶标往往在公网且需要隐藏来源 IP,
+  // 所以这里必须能选代理池——早先这个对话框漏了它,用户只能拿到「跟随全局」。
+  const [proxyMode, setProxyMode] = React.useState<ProxyEgressMode>("");
+  const [proxyGroupID, setProxyGroupID] = React.useState(0);
 
   // 锁定模式:详情页给了 platform/target,用户不需要也不能改(改了就换了授权边界)。
   const locked = !!platform && !!target;
@@ -129,9 +134,12 @@ export function CreateSRCTaskDialog({
   }, [open, locked, platformId]);
 
   // 每次打开都按当前平台/目标重置:同一个对话框会服务不同的目标,残留上次的输入会开错任务。
+  // 出网方式同样归零(残留「走代理池」会让下一个任务意外走池,是安全语义,必须重置)。
   // 快速创建模式下等用户选完再填默认名(见下一个 effect)。
   React.useEffect(() => {
     if (!open) return;
+    setProxyMode("");
+    setProxyGroupID(0);
     if (!locked) {
       setName("");
       setGoal("");
@@ -175,6 +183,9 @@ export function CreateSRCTaskDialog({
         srcMode: true,
         srcPlatformId: pickedPlatform.id,
         srcTargetId: pickedTarget.id,
+        // 出网方式:默认跟随全局;选「走代理池」才带组 id。
+        proxyMode,
+        proxyGroupId: proxyGroupIdForSubmit({ mode: proxyMode, groupId: proxyGroupID }),
       });
       toast.success("SRC 任务已创建,平台规范与授权范围已注入");
       onOpenChange(false);
@@ -319,6 +330,16 @@ export function CreateSRCTaskDialog({
               placeholder="补充说明"
             />
           </div>
+
+          {/* 出网方式:与通用建任务抽屉同一组件,保证四个建任务入口选项一致。 */}
+          <ProxyEgressSelect
+            mode={proxyMode}
+            groupId={proxyGroupID}
+            onChange={(v) => {
+              setProxyMode(v.mode);
+              setProxyGroupID(v.groupId);
+            }}
+          />
         </div>
 
         <DialogFooter>

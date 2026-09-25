@@ -24,7 +24,25 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
-import { ReconRunsPanel, ReconGraphPanel, ReconStagedPanel, ReconOverviewPanel, ReconAssetsPanel, ReconEvidencePanel } from "@/components/recon-detail-panels";
+import { AssetsTab } from "@/app/(main)/function/tasks/detail/_tabs/assets-tab";
+import { BroadcastTab } from "@/app/(main)/function/tasks/detail/_tabs/broadcast-tab";
+import { CoverageGraphTab } from "@/app/(main)/function/tasks/detail/_tabs/coverage-graph-tab";
+import { FindingsTab } from "@/app/(main)/function/tasks/detail/_tabs/findings-tab";
+import { GraphTab } from "@/app/(main)/function/tasks/detail/_tabs/graph-tab";
+import { InterceptTab } from "@/app/(main)/function/tasks/detail/_tabs/intercept-tab";
+import { OverviewTab } from "@/app/(main)/function/tasks/detail/_tabs/overview-tab";
+import { ReportTab } from "@/app/(main)/function/tasks/detail/_tabs/report-tab";
+import { RetestsTab } from "@/app/(main)/function/tasks/detail/_tabs/retests-tab";
+import { SessionsTab } from "@/app/(main)/function/tasks/detail/_tabs/sessions-tab";
+import { TaskVpsTab } from "@/app/(main)/function/tasks/detail/_tabs/vps-tab";
+import {
+  ReconAssetsPanel,
+  ReconEvidencePanel,
+  ReconGraphPanel,
+  ReconOverviewPanel,
+  ReconRunsPanel,
+  ReconStagedPanel,
+} from "@/components/recon-detail-panels";
 import { StatusBadge } from "@/components/status-badge";
 import { TaskLLMProfileChain } from "@/components/task-llm-profile-chain";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -54,18 +72,8 @@ import { Spinner } from "@/components/ui/spinner";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { api } from "@/lib/api";
+import { tasksListContextQuery } from "@/lib/task-list-context";
 import type { LLMProfile, Task } from "@/lib/types";
-
-import { AssetsTab } from "@/app/(main)/function/tasks/detail/_tabs/assets-tab";
-import { BroadcastTab } from "@/app/(main)/function/tasks/detail/_tabs/broadcast-tab";
-import { CoverageGraphTab } from "@/app/(main)/function/tasks/detail/_tabs/coverage-graph-tab";
-import { FindingsTab } from "@/app/(main)/function/tasks/detail/_tabs/findings-tab";
-import { GraphTab } from "@/app/(main)/function/tasks/detail/_tabs/graph-tab";
-import { InterceptTab } from "@/app/(main)/function/tasks/detail/_tabs/intercept-tab";
-import { OverviewTab } from "@/app/(main)/function/tasks/detail/_tabs/overview-tab";
-import { ReportTab } from "@/app/(main)/function/tasks/detail/_tabs/report-tab";
-import { RetestsTab } from "@/app/(main)/function/tasks/detail/_tabs/retests-tab";
-import { SessionsTab } from "@/app/(main)/function/tasks/detail/_tabs/sessions-tab";
 
 const TABS = [
   { value: "sessions", label: "会话" },
@@ -77,6 +85,7 @@ const TABS = [
   { value: "assets", label: "测试资产" },
   { value: "coverage", label: "资产覆盖图" },
   { value: "intercept", label: "拦截审批" },
+  { value: "vps", label: "执行环境" },
   { value: "report", label: "报告" },
 ];
 
@@ -89,6 +98,18 @@ const RECON_TABS = [
   { value: "staged", label: "暂存区" },
   { value: "evidence", label: "证据" },
 ];
+
+// 构造返回任务列表的链接:透传 company/src/stage 上下文,保证从详情页返回后
+// 仍停留在原「资产主体」视图,而不是大退到选择主体页。URL 已带的 stage 优先;
+// recon 任务缺省时补 stage=recon,维持旧的 recon 列表定位;无上下文时不带 ?。
+function tasksListHref(params: Pick<URLSearchParams, "get">, isRecon: boolean): string {
+  const search = new URLSearchParams(tasksListContextQuery(params));
+  if (!search.get("stage") && isRecon) {
+    search.set("stage", "recon");
+  }
+  const query = search.toString();
+  return query ? `/function/tasks?${query}` : "/function/tasks";
+}
 
 function taskProfileIDs(task: Task): string[] {
   if (task.llm_profile_ids && task.llm_profile_ids.length > 0) {
@@ -236,7 +257,14 @@ export function TaskDetailView() {
   const [task, setTask] = React.useState<Task | null>(null);
   const [paused, setPaused] = React.useState(false);
   const [loaded, setLoaded] = React.useState(false);
-  const [tab, setTab] = React.useState<string | null>(null);
+  // tab 深链初值:useState 初值在任务加载前就要确定,此时还不知道阶段,
+  // 先按 agent/recon 两类页签 value 的并集校验;渲染时再按当前阶段页签兜底。
+  const [tab, setTab] = React.useState<string | null>(() => {
+    const requested = searchParams.get("tab");
+    if (!requested) return null;
+    const knownValues = new Set([...TABS, ...RECON_TABS].map((t) => t.value));
+    return knownValues.has(requested) ? requested : null;
+  });
   const [interceptPendingCount, setInterceptPendingCount] = React.useState(0);
   const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
   const [archiving, setArchiving] = React.useState(false);
@@ -316,6 +344,16 @@ export function TaskDetailView() {
     }
   }
 
+  // 换页签时用 replaceState 把 tab 写回 URL:必须在现有参数副本上 set,
+  // 才能保留 id/company/stage/src 等参数,供下游(漏洞详情)带 tab=... 深链返回。
+  function handleTabChange(next: string) {
+    setTab(next);
+    const nextParams = new URLSearchParams(searchParams.toString());
+    nextParams.set("tab", next);
+    // Next 16 对原生 replaceState 会同步 useSearchParams。
+    window.history.replaceState(null, "", `${window.location.pathname}?${nextParams.toString()}`);
+  }
+
   async function rerunRecon() {
     if (rerunning) return;
     setRerunning(true);
@@ -342,7 +380,7 @@ export function TaskDetailView() {
         delete_llm_records: false,
       });
       toast.success(`任务 #${id} 已删除`);
-      router.push("/function/tasks?stage=recon");
+      router.push(tasksListHref(searchParams, isRecon));
     } catch (e) {
       toast.error(`删除失败：${(e as Error).message}`);
       setDeleting(false);
@@ -355,7 +393,7 @@ export function TaskDetailView() {
     try {
       await api.archiveTask(task.id);
       toast.success("任务已加入归档队列");
-      router.push("/function/tasks");
+      router.push(tasksListHref(searchParams, isRecon));
     } catch (error) {
       toast.error(`归档失败：${(error as Error).message}`);
       setArchiving(false);
@@ -379,7 +417,13 @@ export function TaskDetailView() {
 
   const isRecon = task.stage === "recon";
   const tabs = isRecon ? RECON_TABS : TABS;
-  const activeTab = tab ?? (isRecon ? "overview" : "sessions");
+  // 深链初值只按两类页签并集校验过,这里再按当前阶段的页签集合兜底:
+  // tab 不属于当前阶段(或未提供)时,回落到该阶段默认页签。
+  const tabValues = new Set(tabs.map((t) => t.value));
+  let activeTab: string = tab ?? "";
+  if (!tabValues.has(activeTab)) {
+    activeTab = isRecon ? "overview" : "sessions";
+  }
   const completed = task.status === "done";
   const terminal = ["done", "failed", "timeout"].includes(task.status);
   const archiveLifecycleEligible = terminal || paused || task.status === "paused";
@@ -403,13 +447,13 @@ export function TaskDetailView() {
   }
 
   return (
-    <Tabs value={activeTab} onValueChange={setTab} className="flex flex-1 flex-col gap-0">
+    <Tabs value={activeTab} onValueChange={handleTabChange} className="flex flex-1 flex-col gap-0">
       {/* Top fixed area */}
       <header className="sticky top-0 z-10 flex flex-col gap-2 border-b bg-background/95 px-4 py-2.5 backdrop-blur lg:px-6">
         <div className="flex items-center gap-2">
           <SidebarTrigger className="-ml-1" />
           <Button asChild variant="ghost" size="icon" className="size-7">
-            <Link href={isRecon ? "/function/tasks?stage=recon" : "/function/tasks"}>
+            <Link href={tasksListHref(searchParams, isRecon)}>
               <ArrowLeftIcon />
             </Link>
           </Button>
@@ -582,6 +626,9 @@ export function TaskDetailView() {
             </TabsContent>
             <TabsContent value="intercept" className="mt-0">
               <InterceptTab taskId={id} />
+            </TabsContent>
+            <TabsContent value="vps" className="mt-0">
+              <TaskVpsTab taskId={id} />
             </TabsContent>
             <TabsContent value="report" className="mt-0">
               <ReportTab taskId={id} />

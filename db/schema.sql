@@ -1441,6 +1441,32 @@ ALTER TABLE report_templates ADD COLUMN IF NOT EXISTS analyze_error      TEXT NO
 ALTER TABLE report_templates ADD COLUMN IF NOT EXISTS analyze_task_id    BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE report_templates ADD COLUMN IF NOT EXISTS analyze_conv_id    BIGINT;
 ALTER TABLE report_templates ADD COLUMN IF NOT EXISTS analyzed_at        TIMESTAMPTZ;
+-- 模板导出写作指令:模板识别时由 AI 一并产出,与占位模板配套;AI 按模板导出时
+-- 注入 LLM,描述每个章节应填什么数据、写作口吻、格式与脱敏要求。可在模板管理页编辑。
+ALTER TABLE report_templates ADD COLUMN IF NOT EXISTS export_prompt      TEXT NOT NULL DEFAULT '';
+
+-- 报告生成作业:报告中心所有「走 LLM 的报告产出」统一落这张表,前端轮询进度、
+-- 下载产物、回看历史。kind:
+--   export         AI 按模板导出(产物文件落 <data>/report-jobs/,路径不外泄,经下载接口取);
+--   task_report_ai 任务总结报告 AI 撰写(产出直接覆盖写回 reports,无产物文件)。
+-- monitor_task_id/conv_id 指向监看任务(stage='report',kind=pipeline)与会话,
+-- 报告中心任务(/function/tasks?stage=report)与对话(/chat?stage=report)可见。
+CREATE TABLE IF NOT EXISTS report_jobs (
+    id              BIGSERIAL PRIMARY KEY,
+    kind            TEXT NOT NULL CHECK (kind IN ('export','task_report_ai')),
+    report_id       BIGINT NOT NULL DEFAULT 0,
+    template_id     BIGINT NOT NULL DEFAULT 0,
+    source_task_id  BIGINT NOT NULL DEFAULT 0,
+    monitor_task_id BIGINT NOT NULL DEFAULT 0,
+    conv_id         BIGINT,
+    format          TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'running' CHECK (status IN ('running','done','failed')),
+    error           TEXT NOT NULL DEFAULT '',
+    result_path     TEXT NOT NULL DEFAULT '',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_report_jobs_report ON report_jobs(report_id, id DESC);
 
 -- ============================================================
 -- 漏洞库(vulndb_entries):沉淀漏洞情报与利用指引。
@@ -1985,3 +2011,117 @@ ALTER TABLE intercept_rules DROP CONSTRAINT IF EXISTS intercept_rules_scope_chec
 ALTER TABLE intercept_rules ADD CONSTRAINT intercept_rules_scope_check
     CHECK (scope IN ('','src'));
 CREATE INDEX IF NOT EXISTS idx_intercept_rules_scope ON intercept_rules(scope) WHERE scope <> '';
+
+-- ============================================================
+-- VPS 中心(2026-09-25):任务级执行环境。自有 VPS 手动录入,
+-- agent 的命令类工具经 SSH 在指派机器上执行,Web 终端 / 工具集 / 流水审计。
+-- ============================================================
+
+-- 机器池:一台可 SSH 的 Linux 机器 = 一个执行环境。
+-- 凭据(密码/私钥/私钥口令)以 secretbox AES-256-GCM 密文入库,明文只在 server 层短暂存在。
+CREATE TABLE IF NOT EXISTS vps_machines (
+    id                 BIGSERIAL PRIMARY KEY,
+    name               TEXT NOT NULL,
+    host               TEXT NOT NULL,
+    port               INT NOT NULL DEFAULT 22,
+    username           TEXT NOT NULL,
+    auth_type          TEXT NOT NULL DEFAULT 'password',
+    password_enc       BYTEA,
+    private_key_enc    BYTEA,
+    key_passphrase_enc BYTEA,
+    -- online/offline/unknown/busy/maintenance
+    status             TEXT NOT NULL DEFAULT 'unknown',
+    -- 系统信息(录入测活时经 SSH 采集)
+    os_name            TEXT NOT NULL DEFAULT '',
+    os_version         TEXT NOT NULL DEFAULT '',
+    kernel             TEXT NOT NULL DEFAULT '',
+    arch               TEXT NOT NULL DEFAULT '',
+    cpu_cores          INT NOT NULL DEFAULT 0,
+    memory_mb          INT NOT NULL DEFAULT 0,
+    disk_gb            INT NOT NULL DEFAULT 0,
+    region             TEXT NOT NULL DEFAULT '',
+    -- manual(手动录入)/ cloud(云 API 开通,二期)
+    provider           TEXT NOT NULL DEFAULT 'manual',
+    tags               JSONB NOT NULL DEFAULT '[]',
+    -- 该机器上平台工作区的根目录(每任务一个子目录,SSH 执行固定 cd 进去)
+    workspace_base     TEXT NOT NULL DEFAULT '/root/.artex-ws',
+    -- 当前指派(冗余列,配合下面的部分唯一索引保证一台机器同一时刻最多被一个任务占用)
+    assigned_task_id   BIGINT,
+    last_error         TEXT NOT NULL DEFAULT '',
+    last_check_at      TIMESTAMPTZ,
+    last_online_at     TIMESTAMPTZ,
+    notes              TEXT NOT NULL DEFAULT '',
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (auth_type IN ('password','key')),
+    CHECK (status IN ('online','offline','unknown','busy','maintenance')),
+    CHECK (provider IN ('manual','cloud'))
+);
+-- 一台机器同一时刻只能被一个任务占用。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_vps_machines_active_task
+    ON vps_machines(assigned_task_id) WHERE assigned_task_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_vps_machines_status ON vps_machines(status);
+DROP TRIGGER IF EXISTS trg_vps_machines_upd ON vps_machines;
+CREATE TRIGGER trg_vps_machines_upd BEFORE UPDATE ON vps_machines
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- 指派历史:谁(哪个任务)在什么时间用了哪台机器、何时因何释放。
+CREATE TABLE IF NOT EXISTS vps_assignments (
+    id             BIGSERIAL PRIMARY KEY,
+    machine_id     BIGINT NOT NULL,
+    task_id        BIGINT NOT NULL,
+    assigned_by    TEXT NOT NULL DEFAULT 'manual',
+    assigned_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    released_at    TIMESTAMPTZ,
+    -- manual(手动解绑)/ task_end(任务终态自动释放)
+    release_reason TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_vps_assignments_task ON vps_assignments(task_id);
+CREATE INDEX IF NOT EXISTS idx_vps_assignments_machine ON vps_assignments(machine_id);
+
+-- 执行流水:每一次经平台在该机器上跑过的命令。终端交互命令按整段会话记一条。
+-- 完整输出落 <BaseDir>/vps/outputs/<id>.txt,表内只留预览与大小(命令输出可能很大)。
+CREATE TABLE IF NOT EXISTS vps_executions (
+    id           BIGSERIAL PRIMARY KEY,
+    machine_id   BIGINT NOT NULL,
+    task_id      BIGINT,
+    -- agent(worker 工具执行)/ terminal(Web 终端整段会话)/ toolset(工具集脚本)/ manual(单命令试跑)/ detect(系统/工具探测)
+    source       TEXT NOT NULL DEFAULT 'manual',
+    toolset_id   BIGINT,
+    command      TEXT NOT NULL,
+    exit_code    INT,
+    duration_ms  INT NOT NULL DEFAULT 0,
+    output_size  INT NOT NULL DEFAULT 0,
+    output_path  TEXT NOT NULL DEFAULT '',
+    error        TEXT NOT NULL DEFAULT '',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (source IN ('agent','terminal','toolset','manual','detect'))
+);
+CREATE INDEX IF NOT EXISTS idx_vps_exec_machine_time ON vps_executions(machine_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_vps_exec_task ON vps_executions(task_id) WHERE task_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_vps_exec_created ON vps_executions(created_at DESC);
+
+-- 工具集:初始化脚本模板(一键给机器装渗透工具)。builtin 种子在 Go 侧幂等播种
+-- (同 promptcatalog/toolcatalog 惯例),不在这里 INSERT。
+CREATE TABLE IF NOT EXISTS vps_toolsets (
+    id          BIGSERIAL PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,
+    description TEXT NOT NULL DEFAULT '',
+    script      TEXT NOT NULL,
+    builtin     BOOLEAN NOT NULL DEFAULT false,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+DROP TRIGGER IF EXISTS trg_vps_toolsets_upd ON vps_toolsets;
+CREATE TRIGGER trg_vps_toolsets_upd BEFORE UPDATE ON vps_toolsets
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- 工具检测:每台机器 × 每个已知工具的最新探测结果(工具检测页的 ✓/✗/版本矩阵)。
+CREATE TABLE IF NOT EXISTS vps_tool_detections (
+    machine_id  BIGINT NOT NULL,
+    tool_name   TEXT NOT NULL,
+    installed   BOOLEAN NOT NULL DEFAULT false,
+    version     TEXT NOT NULL DEFAULT '',
+    detected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (machine_id, tool_name)
+);

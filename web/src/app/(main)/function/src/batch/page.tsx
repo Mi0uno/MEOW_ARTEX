@@ -21,6 +21,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { ProxyEgressSelect, proxyGroupIdForSubmit, type ProxyEgressValue } from "@/components/proxy-egress-select";
 import { api, http } from "@/lib/api";
 import type { SRCPlatform, SRCTarget, Task } from "@/lib/types";
 
@@ -45,8 +46,11 @@ function keyOf(platformId: number, targetId: number): string {
  * 不走 api.createTask 是因为它的入参类型还没有这两个字段(本任务由主 agent 统一补 api.ts)。
  * 字段名与其余默认值照抄 api.createTask 的实现,保证与其它建任务入口行为一致——
  * 尤其 src_mode 必须为 true,否则后端不会注入平台规范与授权范围约束。
+ *
+ * 出网方式由调用方传入:批量建任务同样要给「走代理池」这个选项,否则只能拿到
+ * 跟随全局,SRC 场景下(公网靶标、需隐藏来源)用户就没有选择权。
  */
-function createSRCTask(platform: SRCPlatform, target: SRCTarget): Promise<Task> {
+function createSRCTask(platform: SRCPlatform, target: SRCTarget, egress: ProxyEgressValue): Promise<Task> {
   return http<Task>("/tasks", {
     method: "POST",
     body: JSON.stringify({
@@ -66,8 +70,8 @@ function createSRCTask(platform: SRCPlatform, target: SRCTarget): Promise<Task> 
       src_mode: true,
       src_platform_id: platform.id,
       src_target_id: target.id,
-      proxy_mode: "",
-      proxy_group_id: 0,
+      proxy_mode: egress.mode,
+      proxy_group_id: proxyGroupIdForSubmit(egress),
       guard_mode: "",
       guard_rule_ids: [],
     }),
@@ -83,6 +87,8 @@ export default function SRCBatchPage() {
   const [selected, setSelected] = React.useState<Set<string>>(new Set());
   const [collapsed, setCollapsed] = React.useState<Set<number>>(new Set());
   const [creating, setCreating] = React.useState(false);
+  // 出网方式:批量建的每条任务都用这一套设置(逐条设不现实,一次勾几十个目标)。
+  const [egress, setEgress] = React.useState<ProxyEgressValue>({ mode: "", groupId: 0 });
 
   const load = React.useCallback(async () => {
     setLoading(true);
@@ -178,7 +184,7 @@ export default function SRCBatchPage() {
     const failed: string[] = [];
     for (const { platform, target } of pairs) {
       try {
-        const t = await createSRCTask(platform, target);
+        const t = await createSRCTask(platform, target, egress);
         created.push(t.id);
       } catch (e) {
         failed.push(`${platform.name} / ${target.name}(${(e as Error).message})`);
@@ -253,6 +259,17 @@ export default function SRCBatchPage() {
               {applied ? `命中 ${filtered.length} / ` : ""}
               {groups.length} 个平台 · {totalTargets} 个目标 · 已选 {selected.size}
             </span>
+          </div>
+
+          {/* 出网方式:批量建的每条任务共用这一套。放在列表之前——先定出口再挑目标,
+              用户勾选时就知道这批任务会从哪出网。 */}
+          <div className="mx-4 mb-3 max-w-md rounded-lg border p-3 lg:mx-6">
+            <ProxyEgressSelect
+              mode={egress.mode}
+              groupId={egress.groupId}
+              onChange={setEgress}
+              disabled={creating}
+            />
           </div>
 
           {loading ? (

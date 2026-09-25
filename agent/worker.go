@@ -85,7 +85,30 @@ type Worker struct {
 	// maxTokensFn resolves the per-reply output cap in tokens, on the same
 	// per-run basis. nil or 0 = send no cap and let the endpoint decide.
 	maxTokensFn func() int
+	// vpsContextFn resolves the per-run remote-execution context (VPS integration):
+	// when it returns a context, the SDK default Bash is replaced by the host's
+	// SSH-backed one and the system prompt carries the machine profile. Read once
+	// per run (like nonStreaming), so an assignment made after the agent bundle
+	// was built takes effect on the next intent without rebuilding. nil = local
+	// execution (unchanged behavior).
+	vpsContextFn func(taskID int64) *VPSRunContext
 }
+
+// VPSRunContext is the per-run remote-execution environment a host hands the
+// worker when the task has an assigned VPS machine. Bash is swapped by NAME
+// (same name/schema/description as the SDK default — the LLM's view is
+// unchanged, only execution moves), while the file tools (Read/Write/…) keep
+// their SDK local implementations: they operate on the local workspace.
+type VPSRunContext struct {
+	Bash        actool.CoreTool // SSH-backed Bash replacement (identical model-facing surface)
+	SystemBlock string          // machine-profile block appended to the system prompt (may be empty)
+}
+
+// SetVPSContext wires a resolver deciding whether this run executes on a remote
+// VPS. Resolved once per run at execute() — not per tool call — so late
+// assignments apply from the next intent on, and the whole run stays on one
+// machine. nil resolver or nil result = local execution (unchanged behavior).
+func (w *Worker) SetVPSContext(fn func(taskID int64) *VPSRunContext) { w.vpsContextFn = fn }
 
 // WorkerSessionID returns the stable transcript key used by a worker intent.
 // Worker slots are reusable, so the intent id (rather than work#N) is the
@@ -373,10 +396,25 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// base = built-in worker tools ∪ host tools (traffic) ∪ default tools (incl. Bash);
 	// then augment with the agent's visible skills/MCP. During the SDK settlement
 	// phase, Bash is hidden via Settlement.DisabledTools (no local gating needed).
+	// 任务指派了 VPS 时(每 run 解析一次):SDK 本机 Bash 按名字换成宿主提供的 SSH 版
+	// (同名同 schema,LLM 视角不变),文件工具保持本机不动。
+	var vps *VPSRunContext
+	if w.vpsContextFn != nil {
+		vps = w.vpsContextFn(taskID)
+	}
 	base := append(tsx.WorkerTools(), w.extraTools...)
 	// worker 刻意不给 MultiEdit/Glob/Grep：文件精改用 Edit、检索走 Bash(grep/find)，
 	// 收敛工具面、减少低价值调用。其余 SDK 默认工具(Read/Write/Edit/LS/Bash/Sleep)照常。
-	base = append(base, defaultToolsExcept("MultiEdit", "Glob", "Grep")...)
+	sdkTools := defaultToolsExcept("MultiEdit", "Glob", "Grep")
+	if vps != nil && vps.Bash != nil {
+		for i, t := range sdkTools {
+			if t.Name() == vps.Bash.Name() {
+				sdkTools[i] = vps.Bash
+				break
+			}
+		}
+	}
+	base = append(base, sdkTools...)
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts), IntentID: intent.ID})
 	tools, def, cleanup := AugmentTools(ctx, "worker", base)
 	defer cleanup()
@@ -396,6 +434,9 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	sysBody := workerSystem(w.proxyAddr, w.proxyCACert, w.workDir, runDir)
 	if w.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,worker 执行时严格遵守
+	}
+	if vps != nil {
+		sysBody += vps.SystemBlock // 远程执行环境:机器档案 + Bash 走 SSH 的使用规约(与约束注入同一层追加)
 	}
 	// 意图块 → 意图锚定资产块 → 启动指令，依次追加到 system 尾部（与 constraintBlock 同一套追加法）。
 	sysBody += renderIntentTask(intent)

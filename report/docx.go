@@ -8,6 +8,8 @@ import (
 	"io"
 	"regexp"
 	"strings"
+
+	"github.com/beevik/etree"
 )
 
 // ---- docx 解析:把 word/document.xml 还原为归一 markdown + 章节结构 ----
@@ -44,28 +46,45 @@ func ParseDocxReader(r io.Reader) (markdown string, structure TemplateStructure,
 	if err != nil {
 		return "", structure, fmt.Errorf("不是有效的 docx(zip) 文件: %w", err)
 	}
-	var docFile *zip.File
+	var docFile, stylesFile *zip.File
 	for _, f := range zr.File {
-		if f.Name == "word/document.xml" {
+		switch f.Name {
+		case "word/document.xml":
 			docFile = f
-			break
+		case "word/styles.xml":
+			stylesFile = f
 		}
 	}
 	if docFile == nil {
 		return "", structure, fmt.Errorf("docx 缺少 word/document.xml")
+	}
+	// 一并解析 styles.xml 建 styleId→样式名映射:真实模板的标题样式是数字
+	// styleId(如 31/32)+ 中文样式名「标题 N（奇安信）」,只有经映射才能定性,
+	// 只认英文 HeadingN 会全部漏判。
+	styles := docxStyleMap{}
+	if stylesFile != nil {
+		rc, err := stylesFile.Open()
+		if err == nil {
+			sdata, rerr := io.ReadAll(rc)
+			rc.Close()
+			if rerr == nil {
+				styles = parseStylesXML(sdata)
+			}
+		}
 	}
 	rc, err := docFile.Open()
 	if err != nil {
 		return "", structure, err
 	}
 	defer rc.Close()
-	return parseDocumentXML(rc)
+	return parseDocumentXML(rc, styles)
 }
 
 // docxState 是 document.xml 的流式解析状态。
 type docxState struct {
 	md        strings.Builder
 	structure TemplateStructure
+	styles    docxStyleMap // styleId→样式名映射(来自 styles.xml,可空)
 
 	// 段落级
 	inP       bool
@@ -127,7 +146,7 @@ func (s *docxState) emitPara(text, style string, outline int, allBold bool) {
 		s.structure.Headings = append(s.structure.Headings, TemplateHeading{Level: outline + 1, Title: text})
 		return
 	}
-	if n, ok := headingFromStyle(style); ok {
+	if n, ok := headingFromStyle(style, s.styles); ok {
 		s.md.WriteString(strings.Repeat("#", n) + " " + text + "\n\n")
 		s.structure.Headings = append(s.structure.Headings, TemplateHeading{Level: n, Title: text})
 		return
@@ -184,8 +203,10 @@ func (s *docxState) flushTable() {
 }
 
 // parseDocumentXML 流式读 document.xml 并组装 markdown。
-func parseDocumentXML(r io.Reader) (string, TemplateStructure, error) {
-	s := &docxState{outline: -1}
+// styles 为 styleId→样式名映射(可为 nil):数字 pStyle id 需经它解析成样式名
+// 后才能按「标题 N」判定标题级别。
+func parseDocumentXML(r io.Reader, styles docxStyleMap) (string, TemplateStructure, error) {
+	s := &docxState{outline: -1, styles: styles}
 	dec := xml.NewDecoder(r)
 	for {
 		tok, err := dec.Token()
@@ -301,15 +322,132 @@ func parseDocumentXML(r io.Reader) (string, TemplateStructure, error) {
 	return out + "\n", s.structure, nil
 }
 
-// headingFromStyle 从样式 id 推断标题级别:Heading1-6(各语言 Word 的内置标题样式 id 均含 HeadingN)。
-var headingStyleRe = regexp.MustCompile(`(?i)^heading\s*([1-6])$`)
-
-func headingFromStyle(style string) (int, bool) {
+// headingFromStyle 从段落样式推断标题级别,两级判定:
+//  1. 样式 id 本身含 HeadingN(英文内置样式 id 直认,兼容无 styles.xml 的裸文档);
+//  2. 数字 styleId(如 31/32)经 styles.xml 映射成样式名——名字含「标题 N」/「heading N」
+//     (不区分大小写,中英都认,全角括号说明如「标题 1（奇安信）」忽略后缀)→ level=N。
+//
+// 字符样式(w:type="character")不参与标题判定。outlineLvl 与加粗启发式由调用方
+// 保持原有优先级。
+func headingFromStyle(style string, styles docxStyleMap) (int, bool) {
 	if style == "" {
 		return 0, false
 	}
 	if m := headingStyleRe.FindStringSubmatch(strings.TrimSpace(style)); m != nil {
-		return int(m[1][0] - '0'), true
+		return int(m[1][len(m[1])-1] - '0'), true
+	}
+	if styles != nil {
+		if info, ok := styles[style]; ok && info.isParagraph() {
+			return headingLevelFromName(info.name)
+		}
 	}
 	return 0, false
+}
+
+// docxStyleInfo 是 styles.xml 中一个样式的定性信息。
+type docxStyleInfo struct {
+	name      string // w:name 样式名
+	styleType string // w:type(paragraph/character/table/numbering)
+}
+
+func (i docxStyleInfo) isParagraph() bool { return i.styleType == "paragraph" }
+
+// docxStyleMap 是 styleId → 样式信息的映射。
+type docxStyleMap map[string]docxStyleInfo
+
+// parseStylesXML 解析 styles.xml 建 styleId→样式名映射(解析失败返回空映射,
+// 不阻断文档解析)。注意样式名不一定紧跟在 w:style 开标签后,须遍历子元素取 w:name。
+func parseStylesXML(data []byte) docxStyleMap {
+	m := docxStyleMap{}
+	if len(data) == 0 {
+		return m
+	}
+	doc := etree.NewDocument()
+	if err := doc.ReadFromBytes(data); err != nil {
+		return m
+	}
+	root := doc.Root()
+	if root == nil {
+		return m
+	}
+	for _, st := range root.ChildElements() {
+		if st.Tag != "style" {
+			continue
+		}
+		id, name, typ := "", "", ""
+		for _, a := range st.Attr {
+			switch a.Key {
+			case "styleId":
+				id = a.Value
+			case "type":
+				typ = a.Value
+			}
+		}
+		for _, ch := range st.ChildElements() {
+			if ch.Tag == "name" {
+				name = styleAttrVal(ch, "val")
+				break
+			}
+		}
+		if id != "" {
+			m[id] = docxStyleInfo{name: name, styleType: typ}
+		}
+	}
+	return m
+}
+
+// styleAttrVal 取元素属性值(按 key 匹配,兼容带/不带命名空间前缀两种存放形态)。
+func styleAttrVal(el *etree.Element, key string) string {
+	for _, a := range el.Attr {
+		if a.Key == key {
+			return a.Value
+		}
+	}
+	return ""
+}
+
+// headingLevelFromName 从样式名判定标题级别:名字含「标题 N」/「heading N」
+// (不区分大小写;「标题 2(self)」「标题 1（奇安信）」等后缀忽略)→ N。
+func headingLevelFromName(name string) (int, bool) {
+	if name == "" {
+		return 0, false
+	}
+	m := headingNameRe.FindStringSubmatch(foldFullwidth(name))
+	if m == nil {
+		return 0, false
+	}
+	n := 0
+	for _, r := range m[1] {
+		n = n*10 + int(r-'0')
+	}
+	if n <= 0 {
+		n = 1 // 「标题 0」视作一级
+	}
+	if n > 9 {
+		n = 9
+	}
+	return n, true
+}
+
+// headingStyleRe 兜底匹配样式 id 本身含 HeadingN 的写法(英文内置样式 id 直认,
+// 覆盖无 styles.xml 的裸文档;数字 styleId 走 styles.xml 名字映射)。
+var headingStyleRe = regexp.MustCompile(`(?i)^heading\s*([1-6])$`)
+
+// headingNameRe 匹配样式名中的标题级别:「标题 1」「标题2」「heading 3」「Heading 3」。
+// 只匹配「标题/heading + 数字」,避免「封皮主标题」这类仅含「标题」字样的样式误判。
+var headingNameRe = regexp.MustCompile(`(?i)(?:heading|标题)\s*([0-9]+)`)
+
+// foldFullwidth 把全角 ASCII 区(U+FF01–U+FF5E)折为半角、全角空格折为半角空格。
+// 样式名/匹配文本里可能混用全角数字或全角括号,折叠后统一按半角处理。
+func foldFullwidth(s string) string {
+	rs := []rune(s)
+	for i, r := range rs {
+		switch {
+		case r >= 0xFF01 && r <= 0xFF5E:
+			rs[i] = r - 0xFEE0
+		case r == 0x3000:
+			rs[i] = ' '
+		}
+	}
+	return string(rs)
 }

@@ -171,13 +171,24 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	// 代理中心:本地代理池监听器 + 源站拉取 + 自动测活。恢复上次的出网模式,
 	// 并把出网地址接进 Manager.ProxyAddr(裸网 ⇄ 代理池的切换落点)。
 	s.initProxyCenter()
+	// VPS 中心:机器池/终端/工具集/流水。播种内置工具集 + 开机对账 + 测活循环。
+	s.initVPS()
 	// report_finding 登记后的联动:漏洞库自动归类 + SRC 成果自动创建。
 	s.wireFindingHooks()
-	// 任务进入终态时自动归档总结报告到报告中心(异步,不阻塞状态写入)。
-	// 识别/信息搜集任务由 autoArchiveTaskReport 内部按 stage 跳过。
+	// 任务进入终态时触发收尾副作用(异步,不阻塞状态写入)。回调链是组合的,不得
+	// 互相覆盖:先释放任务占用的 VPS 机器(快,幂等;契约 §6 task_end),再做报告
+	// 自动归档(重)。识别/信息搜集任务由 autoArchiveTaskReport 内部按 stage 跳过。
+	// 终态集合 = done/failed/timeout(IsTerminal;取消的任务也以这两态落终态),
+	// paused 不触发——会话可恢复。
 	m.SetTaskTerminalHook(func(taskID int64) {
-		go s.autoArchiveTaskReport(taskID)
+		go func() {
+			releaseTaskVPSOnTerminal(taskID)
+			s.autoArchiveTaskReport(taskID)
+		}()
 	})
+	// 报告生成作业的路由层需要 Server 引用(POST /export-ai 等建任务入口);
+	// New 里无条件绑定,消除「启动后未跑过任何报告任务就发导出请求」的时序缺口。
+	bindReportRouteServer(s)
 	if box, err := newAPISecretBox(m.dir); err != nil {
 		log.Printf("[external-apis] 凭据加密盒初始化失败: %v", err)
 	} else {
@@ -255,6 +266,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		seedPrompts(m.pg)          // 内置 agent 默认提示词正文播种进 agent_prompts(仅空时)
 		s.seedOrchestrationTools() // P2 跨任务编排工具 seed 进 tools 表(可按 agent 绑定)
 		s.seedSRCOperatorTools()   // SRC 专属 agent 工具:seed 进 tools 表 + 注册执行实例(src_operator/pentest/worker)
+		s.seedReportWriterTools()  // 报告中心专属 agent 工具:seed 进 tools 表 + 注册执行实例(report_writer)
 		if err := s.seedFindingRetester(); err != nil {
 			log.Printf("[retester] seed: %v", err)
 		}
@@ -282,6 +294,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	} else {
 		log.Printf("[engine] no LLM provider configured — engine idle until set via /api/llm or env")
 	}
+	// 存量报告生成任务(AI 导出/AI 润写)的企业归属回填:纯 SQL 补缺失行,幂等。
+	// 必须在 restoreTaskRuntimes(任务水合 CompanyIDs)之前跑,回补的归属当次启动即可见。
+	s.backfillReportPipelineScope()
 	s.restoreTaskRuntimes()
 	// 报告中心自动汇聚的历史回填:必须在任务加载进内存之后——任务总结报告经
 	// renderTaskReport 渲染,而它走内存任务句柄(store/资产快照)。一次性 flag 守卫。
@@ -332,8 +347,13 @@ func (s *Server) restoreTaskRuntimes() {
 				continue
 			}
 			if t.Stage == "report" {
-				// 重启后续跑 AI 识别任务(草稿完成时整体覆盖写入,天然幂等)。
-				s.launchTemplateTask(t)
+				// 重启后续跑报告流水线(模板识别/AI 报告撰写/AI 按模板导出,
+				// 产出均为整体覆盖写入,天然幂等)。
+				if t.StepKey == "template_analyze" {
+					s.launchTemplateTask(t)
+				} else {
+					s.launchReportPipelineTask(t)
+				}
 				continue
 			}
 			s.engine.Run(s.ctx, t)
@@ -881,6 +901,10 @@ func (s *Server) Handler() http.Handler {
 	s.registerFindingTraffic(mux)
 	// ---- 代理中心 ----
 	s.registerProxyRoutes(mux)
+	// ---- VPS 中心 ----
+	s.registerVPSRoutes(mux)
+	// 任务 ↔ VPS 指派(契约 §6):指派/释放/执行环境。
+	s.registerTaskVPSRoutes(mux)
 	mux.HandleFunc("GET /api/exploration/findings/{id}", s.getFinding)
 	mux.HandleFunc("GET /api/exploration/findings/{id}/lineage", s.findingLineage)
 	mux.HandleFunc("POST /api/exploration/findings/{id}/deepen", s.deepenFinding)
@@ -939,6 +963,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/report-templates/{id}", s.updateReportTemplate)
 	mux.HandleFunc("DELETE /api/report-templates/{id}", s.deleteReportTemplate)
 	mux.HandleFunc("POST /api/report-templates/{id}/analyze", s.analyzeReportTemplate)
+	registerReportExportRoutes(mux) // 报告生成作业:AI 按模板导出 / 作业进度与产物下载
 	mux.HandleFunc("GET /api/chat/mentions", s.searchChatMentions)
 	mux.HandleFunc("POST /api/chat", s.chat)
 	mux.HandleFunc("POST /api/chat/upload", s.chatUpload) // 方式1 文件上传:落到会话/任务工作目录 uploads/
@@ -1328,13 +1353,14 @@ func (s *Server) control(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, "信息搜集任务不支持暂停/恢复;运行中可重发 pause 停止,终态后可重跑")
 		return
 	}
-	// AI 识别任务:同流水线语义,pause=取消本次识别(模板行落 failed,可重新发起)。
+	// 报告流水线任务(模板识别/AI 报告撰写/AI 按模板导出):pause=取消本次生成
+	// (作业落 failed 可重发);step_key 分流到对应 runner 的取消口。
 	if t.Stage == "report" {
-		if req.Action == "pause" && s.stopTemplateTask(t) {
+		if req.Action == "pause" && (s.stopTemplateTask(t) || s.stopReportPipelineTask(t)) {
 			writeJSON(w, 200, map[string]any{"id": t.ID, "stopping": true})
 			return
 		}
-		writeErr(w, 409, "识别任务不支持暂停/恢复;运行中可重发 pause 停止")
+		writeErr(w, 409, "报告生成任务不支持暂停/恢复;运行中可重发 pause 停止")
 		return
 	}
 	result, err := s.applyTaskControl(t, req.Action)
@@ -1685,6 +1711,10 @@ type createTaskReq struct {
 	// guard_rule_ids 非空=本任务只用这些规则;空/省略=用全部已启用规则。
 	GuardMode    string  `json:"guard_mode,omitempty"`
 	GuardRuleIDs []int64 `json:"guard_rule_ids,omitempty"`
+	// VPS 执行环境(创建即指派):vps_machine_id>0=指定机器;vps_auto=true=自动挑
+	// 空闲在线机。指派发生在任务进入 running 之前;失败不阻断建任务(本机模式 + warning)。
+	VPSMachineID int64 `json:"vps_machine_id,omitempty"`
+	VPSAuto      bool  `json:"vps_auto,omitempty"`
 }
 
 func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
@@ -1797,6 +1827,8 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		ProxyMode: req.ProxyMode, ProxyGroupID: req.ProxyGroupID,
 		// 监管门限(任务级覆盖):同上,建任务时就定下来,拦截链路按 taskID 解析。
 		GuardMode: req.GuardMode, GuardRuleIDs: req.GuardRuleIDs,
+		// VPS 执行环境(创建即指派):指派在 CreateTaskWithOptions 内、任务启动前完成。
+		VPSMachineID: req.VPSMachineID, VPSAuto: req.VPSAuto,
 	})
 	if err != nil {
 		if errors.Is(err, db.ErrTaskCategoryInvalid) || errors.Is(err, db.ErrTaskCategoryNotFound) {
@@ -1829,7 +1861,7 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	// 共享的建后流程(seed + 种子意图 + 后台目标分解 + engine.Run),与 spawn_task 复用同一段。
 	// launchTask 内部异步,不阻塞 UI —— 目标分解在后台可见地进行。
 	s.launchTask(t, req.Description+" "+req.Goal, req.SeedFirstIntent != nil && *req.SeedFirstIntent)
-	writeJSON(w, 201, s.withProxyEgress(taskDTO(t, s.resolvedTaskStatus(t))))
+	writeJSON(w, 201, s.withProxyEgress(s.withVPSMachine(taskDTO(t, s.resolvedTaskStatus(t)))))
 }
 
 func (s *Server) validateTaskProfileIDs(ids []int64) error {
@@ -2029,7 +2061,7 @@ func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "task not found")
 		return
 	}
-	dto := s.withProxyEgress(taskDTO(t, s.resolvedTaskStatus(t)))
+	dto := s.withVPSMachine(s.withProxyEgress(taskDTO(t, s.resolvedTaskStatus(t))))
 	archiveBlockers, _ := s.m.PG().TaskArchiveBlockers()
 	applyTaskArchiveBlocker(&dto, archiveBlockers)
 	writeJSON(w, 200, dto)

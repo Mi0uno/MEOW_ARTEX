@@ -43,6 +43,7 @@ func (s *Server) hostTools() ([]actool.CoreTool, map[string][]string) {
 	tools = append(tools, s.platformTools()...)   // 平台操作工具(建改 skill/工具/MCP，给 Auto 用)
 	tools = append(tools, s.reconQueryTools()...) // 信息搜集 AI 查询工具(fofa_search/hunter_search, stage=recon)
 	tools = append(tools, s.reportTools()...)     // 报告工具(archive_task_report → 报告中心)
+	tools = append(tools, s.vpsAgentTools()...)   // VPS agent 工具(vps_machine_info/vps_install_toolset, 绑 worker)
 	custom, err := s.customTools()
 	if err != nil {
 		log.Printf("[custom-tool] 加载失败: %v", err)
@@ -519,6 +520,7 @@ func (s *Server) seedOrchestrationTools() {
 	s.upgradeReporterTriggerMessage() // 老库补迁移:让 reporter 回传 evidence_version(一次性)
 	s.seedFindingTrafficTools()       // 增加可选证据参数及只读证据工具，保留用户配置
 	s.seedFindingWorkflowTools()
+	s.seedVPSAgentTools() // VPS agent 工具(vps_machine_info/vps_install_toolset) seed 进 tools 表,默认绑 worker
 	// 注：报告回填不在这里——它需要任务已加载进内存(renderTaskReport 走内存句柄),
 	// 见 server.go 的 restoreTaskRuntimes() 之后。
 	// 注：pentest 的默认工具绑定无需迁移——BuiltinToolSeeds 在全新初始化时就把

@@ -73,6 +73,16 @@ import type {
   PromptVar,
   PromptVersion,
   ProxyCheckRun,
+  TaskVpsEnvironment,
+  VpsAssignment,
+  VpsDashboard,
+  VpsExecResult,
+  VpsExecution,
+  VpsMachine,
+  VpsMachineDetail,
+  VpsMachineInput,
+  VpsToolDetection,
+  VpsToolset,
   ProxyCountryStat,
   ProxyEgressStatus,
   ProxyEntry,
@@ -90,6 +100,7 @@ import type {
   ReportCompanyCount,
   ReportDetail,
   ReportEvent,
+  ReportJob,
   ReportSummary,
   ReportTemplate,
   SessionTokenUsage,
@@ -226,13 +237,41 @@ function mockReport(_task?: string): string {
 > （demo）本报告由 mock 数据生成，仅用于界面演示。`;
 }
 
+// SSE/WS 直连基址:生产环境静态导出由 Go 后端直接伺服,页面同源即后端(任意端口都对,
+// 曾经写死 :8787 导致 8799 等其它端口部署时终端/SSE 全部连错地方);仅 next dev(:3000)
+// 时后端才在 :8787。可用 NEXT_PUBLIC_SSE_BASE 强制覆盖(置 "" = 同源)。
+function streamBase(): string {
+  const env = process.env.NEXT_PUBLIC_SSE_BASE;
+  if (env !== undefined) return env;
+  if (typeof window === "undefined") return "";
+  if (window.location.port === "3000") {
+    return `${window.location.protocol}//${window.location.hostname}:8787`;
+  }
+  return window.location.origin;
+}
+
 export function sseUrl(path: string): string {
-  const base =
-    process.env.NEXT_PUBLIC_SSE_BASE ??
-    (typeof window !== "undefined" ? `${window.location.protocol}//${window.location.hostname}:8787` : "");
+  const base = streamBase();
   const token = getToken();
   const sep = path.includes("?") ? "&" : "?";
   return token ? `${base}${path}${sep}token=${encodeURIComponent(token)}` : `${base}${path}`;
+}
+
+// wsUrl 与 sseUrl 同源直连 Go 后端(Next 代理不支持 WebSocket 升级),用于 Web 终端等
+// 双向流。token 同样走 ?token=。
+export function wsUrl(path: string): string {
+  const base = streamBase();
+  let wsBase: string;
+  if (base === "") {
+    // WebSocket 不能用相对地址,同源时显式拼 ws(s)://host。
+    if (typeof window === "undefined") return path;
+    wsBase = `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}`;
+  } else {
+    wsBase = base.replace(/^http/, "ws");
+  }
+  const token = getToken();
+  const sep = path.includes("?") ? "&" : "?";
+  return token ? `${wsBase}${path}${sep}token=${encodeURIComponent(token)}` : `${wsBase}${path}`;
 }
 
 const get = <T>(p: string) => http<T>(p);
@@ -326,6 +365,8 @@ export const api = {
     proxyGroupId?: number; // 仅 pool 时有效:指定代理组;0/缺省=用全局选中的组
     guardMode?: string; // 监管门限:""=跟随全局 / "off"=本任务不跑监管 / "enforce"=强制启用
     guardRuleIds?: number[]; // 仅本任务启用这些拦截规则;空=用全部已启用规则
+    vpsMachineId?: number; // 执行环境:指定机器 id(创建即指派,发生在任务启动之前)
+    vpsAuto?: boolean; // 执行环境:true=自动分配一台空闲在线机器(vps_machine_id 为空时生效)
     stepKey?: string; // recon 单步骤:收集器 key(推荐)
     stepConfig?: Record<string, unknown>; // 步骤配置
     pipeline?: ReconPipeline; // 兼容旧多步编排;stepKey 优先
@@ -350,6 +391,8 @@ export const api = {
       proxy_group_id: input.proxyGroupId ?? 0,
       guard_mode: input.guardMode ?? "",
       guard_rule_ids: input.guardRuleIds ?? [],
+      vps_machine_id: input.vpsMachineId ?? 0,
+      vps_auto: input.vpsAuto ?? false,
       step_key: input.stepKey,
       step_config: input.stepConfig,
       pipeline: input.pipeline,
@@ -1305,7 +1348,7 @@ export const api = {
       headers: token ? { Authorization: `Bearer ${token}` } : undefined,
     });
   },
-  updateReportTemplate: (id: number, patch: { name?: string; category?: string; content?: string }) =>
+  updateReportTemplate: (id: number, patch: { name?: string; category?: string; content?: string; export_prompt?: string }) =>
     put<{ ok: boolean }>(`/report-templates/${id}`, patch),
   deleteReportTemplate: (id: number) => del<{ deleted: boolean }>(`/report-templates/${id}`),
   // AI 占位模板识别(异步任务化):202 立即返回监看任务/会话 id,生成在服务端跑,
@@ -1340,6 +1383,34 @@ export const api = {
     post<{ id: number; created: boolean }>("/reports/generate", { source: "task", task_id: taskId }),
   generateFindingReport: (findingId: number) =>
     post<{ id: number; created: boolean }>("/reports/generate", { source: "finding", finding_id: findingId }),
+  // ---- 报告生成作业(AI 按模板导出 / 任务报告 AI 撰写) ----
+  // AI 按模板导出(异步):服务端建 stage='report' 任务 + 报告 agent 监看会话,
+  // 按模板与导出写作指令分章生成正文后渲染成品;进度用 reportJob(jobId) 轮询。
+  exportReportAI: (id: number, input: { templateId: number; format: "md" | "docx"; profileId?: number }) =>
+    post<{ job_id: number; task_id: number; conv_id: number }>(`/reports/${id}/export-ai`, {
+      template_id: input.templateId,
+      format: input.format,
+      profile_id: input.profileId ?? 0,
+    }),
+  // 报告的生成作业历史(新者在前)。
+  reportJobs: (id: number) => get<{ jobs: ReportJob[] }>(`/reports/${id}/jobs`).then((r) => arr(r.jobs)),
+  // 单条作业进度(轮询用):status running→done/failed。
+  reportJob: (jobId: number) => get<{ job: ReportJob }>(`/report-jobs/${jobId}`).then((r) => r.job),
+  // 下载作业产物(done 状态)并触发浏览器保存。
+  reportJobDownload: async (jobId: number) => {
+    const token = getToken();
+    const url = "/api/report-jobs/" + encodeURIComponent(String(jobId)) + "/download";
+    const r = await fetch(url, { headers: token ? { Authorization: `Bearer ${token}` } : undefined });
+    if (!r.ok) throw new Error(`下载失败:${r.status}`);
+    const blob = await r.blob();
+    const cd = r.headers.get("Content-Disposition") ?? "";
+    const m = cd.match(/filename\*=UTF-8''([^;]+)/);
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = m ? decodeURIComponent(m[1]) : `report-job-${jobId}`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  },
   // ---- 决策引擎(AI管理·Decision 配置;监管&规则·AI监管 编排) ----
   decisionEngines: () => get<{ engines: DecisionEngine[] }>("/decision/engines").then((r) => arr(r.engines)),
   updateDecisionEngine: (
@@ -1981,4 +2052,117 @@ export const api = {
       `/proxy/groups/${groupId}/geo`,
       { limit },
     ),
+
+  // ============================================================
+  // VPS 中心:任务级执行环境
+  // ============================================================
+  // 仪表盘:总览 + 执行量序列 + 占用机器 + 最近流水(一条请求取齐,仿 proxyDashboard)。
+  vpsDashboard: (windowHours = 24) =>
+    get<VpsDashboard>(`/vps/dashboard?window_h=${windowHours}`).then((r) => ({
+      summary:
+        r.summary ??
+        {
+          total: 0,
+          online: 0,
+          offline: 0,
+          busy: 0,
+          maintenance: 0,
+          executions_today: 0,
+          active_tasks: 0,
+        },
+      series: arr(r.series),
+      busy_machines: arr(r.busy_machines),
+      recent: arr(r.recent),
+    })),
+  // 机器池(分页 + 筛选)。status/tag/provider 省略 = 全部;total 为当前筛选视图条数。
+  vpsMachines: (input?: {
+    status?: string;
+    provider?: string;
+    tag?: string;
+    q?: string;
+    limit?: number;
+    offset?: number;
+  }) => {
+    const p = new URLSearchParams();
+    if (input?.status) p.set("status", input.status);
+    if (input?.provider) p.set("provider", input.provider);
+    if (input?.tag) p.set("tag", input.tag);
+    if (input?.q) p.set("q", input.q);
+    p.set("limit", String(input?.limit ?? 50));
+    p.set("offset", String(input?.offset ?? 0));
+    return get<{ machines: VpsMachine[]; total: number }>(`/vps/machines?${p.toString()}`).then((r) => ({
+      machines: arr(r.machines),
+      total: r.total,
+    }));
+  },
+  // 录入机器(录入即自动测活 + 系统信息采集,同步返回带初始状态的机器)。
+  createVpsMachine: (input: VpsMachineInput) => post<VpsMachine>("/vps/machines", input),
+  // 编辑机器(凭据字段缺省 = 不改;status 仅维护状态切换走这里)。
+  updateVpsMachine: (id: number, input: Partial<VpsMachineInput>) => put<VpsMachine>(`/vps/machines/${id}`, input),
+  deleteVpsMachine: (id: number) => del<{ deleted: boolean }>(`/vps/machines/${id}`),
+  // 手动测活(同步,几秒内返回;顺带刷新系统信息)。
+  checkVpsMachine: (id: number) => post<VpsMachine>(`/vps/machines/${id}/check`),
+  // 工具检测(同步跑一轮已知工具探测,返回最新矩阵)。
+  detectVpsMachine: (id: number) =>
+    post<{ detections: VpsToolDetection[] }>(`/vps/machines/${id}/detect`).then((r) => ({
+      detections: arr(r.detections),
+    })),
+  vpsMachine: (id: number) => get<VpsMachineDetail>(`/vps/machines/${id}`).then((r) => ({
+    machine: r.machine,
+    detections: arr(r.detections),
+    current_task: r.current_task ?? null,
+  })),
+  // 单命令执行(手动试跑框)。timeout_sec 缺省 = 服务端默认(120s)。
+  vpsExec: (machineId: number, command: string, timeoutSec?: number) =>
+    post<VpsExecResult>(`/vps/exec`, { machine_id: machineId, command, timeout_sec: timeoutSec }),
+  // 执行流水(按机器或任务筛选;machineId/taskId 至少给一个,0 = 不限)。
+  vpsExecutions: (input: { machineId?: number; taskId?: number; source?: string; limit?: number; offset?: number }) => {
+    const p = new URLSearchParams();
+    if (input.machineId) p.set("machine_id", String(input.machineId));
+    if (input.taskId) p.set("task_id", String(input.taskId));
+    if (input.source) p.set("source", input.source);
+    p.set("limit", String(input.limit ?? 50));
+    p.set("offset", String(input.offset ?? 0));
+    return get<{ executions: VpsExecution[]; total: number }>(`/vps/executions?${p.toString()}`).then((r) => ({
+      executions: arr(r.executions),
+      total: r.total,
+    }));
+  },
+  // 某条流水的完整输出(命令输出可能被截断,完整版在这里)。
+  vpsExecutionOutput: (id: number) => httpText(`/vps/executions/${id}/output`),
+  // 指派历史(machineId=0 时按全部机器)。
+  vpsAssignments: (machineId: number, limit = 50) =>
+    get<{ assignments: VpsAssignment[] }>(`/vps/assignments?machine_id=${machineId}&limit=${limit}`).then((r) => ({
+      assignments: arr(r.assignments),
+    })),
+  // Web 终端 WebSocket 地址(wsUrl 直连后端,token 走 query)。
+  vpsTerminalUrl: (machineId: number) => `/api/vps/machines/${machineId}/terminal`,
+
+  // 工具集 CRUD。
+  vpsToolsets: () => get<{ toolsets: VpsToolset[] }>("/vps/toolsets").then((r) => ({ toolsets: arr(r.toolsets) })),
+  createVpsToolset: (input: { name: string; description?: string; script: string }) =>
+    post<VpsToolset>("/vps/toolsets", input),
+  updateVpsToolset: (id: number, input: { name?: string; description?: string; script?: string }) =>
+    put<VpsToolset>(`/vps/toolsets/${id}`, input),
+  deleteVpsToolset: (id: number) => del<{ deleted: boolean }>(`/vps/toolsets/${id}`),
+  // 应用工具集到机器(同步执行脚本,可能耗时较长;结果落执行流水 source=toolset)。
+  applyVpsToolset: (id: number, machineIds: number[]) =>
+    post<{ results: { machine_id: number; ok: boolean; exit_code: number | null; error: string; execution_id: number }[] }>(
+      `/vps/toolsets/${id}/apply`,
+      { machine_ids: machineIds },
+    ),
+
+  // 任务 ↔ 机器指派:创建任务后在任务详情指派/解绑,或创建时带 vps 字段。
+  assignTaskVps: (taskId: number, machineId: number | "auto") =>
+    post<{ machine: VpsMachine | null }>(`/tasks/${taskId}/vps`, {
+      machine_id: machineId === "auto" ? 0 : machineId,
+      auto: machineId === "auto",
+    }),
+  releaseTaskVps: (taskId: number) => del<{ released: boolean }>(`/tasks/${taskId}/vps`),
+  // 任务详情「执行环境」tab 数据。
+  taskVpsEnvironment: (taskId: number) =>
+    get<TaskVpsEnvironment>(`/tasks/${taskId}/vps-environment`).then((r) => ({
+      machine: r.machine ?? null,
+      executions: arr(r.executions),
+    })),
 };

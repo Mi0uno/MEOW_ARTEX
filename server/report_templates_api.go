@@ -208,11 +208,18 @@ func (s *Server) updateReportTemplate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
-// deleteReportTemplate DELETE /api/report-templates/{id}。
+// deleteReportTemplate DELETE /api/report-templates/{id}。db 层只删行,原始 docx
+// 外壳文件由调用方负责——本 handler 删行成功后补删,避免目录里留孤儿文件。
 func (s *Server) deleteReportTemplate(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil || id <= 0 {
 		writeErr(w, 400, "bad template id")
+		return
+	}
+	// 先读模板拿 OrigPath:行删掉后就取不到文件名了。
+	tpl, err := s.m.PG().GetReportTemplate(id)
+	if err != nil {
+		writeErr(w, 500, err.Error())
 		return
 	}
 	deleted, err := s.m.PG().DeleteReportTemplate(id)
@@ -224,9 +231,24 @@ func (s *Server) deleteReportTemplate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "template not found")
 		return
 	}
+	if tpl != nil {
+		s.removeTemplateOrigDocx(tpl)
+	}
 	tid := id
 	s.templateEvent(tid, "deleted", "user", nil)
 	writeJSON(w, 200, map[string]any{"deleted": true})
+}
+
+// removeTemplateOrigDocx 删除模板的原始 docx 外壳文件。路径复用导出侧的安全解析
+// (禁 .. 跳转、必须落在 report-templates 目录内);文件已不存在不算错误。
+func (s *Server) removeTemplateOrigDocx(tpl *db.ReportTemplate) {
+	p, ok := s.origDocxPath(tpl)
+	if !ok {
+		return
+	}
+	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+		log.Printf("[report-template] 删除原始 docx 失败(模板 %d): %v", tpl.ID, err)
+	}
 }
 
 // analyzeReportTemplate POST /api/report-templates/{id}/analyze —
@@ -308,6 +330,10 @@ func (s *Server) exportReport(w http.ResponseWriter, r *http.Request) {
 		s.fillTemplateTaskData(&data, *rep.TaskID)
 	}
 
+	// rawContent 是报告原始正文:保真 docx 路径只做变量替换,content 块用它——
+	// 若误用渲染后的整份模板输出,外壳的静态章节会被再展开一遍(内容重复)。
+	rawContent := rep.Content
+
 	format := strings.ToLower(r.URL.Query().Get("format"))
 	tplID, _ := strconv.ParseInt(r.URL.Query().Get("template_id"), 10, 64)
 	exportName := strings.TrimSpace(rep.Title)
@@ -349,8 +375,13 @@ func (s *Server) exportReport(w http.ResponseWriter, r *http.Request) {
 					"assets_summary": data.AssetsSummary,
 				},
 				Blocks: map[string]report.DocxBlock{
-					"content":         {Lines: strings.Split(strings.ReplaceAll(data.Content, "\r\n", "\n"), "\n")},
+					// content 用原始正文而非 data.Content(渲染后的整份模板输出),
+					// 否则外壳静态章节出现两遍。
+					"content":         {Lines: strings.Split(strings.ReplaceAll(rawContent, "\r\n", "\n"), "\n")},
 					"findings_detail": {Lines: strings.Split(strings.ReplaceAll(data.FindingsDetail, "\r\n", "\n"), "\n")},
+					// findings_table 以 md 表格文本组装成块:能解析则成 Word 表格,
+					// 不再以 "{{findings_table}}" 字面量或 "| a | b |" 文本残留。
+					"findings_table": report.DocxBlockFromMarkdown(data.FindingsTable),
 				},
 			})
 			if err != nil {
@@ -413,17 +444,17 @@ func urlPathEscape(s string) string {
 	return url.PathEscape(s)
 }
 
-// origDocxBytes 读取模板的原始 docx 外壳(格式保真导出用)。
+// origDocxPath 解析模板原始 docx 的安全绝对路径(读取/删除共用)。
 // OrigPath 存的是 dataDir/report-templates/ 下的文件名(或历史遗留的绝对路径,
-// 同样兼容)。读取前做规范化防御:禁止 .. 跳转,且必须落在 report-templates
-// 目录内(绝对路径比较),防路径穿越。
-func (s *Server) origDocxBytes(tpl *db.ReportTemplate) ([]byte, bool) {
+// 同样兼容)。解析前做规范化防御:禁止 .. 跳转,且必须落在 report-templates
+// 目录内(绝对路径比较),防路径穿越;不合法/未设置返回 false。
+func (s *Server) origDocxPath(tpl *db.ReportTemplate) (string, bool) {
 	if tpl == nil || tpl.OrigPath == "" {
-		return nil, false
+		return "", false
 	}
 	absRoot, err := filepath.Abs(filepath.Join(s.m.dir, "report-templates"))
 	if err != nil {
-		return nil, false
+		return "", false
 	}
 	p := tpl.OrigPath
 	if !filepath.IsAbs(p) {
@@ -432,9 +463,18 @@ func (s *Server) origDocxBytes(tpl *db.ReportTemplate) ([]byte, bool) {
 	clean := filepath.Clean(p)
 	if strings.Contains(clean, "..") ||
 		!strings.HasPrefix(strings.ToLower(clean), strings.ToLower(absRoot+string(os.PathSeparator))) {
+		return "", false
+	}
+	return clean, true
+}
+
+// origDocxBytes 读取模板的原始 docx 外壳(格式保真导出用)。
+func (s *Server) origDocxBytes(tpl *db.ReportTemplate) ([]byte, bool) {
+	p, ok := s.origDocxPath(tpl)
+	if !ok {
 		return nil, false
 	}
-	b, err := os.ReadFile(clean)
+	b, err := os.ReadFile(p)
 	if err != nil {
 		return nil, false
 	}

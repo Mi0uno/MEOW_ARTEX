@@ -23,17 +23,23 @@ import (
 	"github.com/Autumn-27/artex/db"
 )
 
-// templateAnalyzeSystem AI 占位模板改写的固定系统提示词。走 analyzeCompletion 直连
-// LLM(不走 agent harness):输出确定性优先(temperature 0.2 + thinking disabled),
-// 只输出模板本身,草稿直接进编辑器。
+// templateAnalyzeSystem AI 模板识别的固定系统提示词。走 analyzeCompletion 直连
+// LLM(不走 agent harness):输出确定性优先(temperature 0.2 + thinking disabled)。
+// 产出是双产物,格式严格:<TEMPLATE> 占位模板 + <GUIDE> 导出写作指令;解析在
+// splitTemplateAnalyzeOutput,标签缺失回退不判失败(占位模板是主产物)。
 const templateAnalyzeSystem = "你是渗透测试平台的报告模板工程师。用户会给一份报告模板(已从 Word/Markdown 解析为 Markdown)。" +
-	"你的任务:把它改写成「数据占位版模板」——\n" +
+	"你的任务:一次性产出两段内容,按下面的严格格式输出(标签名固定、各自独占一行、标签外不要任何解释、不要代码块围栏):\n" +
+	"<TEMPLATE>\n…数据占位版模板(完整 Markdown)…\n</TEMPLATE>\n" +
+	"<GUIDE>\n…导出写作指令(完整 Markdown)…\n</GUIDE>\n\n" +
+	"第一段 TEMPLATE 的要求:\n" +
 	"1. 保留全部章节结构与固定文字(公司名/说明性文字/表格骨架);\n" +
 	"2. 把「需要填入测试数据/结果」的位置替换为内置变量,可用变量:\n" +
 	"   {{title}} 报告标题;{{date}} 日期;{{summary}} 摘要;{{content}} 报告正文全文;\n" +
 	"   {{findings_table}} 漏洞表格;{{findings_detail}} 漏洞逐条详情;{{assets_summary}} 资产统计;\n" +
-	"3. 不要编造内容、不要删除章节、不要改动变量语法(双花括号);\n" +
-	"4. 只输出改写后的完整 Markdown 模板本身,不要任何解释、不要代码块围栏。"
+	"3. 不要编造内容、不要删除章节、不要改动变量语法(双花括号)。\n\n" +
+	"第二段 GUIDE 是「AI 按模板导出」时注入导出模型的写作指令,要逐章节说明:\n" +
+	"该章应填什么数据(映射到内置变量或任务数据:测试目标/资产/漏洞发现/PoC)、写作口吻与称谓、" +
+	"数字与表格格式、保密与脱敏要求、篇幅建议;全文 500~1500 字。"
 
 // templateAnalyzeBudget LLM 生成整份模板的时间预算。独立于任何 HTTP 超时;
 // 前端只轮询模板状态,不再有对应的前端 signal 对齐问题。
@@ -117,7 +123,7 @@ func (s *Server) startTemplateAnalyzeTask(templateID, profileID int64) (int64, i
 	if err != nil {
 		return 0, 0, fmt.Errorf("创建监看会话失败: %w", err)
 	}
-	req := fmt.Sprintf("请把报告模板「%s」(%s)改写为数据占位版模板:保留章节结构与固定文字,数据位置替换为内置变量。模板结构:%s",
+	req := fmt.Sprintf("请把报告模板「%s」(%s)改写为数据占位版模板,并配套产出导出写作指令:模板保留章节结构与固定文字、数据位置替换为内置变量;指令逐章节说明各章数据来源/口吻/格式。模板结构:%s",
 		tpl.Name, tpl.Category, tpl.SourceNote)
 	if _, err := s.m.PG().AppendConvActivity(conv.ID, db.Activity{
 		Worker: "template_engineer", Kind: "user", Summary: firstLine(req, 200), Detail: req,
@@ -219,7 +225,7 @@ func (s *Server) runTemplateTask(ctx context.Context, t *Task) {
 	}()
 	if _, err := s.m.PG().AppendConvActivity(cfg.ConvID, db.Activity{
 		Worker: "template_engineer", Kind: "text",
-		Summary: fmt.Sprintf("已开始分析模板「%s」(%s),预计 1~2 分钟,完成后草稿自动送到模板管理页。", tpl.Name, tpl.SourceNote),
+		Summary: fmt.Sprintf("已开始分析模板「%s」(%s),预计 1~2 分钟,完成后占位模板与导出写作指令自动送到模板管理页。", tpl.Name, tpl.SourceNote),
 	}); err != nil {
 		log.Printf("[report-template] conv %d 写入开工消息失败: %v", cfg.ConvID, err)
 	}
@@ -232,9 +238,9 @@ func (s *Server) runTemplateTask(ctx context.Context, t *Task) {
 	}
 	structureJSON, _ := json.Marshal(tpl.Structure)
 	user := fmt.Sprintf("模板结构: %s\n\n模板正文:\n%s", string(structureJSON), tpl.Content)
-	genCtx, cancel := context.WithTimeout(ctx, templateAnalyzeBudget)
-	defer cancel()
-	suggestion, err := analyzeCompletion(genCtx, prov, templateAnalyzeSystem, user)
+	// 自动触发的识别无人值守:限流/超时等瞬态失败带退避重试(2 次额外机会),
+	// 不再把「失败」直接甩给用户;非瞬态(鉴权/配置)仍走快速失败。
+	suggestion, err := analyzeWithRetry(ctx, prov, templateAnalyzeSystem, user, 2, templateAnalyzeBudget)
 	if err != nil {
 		if ctx.Err() != nil {
 			fail("已停止或服务重启")
@@ -244,30 +250,85 @@ func (s *Server) runTemplateTask(ctx context.Context, t *Task) {
 		return
 	}
 	suggestion = strings.TrimSpace(suggestion)
-	suggestion = strings.TrimPrefix(suggestion, "```markdown")
-	suggestion = strings.TrimPrefix(suggestion, "```")
-	suggestion = strings.TrimSuffix(strings.TrimSpace(suggestion), "```")
-	suggestion = strings.TrimSpace(suggestion)
 	if suggestion == "" {
 		fail("AI 返回了空结果,请重试或换一个模型")
 		return
 	}
-	if err := s.m.PG().SetReportTemplateAnalyzeDone(cfg.TemplateID, suggestion); err != nil {
+	// 双产物解析:占位模板(主产物)+ 导出写作指令(可缺省)。标签缺失回退不判失败。
+	placeholder, guide := splitTemplateAnalyzeOutput(suggestion)
+	if placeholder == "" {
+		fail("AI 返回了空结果,请重试或换一个模型")
+		return
+	}
+	if err := s.m.PG().SetReportTemplateAnalyzeDone(cfg.TemplateID, placeholder, guide); err != nil {
 		fail("草稿写入失败: " + err.Error())
 		return
 	}
 	s.templateEvent(cfg.TemplateID, "ai_analyzed", "agent", map[string]any{
-		"task_id": t.ID, "profile_id": cfg.ProfileID, "words": len([]rune(suggestion)),
+		"task_id": t.ID, "profile_id": cfg.ProfileID,
+		"words": len([]rune(placeholder)), "guide_words": len([]rune(guide)),
 	})
+	// 监看会话 assistant 消息 = 双产物拼接(前缀小标题),用户在会话里直接看到两段。
+	var convDetail strings.Builder
+	convDetail.WriteString("【占位模板草稿】\n\n" + placeholder)
+	if guide != "" {
+		convDetail.WriteString("\n\n【导出写作指令】\n\n" + guide)
+	}
 	if _, err := s.m.PG().AppendConvActivity(cfg.ConvID, db.Activity{
-		Worker: "template_engineer", Kind: "text", Summary: firstLine(suggestion, 200), Detail: suggestion,
+		Worker: "template_engineer", Kind: "text", Summary: firstLine(placeholder, 200), Detail: convDetail.String(),
 	}); err != nil {
 		log.Printf("[report-template] conv %d 写入草稿失败: %v", cfg.ConvID, err)
 	}
-	s.writeTemplateGraphNode(t, true, fmt.Sprintf("AI 占位模板草稿已生成(%d 字),已写入模板「%s」,到模板管理页确认采用", len([]rune(suggestion)), tpl.Name))
+	summary := fmt.Sprintf("AI 占位模板草稿已生成(%d 字),已写入模板「%s」,到模板管理页确认采用", len([]rune(placeholder)), tpl.Name)
+	if guide != "" {
+		summary = fmt.Sprintf("AI 占位模板草稿已生成(模板 %d 字 + 导出指令 %d 字),已写入模板「%s」,到模板管理页确认采用",
+			len([]rune(placeholder)), len([]rune(guide)), tpl.Name)
+	}
+	s.writeTemplateGraphNode(t, true, summary)
 	_ = s.m.SetTaskStatus(t.ID, "done")
 	_ = s.m.PG().TouchConversation(cfg.ConvID)
-	log.Printf("[report-template] 任务 %s 完成: 模板 %d 草稿 %d 字", t.ID, cfg.TemplateID, len([]rune(suggestion)))
+	log.Printf("[report-template] 任务 %s 完成: 模板 %d 草稿 %d 字 + 导出指令 %d 字",
+		t.ID, cfg.TemplateID, len([]rune(placeholder)), len([]rune(guide)))
+}
+
+// splitTemplateAnalyzeOutput 解析识别输出的双产物:
+//
+//	<TEMPLATE>占位模板</TEMPLATE> … <GUIDE>导出写作指令</GUIDE>
+//
+// 标签按提示词约定的固定大写用 strings.Index 定位剥离;段内再剥一次代码围栏(模型
+// 偶尔整段套 ```markdown)。找不到标签不判失败:整体剥围栏后回退为占位模板、guide
+// 置空——识别的主产物是占位模板,导出指令缺省时模板本身仍完整可用。
+func splitTemplateAnalyzeOutput(out string) (placeholder, guide string) {
+	s := strings.TrimSpace(out)
+	ti := strings.Index(s, "<TEMPLATE>")
+	gi := strings.Index(s, "<GUIDE>")
+	if ti < 0 && gi < 0 {
+		return stripAnalyzeFences(s), ""
+	}
+	if ti >= 0 {
+		body := s[ti+len("<TEMPLATE>"):]
+		if e := strings.Index(body, "</TEMPLATE>"); e >= 0 {
+			body = body[:e]
+		}
+		placeholder = stripAnalyzeFences(body)
+	}
+	if gi >= 0 {
+		body := s[gi+len("<GUIDE>"):]
+		if e := strings.Index(body, "</GUIDE>"); e >= 0 {
+			body = body[:e]
+		}
+		guide = stripAnalyzeFences(body)
+	}
+	return placeholder, guide
+}
+
+// stripAnalyzeFences 剥掉模型偶尔整段包裹的 markdown 代码围栏。
+func stripAnalyzeFences(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "```markdown")
+	s = strings.TrimPrefix(s, "```")
+	s = strings.TrimSuffix(strings.TrimSpace(s), "```")
+	return strings.TrimSpace(s)
 }
 
 // writeTemplateGraphNode 识别结果落探索图(任务详情→播报板可见):

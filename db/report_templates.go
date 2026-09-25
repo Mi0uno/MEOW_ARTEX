@@ -16,6 +16,8 @@ import (
 // OrigPath 非空时指向上传的原始 docx 包,格式保真导出以其为外壳。
 // AI 占位识别异步任务化:analyze_status ”/running/done/failed,
 // 草稿落 suggested_content(analyze_task_id/analyze_conv_id 指向监看任务与会话)。
+// ExportPrompt 是与占位模板配套的「导出写作指令」:识别时由 AI 一并产出,
+// AI 按模板导出时注入 LLM,描述各章节数据来源/口吻/格式要求;可在模板管理页编辑。
 type ReportTemplate struct {
 	ID               int64           `json:"id"`
 	Name             string          `json:"name"`
@@ -27,6 +29,7 @@ type ReportTemplate struct {
 	OrigPath         string          `json:"orig_path,omitempty"`
 	AnalyzeStatus    string          `json:"analyze_status"`
 	SuggestedContent string          `json:"suggested_content,omitempty"`
+	ExportPrompt     string          `json:"export_prompt,omitempty"`
 	AnalyzeError     string          `json:"analyze_error,omitempty"`
 	AnalyzeTaskID    int64           `json:"analyze_task_id,omitempty"`
 	AnalyzeConvID    int64           `json:"analyze_conv_id,omitempty"`
@@ -35,7 +38,7 @@ type ReportTemplate struct {
 }
 
 const reportTemplateCols = `id, name, category, format, content, structure, source_note, orig_path,
-	analyze_status, suggested_content, analyze_error, analyze_task_id, analyze_conv_id, analyzed_at, created_at`
+	analyze_status, suggested_content, export_prompt, analyze_error, analyze_task_id, analyze_conv_id, analyzed_at, created_at`
 
 // reportTemplateListCols 列表不回传正文与 AI 草稿(都可能很大),详情/编辑用 GetReportTemplate。
 const reportTemplateListCols = `id, name, category, format, structure, source_note, orig_path,
@@ -48,7 +51,7 @@ func scanReportTemplate(sc interface{ Scan(...any) error }, withContent bool) (*
 	var convID sql.NullInt64
 	if withContent {
 		if err := sc.Scan(&t.ID, &t.Name, &t.Category, &t.Format, &t.Content, &t.Structure, &t.SourceNote, &t.OrigPath,
-			&t.AnalyzeStatus, &t.SuggestedContent, &t.AnalyzeError, &t.AnalyzeTaskID, &convID, &analyzedAt, &t.CreatedAt); err != nil {
+			&t.AnalyzeStatus, &t.SuggestedContent, &t.ExportPrompt, &t.AnalyzeError, &t.AnalyzeTaskID, &convID, &analyzedAt, &t.CreatedAt); err != nil {
 			return nil, err
 		}
 	} else {
@@ -156,18 +159,27 @@ func (d *DB) SetReportTemplateOrigPath(id int64, path string) error {
 	return err
 }
 
-// SetReportTemplateAnalyzeStart 标记识别任务启动(running + 监看任务/会话 id),清空旧草稿与错误。
+// SetReportTemplateAnalyzeStart 标记识别任务启动(running + 监看任务/会话 id),
+// 清空旧草稿/旧导出指令与错误(重跑识别 = 旧结论作废,重新产出)。
 func (d *DB) SetReportTemplateAnalyzeStart(id, taskID, convID int64) error {
 	_, err := d.Exec(`UPDATE report_templates SET
 		analyze_status='running', analyze_task_id=$2, analyze_conv_id=$3,
-		suggested_content='', analyze_error='', analyzed_at=NULL WHERE id=$1`, id, taskID, convID)
+		suggested_content='', export_prompt='', analyze_error='', analyzed_at=NULL WHERE id=$1`, id, taskID, convID)
 	return err
 }
 
-// SetReportTemplateAnalyzeDone 写入 AI 草稿并落 done;失败路径用 SetReportTemplateAnalyzeFailed。
-func (d *DB) SetReportTemplateAnalyzeDone(id int64, suggestion string) error {
+// SetReportTemplateAnalyzeDone 写入 AI 草稿(占位模板 + 配套导出写作指令)并落 done;
+// exportPrompt 可为空(模型未产出指令时不阻塞占位模板本身);失败路径用 SetReportTemplateAnalyzeFailed。
+func (d *DB) SetReportTemplateAnalyzeDone(id int64, suggestion, exportPrompt string) error {
 	_, err := d.Exec(`UPDATE report_templates SET
-		analyze_status='done', suggested_content=$2, analyze_error='', analyzed_at=now() WHERE id=$1`, id, suggestion)
+		analyze_status='done', suggested_content=$2, export_prompt=$3, analyze_error='', analyzed_at=now() WHERE id=$1`,
+		id, suggestion, exportPrompt)
+	return err
+}
+
+// SetReportTemplateExportPrompt 单独更新导出写作指令(用户在模板管理页手工编辑)。
+func (d *DB) SetReportTemplateExportPrompt(id int64, prompt string) error {
+	_, err := d.Exec(`UPDATE report_templates SET export_prompt=$2 WHERE id=$1`, id, prompt)
 	return err
 }
 

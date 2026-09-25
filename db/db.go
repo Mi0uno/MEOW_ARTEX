@@ -216,6 +216,11 @@ var builtinAgents = []builtinAgent{
 	// 报告模板工程师:内置「模板工程师」agent(报告中心阶段)。AI 占位模板识别任务的过程
 	// 会话绑在它名下(报告中心→对话 ?stage=report 监看);识别完成后也可在本会话里继续追问改稿。
 	{"template_engineer", "模板工程师", "assistant", "报告模板工程师：把渗透测试报告模板改写为「数据占位版」——保留章节结构与固定文字,数据位置替换为平台内置变量。", nil, false, intp(600), "report"},
+	// 报告撰写:内置「报告撰写」agent(报告中心阶段)。走 LLM 的报告产出任务(任务总结
+	// 报告 AI 撰写/AI 按模板导出)的监看会话绑在它名下;报告中心对话里也可直接指挥它
+	// 取数、写稿、存稿。专属工具 report_get_context/report_get_template/report_save_report
+	// 由 server.seedReportWriterTools 播种并默认绑到它。
+	{"report_writer", "报告撰写", "assistant", "报告撰写 agent：把任务与漏洞的实测产出写成可交付的正式报告——按模板与写作指令组织章节、核实数据来源、成稿存回报告中心。", nil, false, intp(900), "report"},
 	// SRC 测试:内置「SRC 测试」agent。agents.stage 白名单没有 src,SRC 任务即 exploit
 	// 阶段。职责=在平台规范与目标授权范围内挖掘/验证/自评/起草提交;三个专属工具
 	// src_get_context/src_score_finding/src_draft_submission 由 server.seedSRCOperatorTools

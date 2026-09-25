@@ -82,6 +82,17 @@ type TaskDTO struct {
 	GuardMode string `json:"guard_mode"`
 	// 仅本任务启用这些拦截规则;空数组=用全部已启用规则。同理不带 omitempty。
 	GuardRuleIDs []int64 `json:"guard_rule_ids"`
+	// VPSMachine 是任务当前指派的执行机器摘要(契约 §6 的 vps_machine 字段)。
+	// 仅创建/详情返回(withVPSMachine 填充,列表不做逐条机器查询);未指派为 nil。
+	VPSMachine *TaskVPSMachineDTO `json:"vps_machine,omitempty"`
+}
+
+// TaskVPSMachineDTO 是任务当前指派机器的摘要(id/name/host/status)。
+type TaskVPSMachineDTO struct {
+	ID     int64  `json:"id"`
+	Name   string `json:"name"`
+	Host   string `json:"host"`
+	Status string `json:"status"`
 }
 
 func applyTaskArchiveBlocker(dto *TaskDTO, blockers map[int64]int64) {
@@ -174,6 +185,28 @@ func (s *Server) withProxyEgress(dto TaskDTO) TaskDTO {
 		return dto
 	}
 	dto.ProxyEgress = s.m.ProxyAddrForTask(dto.ProxyMode, dto.ProxyGroupID)
+	return dto
+}
+
+// withVPSMachine 补上「任务当前指派的执行机器」摘要(契约 §6 的 vps_machine 字段)。
+// 与 withProxyEgress 同款:派生字段单独一个方法,taskDTO 保持纯转换函数(多处调用,
+// 含测试);只有创建与详情接口调它,列表不做逐条机器查询。
+func (s *Server) withVPSMachine(dto TaskDTO) TaskDTO {
+	mgr := VPSManager()
+	if mgr == nil {
+		return dto
+	}
+	id, err := strconv.ParseInt(dto.ID, 10, 64)
+	if err != nil || id <= 0 {
+		return dto
+	}
+	machine, err := mgr.MachineForTask(id)
+	if err != nil || machine == nil {
+		return dto
+	}
+	dto.VPSMachine = &TaskVPSMachineDTO{
+		ID: machine.ID, Name: machine.Name, Host: machine.Host, Status: machine.Status,
+	}
 	return dto
 }
 

@@ -38,13 +38,19 @@ func (s *Server) launchTask(t *Task, seedText string, seedFirstIntent bool) {
 		s.launchReconTask(t)
 		return
 	}
-	// AI 识别任务(报告中心):同流水线语义,不进 agent 引擎,由 tmplRunner 驱动。
+	// 报告中心流水线任务:同流水线语义,不进 agent 引擎,按 step_key 分发——
+	// template_analyze=AI 占位模板识别(tmplRunner);其余(report_export=AI 按模板
+	// 导出、task_report_ai=任务总结报告 AI 撰写)走 launchReportPipelineTask。
 	if t.Stage == "report" {
 		if !s.engine.beginTaskOperation(t.ID) {
 			return
 		}
 		defer s.engine.decInflight(t.ID)
-		s.launchTemplateTask(t)
+		if t.StepKey == "template_analyze" {
+			s.launchTemplateTask(t)
+		} else {
+			s.launchReportPipelineTask(t)
+		}
 		return
 	}
 	if !s.engine.beginTaskOperation(t.ID) {

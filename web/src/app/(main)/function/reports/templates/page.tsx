@@ -1,8 +1,8 @@
 "use client";
 
 // 报告模板管理:上传 Word(.docx)/Markdown 模板,精准解析结构;
-// 支持分类、检索、分页与增删改查;可 AI 读取模板生成「数据占位版」草稿;
-// 导出报告时按模板填充生成。
+// 支持分类、检索、分页与增删改查;AI 识别同时产出「占位模板 + 导出写作指令」双产物;
+// 导出报告时可走快速变量替换,或由报告 agent 按模板与写作指令 AI 生成。
 
 import * as React from "react";
 
@@ -433,7 +433,9 @@ function UploadDialog({
     setUploading(true);
     try {
       await api.uploadReportTemplate(file, name.trim() || undefined, category);
-      toast.success("模板已上传,AI 正在后台自动生成占位草稿(可在 报告中心 → 任务/对话 监看)");
+      toast.success(
+        "模板已上传,AI 正在后台生成「占位模板 + 导出写作指令」双产物(可在 报告中心 → 任务/对话 监看)",
+      );
       setFile(null);
       setName("");
       onUploaded();
@@ -496,9 +498,10 @@ function UploadDialog({
   );
 }
 
-// EditTemplateDialog 编辑模板:名称/分类/正文 + AI 生成占位模板。
+// EditTemplateDialog 编辑模板:名称/分类/正文 + 导出写作指令,支持 AI 生成双产物草稿。
 // AI 识别为异步任务:点击后 202 立即返回,这里轮询模板状态直到 done/failed;
-// done 后草稿存服务端,点「采用 AI 草稿」填入编辑器,保存由用户手动确认。
+// done 后「占位模板 + 导出写作指令」草稿存服务端,分别点「采用」填入对应编辑框;
+// 正文与导出指令各自独立保存(导出指令单独提交,保存后不关闭对话框)。
 function EditTemplateDialog({
   template,
   onOpenChange,
@@ -514,6 +517,12 @@ function EditTemplateDialog({
   const [saving, setSaving] = React.useState(false);
   const [analyzing, setAnalyzing] = React.useState(false);
   const [suggestion, setSuggestion] = React.useState("");
+  // 导出写作指令:exportPromptSaved 记录已保存值,用于「保存指令」按钮的未改动禁用。
+  const [exportPrompt, setExportPrompt] = React.useState("");
+  const [exportPromptSaved, setExportPromptSaved] = React.useState("");
+  const [savingPrompt, setSavingPrompt] = React.useState(false);
+  // AI 识别产出的导出指令草稿(识别 done 后模板详情的 export_prompt 字段即 AI 产出)。
+  const [guideDraft, setGuideDraft] = React.useState("");
   const [llmProfiles, setLlmProfiles] = React.useState<LLMProfile[]>([]);
   const [analyzeProfileId, setAnalyzeProfileId] = React.useState<string>("0");
   const pollRef = React.useRef<ReturnType<typeof setInterval> | null>(null);
@@ -539,7 +548,8 @@ function EditTemplateDialog({
             setAnalyzing(false);
             if (full.analyze_status === "done" && full.suggested_content) {
               setSuggestion(full.suggested_content);
-              toast.success("AI 草稿已生成,点「采用 AI 草稿」填入编辑器");
+              setGuideDraft(full.export_prompt ?? "");
+              toast.success("AI 已产出「占位模板 + 导出指令」,分别点「采用」按钮填入");
             } else if (full.analyze_status === "failed") {
               toast.error(`AI 识别失败:${full.analyze_error || "未知原因,可重试"}`);
             }
@@ -553,6 +563,7 @@ function EditTemplateDialog({
   React.useEffect(() => {
     stopPoll();
     setSuggestion("");
+    setGuideDraft("");
     setAnalyzing(false);
     if (!template) return;
     setName(template.name);
@@ -560,12 +571,16 @@ function EditTemplateDialog({
     api
       .reportTemplate(template.id)
       .then((full) => {
+        // 详情同时带回正文与导出写作指令,两个编辑框直接回填。
         setContent(full.content ?? "");
+        setExportPrompt(full.export_prompt ?? "");
+        setExportPromptSaved(full.export_prompt ?? "");
         if (full.analyze_status === "running") {
           setAnalyzing(true);
           startPoll(template.id);
         } else if (full.analyze_status === "done" && full.suggested_content) {
           setSuggestion(full.suggested_content);
+          setGuideDraft(full.export_prompt ?? "");
         }
         return api.llmProfiles().then(setLlmProfiles);
       })
@@ -608,9 +623,25 @@ function EditTemplateDialog({
     }
   };
 
+  // 独立保存导出写作指令:与模板正文分开提交,保存后不关对话框,便于继续微调。
+  const savePrompt = async () => {
+    if (!template) return;
+    setSavingPrompt(true);
+    try {
+      await api.updateReportTemplate(template.id, { export_prompt: exportPrompt });
+      setExportPromptSaved(exportPrompt);
+      toast.success("导出写作指令已保存");
+      onSaved();
+    } catch (e) {
+      toast.error(`保存导出指令失败:${(e as Error).message}`);
+    } finally {
+      setSavingPrompt(false);
+    }
+  };
+
   return (
     <Dialog open={!!template} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-3xl">
+      <DialogContent className="max-h-[88vh] overflow-y-auto sm:max-w-3xl">
         <DialogHeader>
           <DialogTitle>编辑模板 · {template?.name}</DialogTitle>
           <DialogDescription>
@@ -619,7 +650,7 @@ function EditTemplateDialog({
             <code className="mx-1 rounded bg-muted px-1 font-mono">{"{{findings_table}}"}</code>
             <code className="mx-1 rounded bg-muted px-1 font-mono">{"{{findings_detail}}"}</code>
             <code className="mx-1 rounded bg-muted px-1 font-mono">{"{{summary}}"}</code> 等。也可让 AI
-            自动生成占位草稿。
+            同时生成占位模板与导出写作指令草稿。
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-3">
@@ -651,12 +682,18 @@ function EditTemplateDialog({
             </Select>
             <Button variant="outline" size="sm" disabled={analyzing} onClick={() => void analyze()}>
               {analyzing ? <Loader2Icon className="size-4 animate-spin" /> : <SparklesIcon className="size-4" />}
-              {analyzing ? "AI 识别中…(后台任务)" : "AI 生成占位模板"}
+              {analyzing ? "AI 识别中…(后台任务)" : "AI 生成占位模板与导出指令"}
             </Button>
             {!!suggestion && !analyzing && (
               <Button variant="outline" size="sm" onClick={() => setContent(suggestion)}>
                 <CheckIcon className="size-4" />
-                采用 AI 草稿
+                采用占位模板
+              </Button>
+            )}
+            {!!guideDraft && !analyzing && guideDraft !== exportPrompt && (
+              <Button variant="outline" size="sm" onClick={() => setExportPrompt(guideDraft)}>
+                <CheckIcon className="size-4" />
+                采用导出指令
               </Button>
             )}
             {template?.analyze_task_id ? (
@@ -671,8 +708,31 @@ function EditTemplateDialog({
           <Textarea
             value={content}
             onChange={(e) => setContent(e.target.value)}
-            className="min-h-[46vh] font-mono text-xs"
+            className="min-h-[26vh] font-mono text-xs"
           />
+          <div className="grid gap-1.5">
+            <div className="flex items-center justify-between gap-2">
+              <Label htmlFor="etpl-export-prompt">导出写作指令</Label>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={savingPrompt || exportPrompt === exportPromptSaved}
+                onClick={() => void savePrompt()}
+              >
+                {savingPrompt ? "保存中…" : "保存指令"}
+              </Button>
+            </div>
+            <p className="text-muted-foreground text-[11px]">
+              AI 按模板导出时注入 LLM 的写作要求:各章数据来源、口吻称谓、数字与表格格式、保密脱敏等;留空则仅按模板结构组织正文。此处独立保存,不影响上方模板正文。
+            </p>
+            <Textarea
+              id="etpl-export-prompt"
+              value={exportPrompt}
+              onChange={(e) => setExportPrompt(e.target.value)}
+              placeholder="可手写,或点上方「AI 生成占位模板与导出指令」自动产出"
+              className="min-h-[16vh] font-mono text-xs"
+            />
+          </div>
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)}>

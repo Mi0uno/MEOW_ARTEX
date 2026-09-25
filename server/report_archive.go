@@ -50,6 +50,9 @@ func (s *Server) autoArchiveTaskReport(taskID int64) {
 		"source": "auto_task_terminal", "words": len([]rune(md)),
 	})
 	log.Printf("[report-archive] 任务 %d 总结报告已自动归档 #%d(新建=%v)", taskID, id, created)
+	// 归档成功后异步触发 AI 润写(maybeStartTaskReportEnhance 自带开关/幂等/静默
+	// 跳过;goroutine 不阻塞终态收尾;失败不回滚保底报告)。
+	go s.maybeStartTaskReportEnhance(taskID)
 }
 
 // wireFindingHooks 把 report_finding 登记后的联动挂上:

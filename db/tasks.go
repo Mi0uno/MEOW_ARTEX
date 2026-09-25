@@ -290,6 +290,11 @@ type TaskCreateOptions struct {
 	// GuardRuleIDs 非空=本任务只用这些规则;空=用全部已启用规则。
 	GuardMode    string
 	GuardRuleIDs []int64
+	// VPS 执行环境(创建即指派;不落 tasks 表,由 server 层 Manager 在任务进入
+	// running 之前经 vpscenter 指派):VPSMachineID>0=指定机器,VPSAuto=true=自动
+	// 挑空闲在线机。指派失败不阻断建任务(任务照常按本机模式跑,只记 warning)。
+	VPSMachineID int64
+	VPSAuto      bool
 }
 
 // CreateTaskWithOptions creates an exploration, task, direct source relations,
