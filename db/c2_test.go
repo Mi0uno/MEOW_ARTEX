@@ -584,3 +584,154 @@ func TestC2SessionCompanyFilter(t *testing.T) {
 		t.Fatalf("解绑后不应命中: %d (%v)", total, err)
 	}
 }
+
+// c2TestVpsMachine 落一台测试 VPS 机器(密码密文用假字节——本层只搬运密文)。
+func c2TestVpsMachine(t *testing.T, d *DB, name string) *VpsMachine {
+	t.Helper()
+	m, err := d.CreateVpsMachine(VpsMachineInput{
+		Name:           name,
+		Host:           "203.0.113.10",
+		Username:       "root",
+		AuthType:       VpsAuthPassword,
+		PasswordSealed: []byte("sealed-vps-password"),
+		WorkspaceBase:  "/root/.artex-ws",
+	})
+	if err != nil {
+		t.Fatalf("建测试 VPS 机器失败: %v", err)
+	}
+	return m
+}
+
+// TestC2ListenerCarrierColumns 二期载体列(契约 §12):默认 local、vps 三元组读写、
+// 机器名带出、白名单校验、vps→local 归零。
+func TestC2ListenerCarrierColumns(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v)", err)
+	}
+	defer d.Close()
+
+	vm := c2TestVpsMachine(t, d, fmt.Sprintf("c2-载体机-%d", time.Now().UnixNano()))
+	defer d.DeleteVpsMachine(vm.ID) //nolint:errcheck
+
+	// 一期默认:不传载体字段 = local。
+	l := c2TestListener(t, d, fmt.Sprintf("c2-carrier-local-%d", time.Now().UnixNano()))
+	defer d.DeleteC2Listener(l.ID) //nolint:errcheck
+	if l.HostKind != C2ListenerHostKindLocal || l.VPSMachineID != 0 || l.RemotePort != 0 {
+		t.Fatalf("默认载体应为 local: %+v", l)
+	}
+
+	// vps 载体:三元组入库 + 机器名带出(List 与 Get 同口径)。
+	vlName := fmt.Sprintf("c2-carrier-vps-%d", time.Now().UnixNano())
+	vid, err := d.CreateC2Listener(C2ListenerInput{
+		Name: vlName, BindHost: "127.0.0.1", Port: 0,
+		URLPath:      "auto-" + fmt.Sprint(time.Now().UnixNano()),
+		Callback:     "", // vps 载体 callback 可空(前端用机器 host 拼)
+		EncKeySealed: []byte("sealed-key-bytes-" + vlName),
+		HostKind:     C2ListenerHostKindVPS, VPSMachineID: vm.ID, RemotePort: 443,
+	})
+	if err != nil {
+		t.Fatalf("建 vps 载体监听器失败: %v", err)
+	}
+	defer d.DeleteC2Listener(vid) //nolint:errcheck
+	vl, err := d.GetC2Listener(vid)
+	if err != nil || vl == nil {
+		t.Fatalf("回读 vps 载体监听器失败: %v(%v)", vl, err)
+	}
+	if vl.HostKind != C2ListenerHostKindVPS || vl.VPSMachineID != vm.ID || vl.RemotePort != 443 {
+		t.Fatalf("vps 载体字段未落库: %+v", vl)
+	}
+	if vl.VPSMachineName != vm.Name {
+		t.Fatalf("机器名应从 vps_machines 带出: got=%q want=%q", vl.VPSMachineName, vm.Name)
+	}
+	listed, err := d.ListC2Listeners()
+	if err != nil {
+		t.Fatalf("列监听器失败: %v", err)
+	}
+	found := false
+	for _, it := range listed {
+		if it.ID == vid {
+			found = true
+			if it.VPSMachineName != vm.Name {
+				t.Fatalf("列表机器名带出失败: %+v", it)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("列表未包含 vps 载体监听器 #%d", vid)
+	}
+
+	// 白名单校验:vps 缺机器/缺端口/非法 host_kind。
+	bad := []C2ListenerInput{
+		{Name: "缺机器", HostKind: C2ListenerHostKindVPS, RemotePort: 443},
+		{Name: "缺端口", HostKind: C2ListenerHostKindVPS, VPSMachineID: vm.ID},
+		{Name: "非法端口", HostKind: C2ListenerHostKindVPS, VPSMachineID: vm.ID, RemotePort: 70000},
+		{Name: "非法载体", HostKind: "k8s", VPSMachineID: vm.ID, RemotePort: 443},
+	}
+	for i := range bad {
+		if _, err := d.CreateC2Listener(bad[i]); err == nil {
+			t.Fatalf("第 %d 个非法载体输入应被拒绝: %+v", i+1, bad[i])
+		}
+	}
+
+	// 更新:vps → local 归零;local → vps 补三元组。
+	if err := d.UpdateC2Listener(vid, C2ListenerInput{
+		Name: vlName, BindHost: "127.0.0.1", Port: 0, URLPath: vl.URLPath,
+		HostKind: C2ListenerHostKindLocal,
+	}); err != nil {
+		t.Fatalf("切回 local 失败: %v", err)
+	}
+	if got, _ := d.GetC2Listener(vid); got.HostKind != C2ListenerHostKindLocal ||
+		got.VPSMachineID != 0 || got.RemotePort != 0 || got.VPSMachineName != "" {
+		t.Fatalf("切回 local 应归零载体字段: %+v", got)
+	}
+	if err := d.UpdateC2Listener(vid, C2ListenerInput{
+		Name: vlName, BindHost: "127.0.0.1", Port: 0, URLPath: vl.URLPath,
+		HostKind: C2ListenerHostKindVPS, VPSMachineID: vm.ID, RemotePort: 8443,
+	}); err != nil {
+		t.Fatalf("切到 vps 失败: %v", err)
+	}
+	if got, _ := d.GetC2Listener(vid); got.VPSMachineID != vm.ID || got.RemotePort != 8443 {
+		t.Fatalf("切到 vps 后字段未更新: %+v", got)
+	}
+}
+
+// TestC2PayloadV2Columns 二期载荷列(契约 §13/§14):evasion_profile_id 建行带入、
+// 构建产物回填(sha256/size/file_path/built_on_vps)。
+func TestC2PayloadV2Columns(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v)", err)
+	}
+	defer d.Close()
+
+	l := c2TestListener(t, d, fmt.Sprintf("c2-payload-v2-%d", time.Now().UnixNano()))
+	defer d.DeleteC2Listener(l.ID) //nolint:errcheck
+
+	token := fmt.Sprintf("tokv2-%d", time.Now().UnixNano())
+	pid, err := d.CreateC2Payload(C2PayloadInput{
+		ListenerID: l.ID, Name: "gosrc-源码包", Format: C2PayloadFormatGoSrc, Target: "windows",
+		Token: token, SHA256: "srcsha", Size: 12345, CreatedBy: "test",
+		EvasionProfileID: 77,
+	})
+	if err != nil {
+		t.Fatalf("建 gosrc 载荷失败: %v", err)
+	}
+	defer d.DeleteC2Payload(pid) //nolint:errcheck
+	pl, err := d.GetC2Payload(pid)
+	if err != nil || pl == nil {
+		t.Fatalf("回读载荷失败: %v(%v)", pl, err)
+	}
+	if pl.EvasionProfileID != 77 || pl.BuiltOnVPS {
+		t.Fatalf("载荷二期列不对: %+v", pl)
+	}
+
+	// 构建产物回填(§14):二进制替换 file_path 并刷新 sha256/size。
+	if err := d.UpdateC2PayloadBuildResult(pid, "/data/c2/payloads/9_beacon.exe", "binsha", 4096000); err != nil {
+		t.Fatalf("回填构建产物失败: %v", err)
+	}
+	if got, _ := d.GetC2Payload(pid); got == nil || !got.BuiltOnVPS ||
+		got.SHA256 != "binsha" || got.Size != 4096000 || got.EvasionProfileID != 77 {
+		t.Fatalf("构建产物回填未生效: %+v", got)
+	}
+}

@@ -6,8 +6,12 @@
 // <callback>/<url_path>/p/<token> 投递。本页负责监听器的增删改查与启停;
 // 会话与任务在「会话」页,载荷生成在「载荷」页。
 //
+// 载体(二期):本机直听,或选一台 VPS 机器经 SSH 远程端口转发把机器公网口
+// 的流量转回本机监听器(契约 §12)。启停失败(端口占用 / SSH 不通最常见)
+// 把后端错误原文报出来。
+//
 // 接口(c2Listeners)没有服务端筛选/分页参数,四件套(搜索/筛选/排序/分页)
-// 全部在客户端对全量列表做;启停失败(端口占用最常见)把后端错误原文报出来。
+// 全部在客户端对全量列表做。
 
 import * as React from "react";
 
@@ -29,7 +33,7 @@ import {
 import { toast } from "sonner";
 
 import { TablePagination } from "@/components/table-pagination";
-import { fmtTime, listenerChannelURL, num, randomURLPath } from "@/components/c2-shared";
+import { c2VpsStatusLabel, fmtTime, listenerChannelURL, num, randomURLPath } from "@/components/c2-shared";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -57,7 +61,7 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectVa
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
-import type { C2Listener } from "@/lib/types";
+import type { C2Listener, VpsMachine } from "@/lib/types";
 import { cn, copyText } from "@/lib/utils";
 
 const PAGE_SIZE = 50;
@@ -309,13 +313,14 @@ function C2ListenersInner() {
                 <TableHeader>
                   <TableRow className="hover:bg-transparent">
                     {/* 名称列不设宽度:table-fixed 下自动吃掉余量。
-                        固定列合计 688px(192+64+80+112+128+112),常规容器下余量充足;
+                        固定列合计 672px(144+96+48+80+80+112+112),常规容器下余量充足;
                         再加列必须先瘦身其他列,否则名称列会被压到看不见。 */}
                     <SortHead field="name">名称</SortHead>
-                    <TableHead className="w-48">回调地址</TableHead>
-                    <TableHead className="w-16">会话</TableHead>
+                    <TableHead className="w-36">回调地址</TableHead>
+                    <TableHead className="w-24">载体</TableHead>
+                    <TableHead className="w-12">会话</TableHead>
                     <TableHead className="w-20">启用状态</TableHead>
-                    <TableHead className="w-28">备注</TableHead>
+                    <TableHead className="w-20">备注</TableHead>
                     <SortHead field="created" width="w-32">
                       创建时间
                     </SortHead>
@@ -350,6 +355,19 @@ function C2ListenersInner() {
                             <span className="text-amber-600 text-xs dark:text-amber-400" title="生成载荷前必须先填回调地址">
                               未配置回调地址
                             </span>
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          {l.host_kind === "vps" ? (
+                            <Badge
+                              variant="outline"
+                              className="border-violet-500/30 bg-violet-500/15 text-violet-600"
+                              title={`VPS 载体:${l.vps_machine_name || `机器 #${l.vps_machine_id}`} · 公网侧转发端口 ${l.remote_port}`}
+                            >
+                              <span className="max-w-20 truncate">{l.vps_machine_name || `机器 #${l.vps_machine_id}`}</span>
+                            </Badge>
+                          ) : (
+                            <span className="text-muted-foreground text-xs">本机</span>
                           )}
                         </TableCell>
                         <TableCell className="tabular-nums">
@@ -499,7 +517,8 @@ function C2ListenersInner() {
 
 // C2ListenerDialog 新建 / 编辑监听器。
 // port 留空 = 0(启动时自动分配);url_path 新建时自动生成、可改;
-// callback 是写进载荷的回调地址,生成载荷前必填。
+// callback 是写进载荷的回调地址,local 载体必填;vps 载体(二期)可选机器 + 公网侧
+// 转发端口,回调地址按机器 host:端口预填、可改,留空时后端按机器信息放宽校验。
 function C2ListenerDialog({
   open,
   onOpenChange,
@@ -517,6 +536,13 @@ function C2ListenerDialog({
   const [callback, setCallback] = React.useState("");
   const [urlPath, setUrlPath] = React.useState("");
   const [notes, setNotes] = React.useState("");
+  // 载体(二期):local = 平台本机直听;vps = 经 SSH 远程端口转发以 VPS 机器为出入口。
+  const [hostKind, setHostKind] = React.useState<"local" | "vps">("local");
+  const [machines, setMachines] = React.useState<VpsMachine[]>([]);
+  const [machineId, setMachineId] = React.useState("");
+  const [remotePortText, setRemotePortText] = React.useState("");
+  // 用户手改过回调地址后不再自动预填。
+  const [callbackTouched, setCallbackTouched] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
 
   React.useEffect(() => {
@@ -528,6 +554,9 @@ function C2ListenerDialog({
       setCallback(listener.callback);
       setUrlPath(listener.url_path);
       setNotes(listener.notes);
+      setHostKind(listener.host_kind === "vps" ? "vps" : "local");
+      setMachineId(listener.vps_machine_id > 0 ? String(listener.vps_machine_id) : "");
+      setRemotePortText(listener.remote_port > 0 ? String(listener.remote_port) : "");
     } else {
       setName("");
       setBindHost("0.0.0.0");
@@ -535,8 +564,39 @@ function C2ListenerDialog({
       setCallback("");
       setUrlPath(randomURLPath());
       setNotes("");
+      setHostKind("local");
+      setMachineId("");
+      setRemotePortText("");
     }
+    setCallbackTouched(false);
   }, [open, listener]);
+
+  // 选了 VPS 载体才拉机器列表(拿最新在线状态)。
+  React.useEffect(() => {
+    if (!open || hostKind !== "vps") return;
+    let alive = true;
+    api
+      .vpsMachines()
+      .then((r) => {
+        if (alive) setMachines(r.machines ?? []);
+      })
+      .catch(() => {
+        if (alive) setMachines([]);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [open, hostKind]);
+
+  // 回调地址预填:http://<机器host>:<转发端口>。用户手改过就不再动。
+  React.useEffect(() => {
+    if (!open || hostKind !== "vps" || callbackTouched) return;
+    const m = machines.find((x) => x.id === Number(machineId));
+    const rp = Number(remotePortText);
+    if (m && remotePortText.trim() !== "" && Number.isInteger(rp) && rp > 0) {
+      setCallback(`http://${m.host}:${rp}`);
+    }
+  }, [open, hostKind, machineId, remotePortText, machines, callbackTouched]);
 
   const submit = async () => {
     const n = name.trim();
@@ -544,12 +604,26 @@ function C2ListenerDialog({
       toast.error("请填写名称");
       return;
     }
+    const isVps = hostKind === "vps";
+    const machineNum = Number(machineId);
+    if (isVps && (!Number.isInteger(machineNum) || machineNum <= 0)) {
+      toast.error("VPS 载体必须选择一台机器");
+      return;
+    }
+    let remotePort = 0;
+    if (isVps) {
+      remotePort = Number(remotePortText);
+      if (!Number.isInteger(remotePort) || remotePort <= 0 || remotePort > 65535) {
+        toast.error("转发端口必须是 1-65535 的整数(在机器公网侧监听,需放行防火墙)");
+        return;
+      }
+    }
     const cb = callback.trim();
-    if (!cb) {
+    if (!isVps && !cb) {
       toast.error("请填写回调地址(写进载荷的回调地址,如 http://1.2.3.4:8443)");
       return;
     }
-    if (!/^https?:\/\//i.test(cb)) {
+    if (cb && !/^https?:\/\//i.test(cb)) {
       toast.error("回调地址需带协议,如 http://1.2.3.4:8443");
       return;
     }
@@ -575,6 +649,9 @@ function C2ListenerDialog({
         callback: cb,
         url_path: up,
         notes: notes.trim(),
+        host_kind: hostKind,
+        vps_machine_id: isVps ? machineNum : 0,
+        remote_port: isVps ? remotePort : 0,
       };
       if (listener) await api.c2UpdateListener(listener.id, input);
       else await api.c2CreateListener(input);
@@ -623,24 +700,116 @@ function C2ListenerDialog({
             </div>
           </div>
 
+          {/* 载体(二期):本机直听 / VPS 机器经 SSH 远程转发做公网出入口。 */}
           <div className="grid grid-cols-3 gap-3">
             <div className="grid gap-1.5">
-              <Label htmlFor="c2-listener-bind">绑定地址</Label>
-              <Input
-                id="c2-listener-bind"
-                value={bindHost}
-                onChange={(e) => setBindHost(e.target.value)}
-                placeholder="0.0.0.0"
-                className="font-mono"
-              />
-              <p className="text-muted-foreground text-[10px]">0.0.0.0 = 所有网卡</p>
+              <Label>载体</Label>
+              <Select value={hostKind} onValueChange={(v) => setHostKind(v === "vps" ? "vps" : "local")}>
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectItem value="local">本机</SelectItem>
+                    <SelectItem value="vps">VPS 机器</SelectItem>
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+              <p className="text-muted-foreground text-[10px]">VPS = 机器公网口经 SSH 转发回本机监听</p>
             </div>
-            <div className="col-span-2 grid gap-1.5">
+            {hostKind === "vps" ? (
+              <div className="col-span-2 grid gap-1.5">
+                <Label htmlFor="c2-listener-machine">VPS 机器</Label>
+                <Select
+                  value={machineId}
+                  onValueChange={(v) => {
+                    setMachineId(v);
+                    setCallbackTouched(false);
+                  }}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue placeholder="选择机器" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      {machines.length === 0 ? (
+                        <SelectItem value="__none__" disabled>
+                          没有可选机器,请先到「VPS 中心」录入
+                        </SelectItem>
+                      ) : (
+                        machines.map((m) => (
+                          <SelectItem key={m.id} value={String(m.id)}>
+                            {m.name}({m.host}) · {c2VpsStatusLabel(String(m.status))}
+                          </SelectItem>
+                        ))
+                      )}
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+                <p className="text-muted-foreground text-[10px]">标注在线状态;离线机器也可选,启动时 SSH 连不上会报错</p>
+              </div>
+            ) : (
+              <div className="col-span-2 grid gap-1.5">
+                <Label htmlFor="c2-listener-bind">绑定地址</Label>
+                <Input
+                  id="c2-listener-bind"
+                  value={bindHost}
+                  onChange={(e) => setBindHost(e.target.value)}
+                  placeholder="0.0.0.0"
+                  className="font-mono"
+                />
+                <p className="text-muted-foreground text-[10px]">0.0.0.0 = 所有网卡</p>
+              </div>
+            )}
+          </div>
+
+          {hostKind === "vps" ? (
+            <div className="grid grid-cols-3 gap-3">
+              <div className="grid gap-1.5">
+                <Label htmlFor="c2-listener-remote-port">转发端口</Label>
+                <Input
+                  id="c2-listener-remote-port"
+                  type="number"
+                  min={1}
+                  max={65535}
+                  value={remotePortText}
+                  onChange={(e) => {
+                    setRemotePortText(e.target.value);
+                    setCallbackTouched(false);
+                  }}
+                  placeholder="如 8443"
+                  className="font-mono"
+                />
+                <p className="text-muted-foreground text-[10px]">在机器公网侧监听,需放行防火墙</p>
+              </div>
+              <div className="col-span-2 grid gap-1.5">
+                <Label htmlFor="c2-listener-callback">回调地址</Label>
+                <Input
+                  id="c2-listener-callback"
+                  value={callback}
+                  onChange={(e) => {
+                    setCallback(e.target.value);
+                    setCallbackTouched(true);
+                  }}
+                  placeholder="http://1.2.3.4:8443(按机器与端口预填,可改)"
+                  className="font-mono"
+                />
+                <p className="text-muted-foreground text-[10px]">
+                  预填 <code className="font-mono">http://&lt;机器 host&gt;:&lt;转发端口&gt;</code>
+                  ,可改;目标机必须能访问到
+                </p>
+              </div>
+            </div>
+          ) : (
+            <div className="grid gap-1.5">
               <Label htmlFor="c2-listener-callback">回调地址</Label>
               <Input
                 id="c2-listener-callback"
                 value={callback}
-                onChange={(e) => setCallback(e.target.value)}
+                onChange={(e) => {
+                  setCallback(e.target.value);
+                  setCallbackTouched(true);
+                }}
                 placeholder="http://1.2.3.4:8443"
                 className="font-mono"
               />
@@ -648,7 +817,7 @@ function C2ListenerDialog({
                 写进载荷的回调地址,如 http://1.2.3.4:8443(目标机必须能访问到)
               </p>
             </div>
-          </div>
+          )}
 
           <div className="grid gap-1.5">
             <Label htmlFor="c2-listener-path">信道路径</Label>

@@ -168,6 +168,8 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	// Exploit-DB/GitHub PoC),默认 6 小时一轮,可在漏洞库页开关与调整。
 	s.vulnSync = newVulnSync(s)
 	go s.vulnSync.run(s.ctx)
+	// VULNDB_V2(A): NVD 历史回填 worker——光标未完成时 30 秒后自动续跑(实现在 vulndb_backfill.go)。
+	go s.vulnBackfillWorker(s.ctx)
 	// 代理中心:本地代理池监听器 + 源站拉取 + 自动测活。恢复上次的出网模式,
 	// 并把出网地址接进 Manager.ProxyAddr(裸网 ⇄ 代理池的切换落点)。
 	s.initProxyCenter()
@@ -806,6 +808,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/vulndb/sync", s.vulnDBSyncStatus)
 	mux.HandleFunc("POST /api/vulndb/sync", s.triggerVulnDBSync)
 	mux.HandleFunc("PUT /api/vulndb/sync/config", s.setVulnDBSyncConfig)
+	// NVD 历史回填(实现在 vulndb_backfill_api.go,见 VULNDB_CONTRACTS_V2.md)。
+	mux.HandleFunc("GET /api/vulndb/backfill", s.vulnBackfillStatus)
+	mux.HandleFunc("POST /api/vulndb/backfill", s.vulnBackfillStart)
+	mux.HandleFunc("DELETE /api/vulndb/backfill", s.vulnBackfillCancel)
 	// ---- SRC 平台选择(平台 → 目标 → 资产) ----
 	mux.HandleFunc("GET /api/src/platforms", s.listSRCPlatforms)
 	mux.HandleFunc("POST /api/src/platforms", s.createSRCPlatform)

@@ -1500,6 +1500,8 @@ CREATE TABLE IF NOT EXISTS vulndb_entries (
     -- 参考链接与标签(数组 JSON)
     refs         JSONB NOT NULL DEFAULT '[]',
     tags         JSONB NOT NULL DEFAULT '[]',
+    -- 在野利用标记(来自 CISA KEV 已知被在野利用目录,由采集器维护;人工不可编辑)
+    kev          BOOLEAN NOT NULL DEFAULT false,
     -- 已收录 PoC 数(由 vulndb_pocs 派生,冗余存储便于列表展示)
     poc_count    INT NOT NULL DEFAULT 0,
     -- 状态:active(有效) / archived(归档) / draft(草稿)
@@ -1508,11 +1510,15 @@ CREATE TABLE IF NOT EXISTS vulndb_entries (
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 -- CVE 编号唯一(非空时);同一 CVE 重复拉取只更新不新增。
+-- 存量库补 kev 列(新建库由上方 CREATE TABLE 直接带出)。
+-- ⚠️ 必须排在下方 idx_vulndb_kev 之前:存量库建 partial index 时 kev 列必须已存在。
+ALTER TABLE vulndb_entries ADD COLUMN IF NOT EXISTS kev BOOLEAN NOT NULL DEFAULT false;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_vulndb_cve_unique
     ON vulndb_entries(cve_id) WHERE cve_id <> '';
 CREATE INDEX IF NOT EXISTS idx_vulndb_category ON vulndb_entries(category, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_vulndb_severity ON vulndb_entries(severity, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_vulndb_time     ON vulndb_entries(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_vulndb_kev      ON vulndb_entries(kev, updated_at DESC) WHERE kev;
 CREATE INDEX IF NOT EXISTS idx_vulndb_task     ON vulndb_entries(task_id) WHERE task_id IS NOT NULL;
 -- 全文检索(标题/描述)走 pg_trgm,与流量正文检索同套路。
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
@@ -1534,12 +1540,13 @@ CREATE TABLE IF NOT EXISTS vulndb_pocs (
     language    TEXT NOT NULL DEFAULT '',
     -- PoC 正文(代码/脚本/请求报文);大文本只详情页读取
     content     TEXT NOT NULL DEFAULT '',
-    -- 来源:manual / github(自动发现) / exploitdb / ai_generated
+    -- 来源:manual / github(自动发现) / exploitdb / pocorexp(PocOrExp_in_Github) /
+    --      nuclei(projectdiscovery 官方模板) / ai_generated
     source      TEXT NOT NULL DEFAULT 'manual',
     source_url  TEXT NOT NULL DEFAULT '',
     verified    BOOLEAN NOT NULL DEFAULT false,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_vulndb_pocs_entry ON vulndb_pocs(entry_id, id);
 -- 同一来源 URL 不重复入库(自动发现时靠它去重)。
@@ -1554,7 +1561,8 @@ CREATE TRIGGER trg_vulndb_pocs_upd BEFORE UPDATE ON vulndb_pocs
 -- ============================================================
 CREATE TABLE IF NOT EXISTS vulndb_sync_runs (
     id           BIGSERIAL PRIMARY KEY,
-    source       TEXT NOT NULL DEFAULT '',       -- nvd / github_advisory / exploitdb / github_poc
+    source       TEXT NOT NULL DEFAULT '',       -- nvd / github_advisory / exploitdb / github_poc /
+                                                    -- pocorexp_today / nuclei / kev / articles / nvd_backfill
     status       TEXT NOT NULL DEFAULT 'running', -- running / done / failed
     fetched      INT NOT NULL DEFAULT 0,
     inserted     INT NOT NULL DEFAULT 0,

@@ -50,9 +50,11 @@ type VulnEntry struct {
 	Refs         json.RawMessage `json:"refs"`
 	Tags         json.RawMessage `json:"tags"`
 	PocCount     int             `json:"poc_count"`
-	Status       string          `json:"status"`
-	CreatedAt    time.Time       `json:"created_at"`
-	UpdatedAt    time.Time       `json:"updated_at"`
+	// KEV 标记该 CVE 在 CISA 已知被在野利用目录中(采集器维护,人工编辑不覆盖)。
+	KEV       bool      `json:"kev"`
+	Status    string    `json:"status"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // VulnPoc 是漏洞库条目下的一条 PoC。
@@ -72,14 +74,14 @@ type VulnPoc struct {
 
 // vulnEntryListCols 列表不带 description/exploitation/remediation(可能很长)。
 const vulnEntryListCols = `id, category, title, cve_id, vendor, product, affected, severity,
-	vuln_class, source, task_id, finding_id, refs, tags, poc_count, status, created_at, updated_at`
+	vuln_class, source, task_id, finding_id, refs, tags, poc_count, kev, status, created_at, updated_at`
 
 const vulnEntryFullCols = vulnEntryListCols + `, description, exploitation, remediation`
 
 func scanVulnEntry(sc interface{ Scan(...any) error }, full bool) (*VulnEntry, error) {
 	var e VulnEntry
 	dest := []any{&e.ID, &e.Category, &e.Title, &e.CVEID, &e.Vendor, &e.Product, &e.Affected, &e.Severity,
-		&e.VulnClass, &e.Source, &e.TaskID, &e.FindingID, &e.Refs, &e.Tags, &e.PocCount, &e.Status, &e.CreatedAt, &e.UpdatedAt}
+		&e.VulnClass, &e.Source, &e.TaskID, &e.FindingID, &e.Refs, &e.Tags, &e.PocCount, &e.KEV, &e.Status, &e.CreatedAt, &e.UpdatedAt}
 	if full {
 		dest = append(dest, &e.Description, &e.Exploitation, &e.Remediation)
 	}
@@ -107,6 +109,7 @@ type VulnEntryFilter struct {
 	Q          string // 标题/描述/利用指引/厂商/产品 关键字
 	TaskID     int64  // 按来源任务筛选(0=不限)
 	HasPoc     string // "1"=仅看有 PoC,"0"=仅看无 PoC,空=不限
+	Kev        string // "1"=仅在野利用(KEV),"0"=仅非 KEV,空=不限
 	Sort       string // updated | created | severity | poc(缺省 updated)
 	Desc       bool
 	Limit      int
@@ -152,6 +155,11 @@ func (d *DB) ListVulnEntries(f VulnEntryFilter) ([]*VulnEntry, int, map[string]i
 		where = append(where, "poc_count > 0")
 	} else if f.HasPoc == "0" {
 		where = append(where, "poc_count = 0")
+	}
+	if f.Kev == "1" {
+		where = append(where, "kev")
+	} else if f.Kev == "0" {
+		where = append(where, "NOT kev")
 	}
 	kw := strings.Join(where, " AND ")
 
@@ -483,7 +491,9 @@ ON CONFLICT (cve_id) WHERE cve_id <> '' DO UPDATE SET
 	vendor = CASE WHEN EXCLUDED.vendor <> '' THEN EXCLUDED.vendor ELSE vulndb_entries.vendor END,
 	product = CASE WHEN EXCLUDED.product <> '' THEN EXCLUDED.product ELSE vulndb_entries.product END,
 	affected = CASE WHEN EXCLUDED.affected <> '' THEN EXCLUDED.affected ELSE vulndb_entries.affected END,
-	refs = CASE WHEN EXCLUDED.refs <> '[]'::jsonb THEN EXCLUDED.refs ELSE vulndb_entries.refs END,
+	// refs 用合并而非覆盖:文章/RSS 源先补进去的参考链接不能被下一轮 NVD 拉取冲掉。
+	refs = (SELECT COALESCE(jsonb_agg(DISTINCT x), '[]'::jsonb)
+		FROM jsonb_array_elements(vulndb_entries.refs || EXCLUDED.refs) AS x),
 	updated_at = now()
 RETURNING id, (xmax = 0) AS inserted`,
 		title, cveID, description, severity, vendor, product, affected, refs).Scan(&id, &inserted)
@@ -600,4 +610,73 @@ func (d *DB) CountVulnEntriesByCategory() (map[string]int, int, error) {
 		total += n
 	}
 	return out, total, rows.Err()
+}
+
+// ---- v2 采集源支撑(KEV 在野利用 / 文章参考链接合并) ----
+
+// SetKevByCVE 按 CVE 编号设置「在野利用」标记(KEV 采集器专用,幂等)。
+// 返回条目是否存在:KEV 目录里可能有本库尚未收录的 CVE(等 NVD 回填入库后,
+// 下一轮 KEV 刷新自然补标记),不存在不算错误。
+func (d *DB) SetKevByCVE(cveID string, kev bool) (bool, error) {
+	cveID = strings.ToUpper(strings.TrimSpace(cveID))
+	if cveID == "" {
+		return false, nil
+	}
+	res, err := d.Exec(`UPDATE vulndb_entries SET kev=$2 WHERE cve_id=$1`, cveID, kev)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// ListKevCveIds 当前已标记在野利用的全部 CVE 编号(KEV 刷新时反向清除已移出目录的条目)。
+func (d *DB) ListKevCveIds() ([]string, error) {
+	rows, err := d.Query(`SELECT cve_id FROM vulndb_entries WHERE kev AND cve_id <> ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// MergeVulnRefs 把参考链接并入条目 refs(JSONB 数组去重合并,保序不保证)。
+// 条目不存在时不报错(自动发现与人工编辑竞态下静默跳过)。
+func (d *DB) MergeVulnRefs(entryID int64, urls []string) error {
+	if entryID <= 0 || len(urls) == 0 {
+		return nil
+	}
+	incoming, err := json.Marshal(urls)
+	if err != nil {
+		return err
+	}
+	_, err = d.Exec(`UPDATE vulndb_entries SET refs = (
+		SELECT COALESCE(jsonb_agg(DISTINCT x), '[]'::jsonb)
+		FROM jsonb_array_elements(refs || $2::jsonb) AS x
+	), updated_at=now() WHERE id=$1`, entryID, incoming)
+	return err
+}
+
+// MergeVulnTags 把标签并入条目 tags(JSONB 数组去重合并)。
+func (d *DB) MergeVulnTags(entryID int64, tags []string) error {
+	if entryID <= 0 || len(tags) == 0 {
+		return nil
+	}
+	incoming, err := json.Marshal(tags)
+	if err != nil {
+		return err
+	}
+	_, err = d.Exec(`UPDATE vulndb_entries SET tags = (
+		SELECT COALESCE(jsonb_agg(DISTINCT x), '[]'::jsonb)
+		FROM jsonb_array_elements(tags || $2::jsonb) AS x
+	), updated_at=now() WHERE id=$1`, entryID, incoming)
+	return err
 }

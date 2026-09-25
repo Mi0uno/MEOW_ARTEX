@@ -157,6 +157,18 @@ func ValidC2PayloadTarget(t string) bool {
 	return false
 }
 
+// 监听器载体(二期 §12):local=平台本机(一期行为);vps=以 VPS 机器为出入口,
+// 平台经 SSH 远程转发把 VPS:remote_port 的流量转回本机监听器。
+const (
+	C2ListenerHostKindLocal = "local"
+	C2ListenerHostKindVPS   = "vps"
+)
+
+// ValidC2ListenerHostKind 校验监听器载体类型。
+func ValidC2ListenerHostKind(k string) bool {
+	return k == C2ListenerHostKindLocal || k == C2ListenerHostKindVPS
+}
+
 // ---- 监听器 ----
 
 // C2Listener 是 beacon 回连入口(不含 enc_key,可直接序列化为响应)。
@@ -171,22 +183,34 @@ type C2Listener struct {
 	Callback string `json:"callback"`
 	Enabled  bool   `json:"enabled"`
 	// SessionCount 是该监听器当前 online 会话数(列表页「在线会话数」列)。
-	SessionCount int64     `json:"session_count"`
-	Notes        string    `json:"notes"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	SessionCount int64  `json:"session_count"`
+	Notes        string `json:"notes"`
+	// 二期载体字段(契约 §12):vps 载体时 VPSMachineID>0 且 RemotePort>0,
+	// Callback 可空(前端用机器 host 拼)。VPSMachineName 由 vps_machines 带出
+	//(local 载体或机器已删为空串),仅展示用。
+	HostKind       string `json:"host_kind"`
+	VPSMachineID   int64  `json:"vps_machine_id"`
+	RemotePort     int    `json:"remote_port"`
+	VPSMachineName string `json:"vps_machine_name,omitempty"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // c2ListenerCols 是监听器行的取列;enc_key 永不出现(单独 GetC2ListenerKey)。
+// 机器名用相关子查询带出(List/Get 共用同一取列串,口径一致)。
 const c2ListenerCols = `l.id, l.name, l.proto, l.bind_host, l.port, l.url_path, l.callback,
 	l.enabled,
 	(SELECT COUNT(*) FROM c2_sessions cs WHERE cs.listener_id = l.id AND cs.status = 'online'),
-	l.notes, l.created_at, l.updated_at`
+	l.notes, l.created_at, l.updated_at,
+	COALESCE(l.host_kind,'local'), COALESCE(l.vps_machine_id,0), l.remote_port,
+	COALESCE((SELECT vm.name FROM vps_machines vm WHERE vm.id = l.vps_machine_id), '')`
 
 func scanC2Listener(sc interface{ Scan(...any) error }) (*C2Listener, error) {
 	var l C2Listener
 	if err := sc.Scan(&l.ID, &l.Name, &l.Proto, &l.BindHost, &l.Port, &l.URLPath, &l.Callback,
-		&l.Enabled, &l.SessionCount, &l.Notes, &l.CreatedAt, &l.UpdatedAt); err != nil {
+		&l.Enabled, &l.SessionCount, &l.Notes, &l.CreatedAt, &l.UpdatedAt,
+		&l.HostKind, &l.VPSMachineID, &l.RemotePort, &l.VPSMachineName); err != nil {
 		return nil, err
 	}
 	return &l, nil
@@ -203,6 +227,11 @@ type C2ListenerInput struct {
 	Callback     string
 	EncKeySealed []byte
 	Notes        string
+	// 二期载体字段(契约 §12):HostKind 空=local;vps 时 VPSMachineID>0 且
+	// RemotePort>0,local 时二者强制归零。
+	HostKind     string
+	VPSMachineID int64
+	RemotePort   int
 }
 
 // normalizeC2ListenerInput 填默认值并校验。
@@ -220,6 +249,23 @@ func normalizeC2ListenerInput(in *C2ListenerInput) error {
 	if in.Port < 0 || in.Port > 65535 {
 		return fmt.Errorf("端口无效(0=自动分配,1-65535)")
 	}
+	if in.HostKind == "" {
+		in.HostKind = C2ListenerHostKindLocal
+	}
+	if !ValidC2ListenerHostKind(in.HostKind) {
+		return fmt.Errorf("无效载体类型: %q(仅 local/vps)", in.HostKind)
+	}
+	if in.HostKind == C2ListenerHostKindVPS {
+		if in.VPSMachineID <= 0 {
+			return fmt.Errorf("vps 载体必须指定机器(vps_machine_id)")
+		}
+		if in.RemotePort <= 0 || in.RemotePort > 65535 {
+			return fmt.Errorf("vps 载体必须指定远端端口 remote_port(1-65535)")
+		}
+	} else {
+		in.VPSMachineID = 0
+		in.RemotePort = 0
+	}
 	return nil
 }
 
@@ -233,9 +279,11 @@ func (d *DB) CreateC2Listener(in C2ListenerInput) (int64, error) {
 	}
 	var id int64
 	err := d.QueryRow(`
-INSERT INTO c2_listeners(name, bind_host, port, url_path, callback, enc_key, notes)
-VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
-		in.Name, in.BindHost, in.Port, in.URLPath, in.Callback, in.EncKeySealed, in.Notes).Scan(&id)
+INSERT INTO c2_listeners(name, bind_host, port, url_path, callback, enc_key, notes,
+	host_kind, vps_machine_id, remote_port)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+		in.Name, in.BindHost, in.Port, in.URLPath, in.Callback, in.EncKeySealed, in.Notes,
+		in.HostKind, nullableID(in.VPSMachineID), in.RemotePort).Scan(&id)
 	return id, err
 }
 
@@ -277,9 +325,11 @@ func (d *DB) UpdateC2Listener(id int64, in C2ListenerInput) error {
 	}
 	_, err := d.Exec(`UPDATE c2_listeners SET
 	name=$2, bind_host=$3, port=$4, url_path=$5, callback=$6, notes=$7,
-	enc_key = CASE WHEN $8::boolean THEN $9 ELSE enc_key END
+	host_kind=$8, vps_machine_id=$9, remote_port=$10,
+	enc_key = CASE WHEN $11::boolean THEN $12 ELSE enc_key END
 WHERE id=$1`,
 		id, in.Name, in.BindHost, in.Port, in.URLPath, in.Callback, in.Notes,
+		in.HostKind, nullableID(in.VPSMachineID), in.RemotePort,
 		in.EncKeySealed != nil, in.EncKeySealed)
 	return err
 }
@@ -1096,17 +1146,24 @@ type C2Payload struct {
 	CreatedBy  string    `json:"created_by"`
 	CreatedAt  time.Time `json:"created_at"`
 
+	// 二期列(契约 §13/§14):变形来源档案(0=无)与是否经 VPS 构建出二进制
+	//(gosrc 建行时是源码 zip,构建成功后 sha256/size/file_path 回填为二进制)。
+	EvasionProfileID int64 `json:"evasion_profile_id"`
+	BuiltOnVPS       bool  `json:"built_on_vps"`
+
 	// FilePath 平台侧文件路径,json:"-" 永不序列化。
 	FilePath string `json:"-"`
 }
 
 const c2PayloadCols = `p.id, p.listener_id, p.name, p.format, p.target, p.token,
-	p.file_path, p.sha256, p.size, p.oneliner, p.created_by, p.created_at`
+	p.file_path, p.sha256, p.size, p.oneliner, p.created_by, p.created_at,
+	COALESCE(p.evasion_profile_id,0), p.built_on_vps`
 
 func scanC2Payload(sc interface{ Scan(...any) error }) (*C2Payload, error) {
 	var pl C2Payload
 	err := sc.Scan(&pl.ID, &pl.ListenerID, &pl.Name, &pl.Format, &pl.Target, &pl.Token,
-		&pl.FilePath, &pl.SHA256, &pl.Size, &pl.Oneliner, &pl.CreatedBy, &pl.CreatedAt)
+		&pl.FilePath, &pl.SHA256, &pl.Size, &pl.Oneliner, &pl.CreatedBy, &pl.CreatedAt,
+		&pl.EvasionProfileID, &pl.BuiltOnVPS)
 	return &pl, err
 }
 
@@ -1122,6 +1179,8 @@ type C2PayloadInput struct {
 	Size       int64
 	Oneliner   string
 	CreatedBy  string
+	// EvasionProfileID 变形来源档案(免杀管线创建的载荷带;0=无)。
+	EvasionProfileID int64
 }
 
 // CreateC2Payload 登记载荷(token 必填且全局唯一)。
@@ -1143,16 +1202,26 @@ func (d *DB) CreateC2Payload(in C2PayloadInput) (int64, error) {
 	}
 	var id int64
 	err := d.QueryRow(`
-INSERT INTO c2_payloads(listener_id, name, format, target, token, file_path, sha256, size, oneliner, created_by)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+INSERT INTO c2_payloads(listener_id, name, format, target, token, file_path, sha256, size, oneliner, created_by, evasion_profile_id)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
 		in.ListenerID, in.Name, in.Format, in.Target, in.Token, in.FilePath,
-		in.SHA256, in.Size, in.Oneliner, in.CreatedBy).Scan(&id)
+		in.SHA256, in.Size, in.Oneliner, in.CreatedBy, nullableID(in.EvasionProfileID)).Scan(&id)
 	return id, err
 }
 
 // UpdateC2PayloadFilePath 回填落盘路径(先登记拿 id、再按数字 id 构造文件名的时序)。
 func (d *DB) UpdateC2PayloadFilePath(id int64, path string) error {
 	_, err := d.Exec(`UPDATE c2_payloads SET file_path=$2 WHERE id=$1`, id, path)
+	return err
+}
+
+// UpdateC2PayloadBuildResult 回填 VPS 构建产物(契约 §14):下载入口改指二进制文件,
+// sha256/size 换成二进制的值,built_on_vps=true。构建失败不调用(job.error 记原因,
+// 载荷行保持源码 zip 状态仍可下载)。
+func (d *DB) UpdateC2PayloadBuildResult(id int64, filePath, sha256 string, size int64) error {
+	_, err := d.Exec(`UPDATE c2_payloads SET
+	file_path=$2, sha256=$3, size=$4, built_on_vps=true
+WHERE id=$1`, id, filePath, sha256, size)
 	return err
 }
 

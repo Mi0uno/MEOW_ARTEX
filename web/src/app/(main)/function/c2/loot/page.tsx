@@ -6,12 +6,27 @@
 // 搜索 + 服务端筛选分页。列表里 content 恒空串(credential/hash 密文存储),
 // 「查看」走详情接口取明文,弹窗展示。支持 ?kind=&q=&session_id= 深链
 // (会话详情未来可带 session_id 跳转),useSearchParams 包 Suspense。
+//
+// 转发现(二期,契约 §15):把一条战利品登记为发现(复用既有发现链路),
+// 需要会话已绑定任务(否则 400);已转换的行显示「发现 #id」徽标可跳发现详情。
+// 后端回填 c2_loot.finding_id;冻结的 C2Loot 类型尚未声明该字段,这里用本地
+// 交叉类型兜底(字段缺失时不显示徽标,重复转换由 409 路径提示)。
 
 import * as React from "react";
 
+import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 
-import { EyeIcon, GemIcon, PlusIcon, RefreshCwIcon, SearchIcon, Trash2Icon, XIcon } from "lucide-react";
+import {
+  ArrowUpRightIcon,
+  EyeIcon,
+  GemIcon,
+  PlusIcon,
+  RefreshCwIcon,
+  SearchIcon,
+  Trash2Icon,
+  XIcon,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { TablePagination } from "@/components/table-pagination";
@@ -48,6 +63,9 @@ import type { C2Loot, C2LootKind } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const PAGE_SIZE = 50;
+
+// 后端在 loot 行上回填 finding_id(契约 §15),冻结的 C2Loot 尚未声明;本地交叉类型兜底。
+type C2LootRow = C2Loot & { finding_id?: number };
 
 type KindTab = "all" | C2LootKind;
 
@@ -96,6 +114,8 @@ function C2LootInner() {
   // 删除确认。
   const [removing, setRemoving] = React.useState<C2Loot | null>(null);
   const [deleteBusy, setDeleteBusy] = React.useState(false);
+  // 转发现行级 busy。
+  const [convertingId, setConvertingId] = React.useState<number | null>(null);
 
   const sessionId = sessionIdText ? Number(sessionIdText) : 0;
 
@@ -151,6 +171,24 @@ function C2LootInner() {
   const reload = () => {
     load(kind, queryApplied, sessionId, page, pageSize);
     loadCounts(sessionId);
+  };
+
+  // 转发现(二期):复用既有发现登记链路。会话未绑定任务 → 400;重复转换 → 409。
+  // api 只把后端 error 原文抛成 message,这里按关键词归一成两句固定文案。
+  const toFinding = async (x: C2LootRow) => {
+    setConvertingId(x.id);
+    try {
+      const r = await api.c2LootToFinding(x.id);
+      toast.success(`已转为发现 #${r.finding_id},可点击行内徽标查看`);
+      reload();
+    } catch (e) {
+      const msg = (e as Error).message || "";
+      if (msg.includes("绑定")) toast.error("转换失败:先在会话页绑定任务");
+      else if (msg.includes("转换") || msg.includes("重复")) toast.error("该战利品已转换过,不能重复转换");
+      else toast.error(`转换失败:${msg}`);
+    } finally {
+      setConvertingId(null);
+    }
   };
 
   const confirmRemove = async () => {
@@ -270,24 +308,35 @@ function C2LootInner() {
                 <TableHeader>
                   <TableRow className="hover:bg-transparent">
                     {/* 名称列不设宽度:table-fixed 下自动吃掉余量。
-                        固定列合计 608px(80+224+80+144+80),常规容器下余量充足。 */}
+                        固定列合计 632px(80+224+80+144+112),常规容器下余量充足。 */}
                     <TableHead>名称</TableHead>
                     <TableHead className="w-20">类型</TableHead>
                     <TableHead className="w-56">来源路径</TableHead>
                     <TableHead className="w-20">会话</TableHead>
                     <TableHead className="w-36">时间</TableHead>
-                    <TableHead className="w-20">操作</TableHead>
+                    <TableHead className="w-28">操作</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {loot.map((x) => {
+                  {loot.map((raw) => {
+                    const x = raw as C2LootRow;
                     const meta = c2LootKindMeta(String(x.kind));
+                    const findingId = num(x.finding_id);
                     return (
                       <TableRow key={x.id}>
                         <TableCell className="min-w-0">
                           <span className="block w-full truncate font-medium" title={x.name}>
                             {x.name}
                           </span>
+                          {findingId > 0 ? (
+                            <Link
+                              href={`/function/findings/detail?id=${findingId}`}
+                              className="inline-flex items-center gap-0.5 rounded-full border border-blue-500/30 bg-blue-500/15 px-1.5 py-px text-[10px] text-blue-600 hover:underline"
+                              title="已登记为发现,点击查看"
+                            >
+                              发现 #{findingId}
+                            </Link>
+                          ) : null}
                         </TableCell>
                         <TableCell>
                           <Badge variant="outline" className={meta.badge}>
@@ -319,6 +368,19 @@ function C2LootInner() {
                             >
                               <EyeIcon className="size-3.5" />
                             </Button>
+                            {findingId <= 0 ? (
+                              <Button
+                                variant="ghost"
+                                size="icon-xs"
+                                onClick={() => void toFinding(x)}
+                                disabled={convertingId === x.id}
+                                title="转为发现(需会话已绑定任务)"
+                              >
+                                <ArrowUpRightIcon
+                                  className={convertingId === x.id ? "size-3.5 animate-spin" : "size-3.5"}
+                                />
+                              </Button>
+                            ) : null}
                             <Button variant="ghost" size="icon-xs" onClick={() => setRemoving(x)} title="删除">
                               <Trash2Icon className="text-muted-foreground size-3.5" />
                             </Button>

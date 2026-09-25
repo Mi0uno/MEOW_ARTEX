@@ -1064,6 +1064,7 @@ export const api = {
     q?: string;
     taskId?: number;
     hasPoc?: string;
+    kev?: string;
     sort?: string;
     limit?: number;
     offset?: number;
@@ -1077,6 +1078,7 @@ export const api = {
     if (input?.q) p.set("q", input.q);
     if (input?.taskId) p.set("task_id", String(input.taskId));
     if (input?.hasPoc) p.set("has_poc", input.hasPoc);
+    if (input?.kev && input.kev !== "all") p.set("kev", input.kev);
     if (input?.sort) p.set("sort", input.sort);
     p.set("limit", String(input?.limit ?? 50));
     p.set("offset", String(input?.offset ?? 0));
@@ -1108,6 +1110,14 @@ export const api = {
   triggerVulnSync: () => post<{ status: string }>("/vulndb/sync", {}),
   setVulnSyncConfig: (input: { enabled?: boolean; interval_hours?: number }) =>
     put<{ ok: boolean }>("/vulndb/sync/config", input),
+  // NVD 历史回填:启动/进度/取消(断点续跑,进度存 settings)。
+  vulnBackfillStatus: () =>
+    get<{ running: boolean; phase: string; start_year: number; window_end: string; done: boolean; error: string }>(
+      "/vulndb/backfill",
+    ),
+  startVulnBackfill: (input: { start_year?: number }) =>
+    post<{ status: string }>("/vulndb/backfill", input ?? {}),
+  cancelVulnBackfill: () => del<{ status: string }>("/vulndb/backfill"),
   // ---- SRC 平台选择(平台 → 目标 → 资产) ----
   srcPlatforms: (input?: { q?: string; enabled?: string; limit?: number; offset?: number }) => {
     const p = new URLSearchParams();

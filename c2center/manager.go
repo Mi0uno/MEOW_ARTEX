@@ -38,6 +38,14 @@ const (
 	TaskError  = "error"
 )
 
+// 监听器载体(契约 §12):local=平台本机(一期行为,监听器直接暴露 bind_host:port);
+// vps=以 VPS 机器为出入口——本地照常监听,VPS:remote_port 的流量经 SSH 远程转发
+// 回到本地监听器(转发本体在 vpscenter,本包只持抽象视图)。
+const (
+	HostKindLocal = "local"
+	HostKindVPS   = "vps"
+)
+
 // 传输方向:up=平台→目标(blob 在 uploads/,beacon 只读);down=目标→平台(产物在
 // downloads/,beacon 只写)。
 const (
@@ -48,18 +56,23 @@ const (
 // Listener 是监听器的持久化视图。enc_key 永不出现在此结构(server 适配器经
 // GetListenerKey 单独交密钥);SessionCount 由 ListListeners 实现方回填。
 type Listener struct {
-	ID           int64     `json:"id"`
-	Name         string    `json:"name"`
-	Proto        string    `json:"proto"` // http(https 二期)
-	BindHost     string    `json:"bind_host"`
-	Port         int       `json:"port"` // 0=启动时自动分配
-	URLPath      string    `json:"url_path"`
-	Callback     string    `json:"callback"`
-	Enabled      bool      `json:"enabled"`
-	SessionCount int       `json:"session_count"`
-	Notes        string    `json:"notes"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	ID           int64  `json:"id"`
+	Name         string `json:"name"`
+	Proto        string `json:"proto"` // http(https 二期)
+	BindHost     string `json:"bind_host"`
+	Port         int    `json:"port"` // 0=启动时自动分配
+	URLPath      string `json:"url_path"`
+	Callback     string `json:"callback"`
+	Enabled      bool   `json:"enabled"`
+	SessionCount int    `json:"session_count"`
+	Notes        string `json:"notes"`
+	// 二期载体字段(契约 §12)。vps 载体时 Callback 可空(投递地址用机器 host 拼)。
+	HostKind     string `json:"host_kind"`      // local|vps
+	VPSMachineID int64  `json:"vps_machine_id"` // vps 载体的机器 id;local=0
+	RemotePort   int    `json:"remote_port"`    // vps 载体的远端监听端口;local=0
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // ListenerInput 是创建/更新监听器的入参(proto 固定 http,不在入参里;enabled 走
@@ -71,6 +84,11 @@ type ListenerInput struct {
 	URLPath  string `json:"url_path"`
 	Callback string `json:"callback"`
 	Notes    string `json:"notes"`
+	// 二期载体字段(契约 §12):vps 时 VPSMachineID>0 且 RemotePort>0
+	//(白名单校验在 db/server 两层)。
+	HostKind     string `json:"host_kind"`
+	VPSMachineID int64  `json:"vps_machine_id"`
+	RemotePort   int    `json:"remote_port"`
 }
 
 // Session 是一台上线主机。sid 是 beacon 持有的会话令牌;listener_id+beacon_uid 幂等复活。
@@ -288,6 +306,13 @@ type Store interface {
 	DeletePayload(id int64) error
 }
 
+// IngressForwarder 是 vps 载体监听器的入口转发器最小视图(契约 §12)。server 侧
+// 用 vpscenter.RemoteForward 实现它:VPS:remote_port 的流量经 SSH 远程转发回到
+// 本地监听器。Stop 语义:向远端注销 tcpip-forward 并关 SSH 连接,幂等。
+type IngressForwarder interface {
+	Stop() error
+}
+
 // Manager 是 C2 中心运行时:持有运行中的监听器,提供启停与 30s 巡检。
 type Manager struct {
 	store Store
@@ -304,9 +329,22 @@ type Manager struct {
 	// PollWait 是 beacon 长轮询的最长挂起时长,默认 25s。
 	PollWait time.Duration
 
+	// IngressOpener 是 vps 载体的转发建立回调(契约 §12,server 在 initC2 注入;
+	// nil 时全部监听器按 local 载体处理)。
+	//
+	// 为什么需要回调:boot 恢复路径(Manager.Start 拉起 enabled 监听器)只能完成
+	// 「本地监听」这一半——SSH 远程转发需要 vpscenter 的机器凭据,那在 server 层,
+	// 本包拿不到(也不允许 import)。因此 Start 对每个 enabled 监听器先起本地监听,
+	// 随后回调本函数;server 侧按 db 行的 host_kind 决定是否 OpenRemoteForward,
+	// 返回的转发器由本包登记、随 StopListener/进程退出连带 Stop。返回 (nil, nil)
+	// 表示纯本机载体;返回错误只记日志不中断其它监听器(与单个监听器启动失败同一
+	// 策略),API 手动 start 的 SSH 错误由 server 编排路径原样上报,不经这里。
+	IngressOpener func(l *Listener) (IngressForwarder, error)
+
 	mu      sync.Mutex
 	ctx     context.Context
 	running map[int64]*channelServer
+	ingress map[int64]IngressForwarder // 监听器 id → 入口转发器(随监听器启停)
 }
 
 // NewManager 构造运行时。log 可为 nil(回落 slog.Default())。
@@ -321,6 +359,7 @@ func NewManager(st Store, log *slog.Logger) *Manager {
 		SweepGraceMultiplier: defaultSweepGrace,
 		PollWait:             defaultPollWait,
 		running:              map[int64]*channelServer{},
+		ingress:              map[int64]IngressForwarder{},
 	}
 }
 
@@ -340,7 +379,7 @@ func (m *Manager) Start(ctx context.Context) {
 			if !listeners[i].Enabled {
 				continue
 			}
-			if err := m.StartListener(&listeners[i]); err != nil {
+			if err := m.startBoot(&listeners[i]); err != nil {
 				m.logf("监听器 «%s»(#%d) 启动失败: %v", listeners[i].Name, listeners[i].ID, err)
 			}
 		}
@@ -402,16 +441,86 @@ func (m *Manager) StartListener(l *Listener) error {
 	return nil
 }
 
+// StartListenerWithIngress 启动本地监听并登记入口转发器(vps 载体,契约 §12;
+// server 的手动 start 编排入口)。ig 为 nil 等价 StartListener + 清除登记。
+//
+// 顺序与所有权:先 StartListener(本地半边,端口占用等错误原样返回),成功后才
+// 登记 ig——本地失败时 ig 尚未交给本包,由调用方自行 Stop。登记时若已有旧转发器
+// (重复 start)先停旧的再覆盖,防泄漏 SSH 连接与远端端口。StopListener 会连带
+// Stop 已登记的转发器(先转发后监听,契约 §12 的停止顺序)。
+func (m *Manager) StartListenerWithIngress(l *Listener, ig IngressForwarder) error {
+	if err := m.StartListener(l); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	old := m.ingress[l.ID]
+	if ig != nil {
+		m.ingress[l.ID] = ig
+	} else {
+		delete(m.ingress, l.ID)
+	}
+	m.mu.Unlock()
+	if old != nil && old != ig {
+		if err := old.Stop(); err != nil {
+			m.logf("监听器 #%d 旧入口转发停止异常(已被新转发器覆盖): %v", l.ID, err)
+		}
+	}
+	return nil
+}
+
+// startBoot 是 boot 恢复路径的单监听器编排(仅 Manager.Start 使用):先起本地监听,
+// 成功后经 IngressOpener 回调由 server 建立 vps 载体的入口转发。本地已起而转发
+// 建立失败时保持本地运行并只记日志(beacon 暂时连不上,用户可在页面手动 start
+// 重建——手动 start 走 server 编排,SSH 错误会原样报给前端)。
+func (m *Manager) startBoot(l *Listener) error {
+	if err := m.StartListener(l); err != nil {
+		return err
+	}
+	if m.IngressOpener == nil || l.HostKind != HostKindVPS {
+		return nil
+	}
+	ig, err := m.IngressOpener(l)
+	if err != nil {
+		m.logf("监听器 «%s»(#%d) 入口转发建立失败(本地监听保持运行): %v", l.Name, l.ID, err)
+		return nil
+	}
+	if ig == nil {
+		return nil
+	}
+	m.mu.Lock()
+	m.ingress[l.ID] = ig
+	m.mu.Unlock()
+	return nil
+}
+
+// IngressRunning 返回监听器是否登记着入口转发器(vps 载体的「转发在位」运行时
+// 状态;【契约 §4 之外的追加方法】,server 的监听器 DTO 标注用)。
+func (m *Manager) IngressRunning(id int64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ingress[id] != nil
+}
+
 // StopListener 停止单个监听器。未在运行时返回错误。
+// vps 载体(契约 §12):先停入口转发器(注销远端端口/断 SSH),再停本地监听。
 func (m *Manager) StopListener(id int64) error {
 	m.mu.Lock()
 	cs := m.running[id]
+	ig := m.ingress[id]
 	delete(m.running, id)
+	delete(m.ingress, id)
 	m.mu.Unlock()
-	if cs == nil {
+	if cs == nil && ig == nil {
 		return fmt.Errorf("监听器 #%d 未在运行", id)
 	}
-	cs.stop()
+	if ig != nil {
+		if err := ig.Stop(); err != nil {
+			m.logf("监听器 #%d 的入口转发停止异常(继续停本地监听): %v", id, err)
+		}
+	}
+	if cs != nil {
+		cs.stop()
+	}
 	m.logf("C2 监听器 #%d 已停止", id)
 	return nil
 }
@@ -469,12 +578,20 @@ func (m *Manager) sweepOnce() {
 	}
 }
 
-// stopAll 停掉全部运行中的监听器(ctx 取消时调用)。
+// stopAll 停掉全部运行中的监听器(ctx 取消时调用)。契约 §12 的停止顺序:
+// 先停入口转发器再停本地监听。
 func (m *Manager) stopAll() {
 	m.mu.Lock()
 	running := m.running
+	ingress := m.ingress
 	m.running = map[int64]*channelServer{}
+	m.ingress = map[int64]IngressForwarder{}
 	m.mu.Unlock()
+	for id, ig := range ingress {
+		if err := ig.Stop(); err != nil {
+			m.logf("监听器 #%d 的入口转发停止异常(随 Manager 停止): %v", id, err)
+		}
+	}
 	for id, cs := range running {
 		cs.stop()
 		m.logf("C2 监听器 #%d 已随 Manager 停止", id)

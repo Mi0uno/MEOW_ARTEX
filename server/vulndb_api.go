@@ -11,7 +11,7 @@ import (
 	"github.com/Autumn-27/artex/db"
 )
 
-// listVulnEntries GET /api/vulndb/entries?category=&categories=&severity=&status=&source=&q=&has_poc=&sort=&desc=&limit=&offset=
+// listVulnEntries GET /api/vulndb/entries?category=&categories=&severity=&status=&source=&q=&has_poc=&kev=&sort=&desc=&limit=&offset=
 // categories 支持逗号分隔多分类(如 categories=0day,nday = 漏洞库页排除 CVE)。
 func (s *Server) listVulnEntries(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
@@ -33,6 +33,7 @@ func (s *Server) listVulnEntries(w http.ResponseWriter, r *http.Request) {
 		Q:          strings.TrimSpace(q.Get("q")),
 		TaskID:     taskID,
 		HasPoc:     strings.TrimSpace(q.Get("has_poc")),
+		Kev:        strings.TrimSpace(q.Get("kev")),
 		Sort:       strings.TrimSpace(q.Get("sort")),
 		Desc:       q.Get("desc") != "0",
 		Limit:      limit, Offset: offset,

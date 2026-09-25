@@ -32,9 +32,14 @@ import (
 const (
 	settingVulnDBSyncOn       = "vulndb_sync_enabled"
 	settingVulnDBSyncInterval = "vulndb_sync_interval_hours"
-	vulnSyncDefaultInterval   = 6 // 小时
+	settingVulnGitHubToken    = "vulndb_github_token" // 可选:GitHub 个人令牌,放大 PoC 搜索配额
+	vulnSyncDefaultInterval   = 6                     // 小时
 	vulnSyncFetchLimit        = 2000
 	vulnSyncTimeout           = 5 * time.Minute
+	// vulnBackfillWindowStart 历史回填窗口起点(含)。NVD 全量回填从这里拉到今天;
+	// 更早的年代只由 Exploit-DB 反向建条目(只补确有公开 EXP 的那部分,避免灌入
+	// 大量无严重度/无 PoC 的空壳条目)。用户可在回填 API 里改 start_year。
+	vulnBackfillWindowStart = 2016
 )
 
 // vulnSync 是 CVE 采集器的运行状态(单例,挂在 Server 上)。
@@ -135,7 +140,7 @@ func (v *vulnSync) runOnce(ctx context.Context) {
 		totalNew += n
 		totalUpd += u
 	}
-	// 3) Exploit-DB:公开 EXP 索引(为已有条目补 PoC)。
+	// 3) Exploit-DB:公开 EXP 索引(为已有条目补 PoC;窗口外的老洞反向建条目)。
 	if p, err := v.syncExploitDB(ctx); err != nil {
 		log.Printf("[vulndb-sync] Exploit-DB 失败: %v", err)
 	} else {
@@ -144,6 +149,31 @@ func (v *vulnSync) runOnce(ctx context.Context) {
 	// 4) GitHub PoC 搜索:为近期高危 CVE 发现 PoC 仓库(限速,抽样)。
 	if p, err := v.syncGitHubPoCs(ctx); err != nil {
 		log.Printf("[vulndb-sync] GitHub PoC 搜索失败: %v", err)
+	} else {
+		totalPocs += p
+	}
+	// ---- v2 新增源(实现见 VULNDB_CONTRACTS_V2.md 的文件所有权矩阵) ----
+	// 5) CISA KEV:已知被在野利用目录,给条目打 kev 标记。
+	if n, err := v.syncKEV(ctx); err != nil {
+		log.Printf("[vulndb-sync] KEV 失败: %v", err)
+	} else {
+		totalUpd += n
+	}
+	// 6) PocOrExp_in_Github:当日 GitHub PoC/EXP 增量。
+	if p, err := v.syncPocOrExpToday(ctx); err != nil {
+		log.Printf("[vulndb-sync] PocOrExp 失败: %v", err)
+	} else {
+		totalPocs += p
+	}
+	// 7) nuclei 官方模板:按 CVE 挂模板 PoC。
+	if p, err := v.syncNucleiTemplates(ctx); err != nil {
+		log.Printf("[vulndb-sync] nuclei 模板失败: %v", err)
+	} else {
+		totalPocs += p
+	}
+	// 8) 安全社区文章 RSS:FreeBuf/安全客/先知,提取 CVE 编号入库/补参考链接。
+	if p, err := v.syncArticleFeeds(ctx); err != nil {
+		log.Printf("[vulndb-sync] 文章抓取失败: %v", err)
 	} else {
 		totalPocs += p
 	}
@@ -469,7 +499,7 @@ func (v *vulnSync) syncExploitDB(ctx context.Context) (pocs int, err error) {
 	//     date_updated,verified,codes,tags,aliases,screenshot_url,application_url,source_url
 	// CVE 编号在 codes 列(多个用 ; 分隔,混有 OSVDB 等其它编号)。
 	header := rows[0]
-	idxID, idxFile, idxDesc, idxType, idxCodes := -1, -1, -1, -1, -1
+	idxID, idxFile, idxDesc, idxType, idxCodes, idxDate := -1, -1, -1, -1, -1, -1
 	for i, h := range header {
 		switch strings.TrimSpace(strings.ToLower(h)) {
 		case "id":
@@ -482,6 +512,8 @@ func (v *vulnSync) syncExploitDB(ctx context.Context) (pocs int, err error) {
 			idxType = i
 		case "codes":
 			idxCodes = i
+		case "date_published":
+			idxDate = i
 		}
 	}
 	if idxCodes < 0 || idxFile < 0 {
@@ -502,8 +534,36 @@ func (v *vulnSync) syncExploitDB(ctx context.Context) (pocs int, err error) {
 				continue
 			}
 			entry, err := v.s.m.PG().FindVulnEntryByCVE(cve)
-			if err != nil || entry == nil {
-				continue // 库里没有这条 CVE 就跳过(先由 NVD/GHSA 建条目)
+			if err != nil {
+				log.Printf("[vulndb-sync] Exploit-DB 查询 %s 失败: %v", cve, err)
+				continue
+			}
+			if entry == nil {
+				// 库里没有这条 CVE:窗口内(2016 起)的交给 NVD/GHSA 全量回填建档,这里跳过;
+				// 窗口外的老洞反向建档——只有确有公开 EXP 的老 CVE 才值得入库,这正好是
+				// 「历史老洞」里真正有利用价值的子集(避免灌入大量无严重度/无 PoC 的空壳)。
+				if !edbpublishedBefore(idxDate, row, vulnBackfillWindowStart) {
+					continue
+				}
+				desc0 := ""
+				if idxDesc >= 0 && len(row) > idxDesc {
+					desc0 = strings.TrimSpace(row[idxDesc])
+				}
+				edURL := ""
+				if idxID >= 0 && len(row) > idxID {
+					edURL = "https://www.exploit-db.com/exploits/" + strings.TrimSpace(row[idxID])
+				}
+				entry, err = v.s.m.PG().CreateVulnEntry(db.VulnEntryInput{
+					Category: db.VulnCategoryCVE,
+					Title:    fmt.Sprintf("%s %s", cve, truncateRunes(desc0, 120)),
+					CVEID:    cve,
+					Source:   "cve_feed", Status: "active",
+					Refs: vulnJSON([]string{edURL}),
+				})
+				if err != nil {
+					log.Printf("[vulndb-sync] Exploit-DB 反向建档 %s 失败: %v", cve, err)
+					continue
+				}
 			}
 			file := strings.TrimSpace(row[idxFile])
 			if file == "" {
@@ -554,9 +614,18 @@ func (v *vulnSync) syncGitHubPoCs(ctx context.Context) (pocs int, err error) {
 		_ = v.s.m.PG().FinishVulnSyncRun(runID, status, 0, 0, 0, pocs, errMsg)
 	}()
 
-	// 取最近的高危 CVE 条目(最多 5 条,避免触发 GitHub 限速)。
+	// 取最近的高危 CVE 条目(无 token 时最多 5 条避免触发 GitHub 限速;
+	// 配置了 vulndb_github_token 则放大到 60 条,搜索配额 30 次/分钟)。
+	token := ""
+	if val, _, err := v.s.m.PG().GetSetting(settingVulnGitHubToken); err == nil {
+		token = strings.TrimSpace(val)
+	}
+	sample := 5
+	if token != "" {
+		sample = 60
+	}
 	items, _, _, err := v.s.m.PG().ListVulnEntries(db.VulnEntryFilter{
-		Category: db.VulnCategoryCVE, Sort: "updated", Limit: 5,
+		Category: db.VulnCategoryCVE, Sort: "updated", Limit: sample,
 	})
 	if err != nil {
 		return 0, err
@@ -585,7 +654,11 @@ func (v *vulnSync) syncGitHubPoCs(ctx context.Context) (pocs int, err error) {
 			} `json:"items"`
 		}
 		api := "https://api.github.com/search/repositories?q=" + url.QueryEscape(e.CVEID+" poc") + "&per_page=3&sort=stars"
-		if err := fetchJSON(ctx, api, nil, &result); err != nil {
+		headers := map[string]string{}
+		if token != "" {
+			headers["Authorization"] = "Bearer " + token
+		}
+		if err := fetchJSON(ctx, api, headers, &result); err != nil {
 			log.Printf("[vulndb-sync] GitHub PoC 搜索 %s 失败: %v", e.CVEID, err)
 			continue
 		}
@@ -609,6 +682,23 @@ func (v *vulnSync) syncGitHubPoCs(ctx context.Context) (pocs int, err error) {
 func vulnJSON(v any) json.RawMessage {
 	b, _ := json.Marshal(v)
 	return b
+}
+
+// edbpublishedBefore 判断 Exploit-DB 行的 date_published 列是否早于给定年份
+// (老洞反向建档的判据)。列缺失/解析失败一律 false:宁可漏一条也不误建档。
+func edbpublishedBefore(idxDate int, row []string, year int) bool {
+	if idxDate < 0 || len(row) <= idxDate {
+		return false
+	}
+	s := strings.TrimSpace(row[idxDate])
+	if len(s) < 4 {
+		return false
+	}
+	y, err := strconv.Atoi(s[:4])
+	if err != nil {
+		return false
+	}
+	return y < year
 }
 
 // truncateRunes 按字符截断(避免多字节被切断)。

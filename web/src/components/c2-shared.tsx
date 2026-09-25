@@ -7,7 +7,20 @@
 // 时间/字节格式化不 import vps-shared:C2 页面只依赖自己的 c2-* 组件与冻结的
 // lib/api.ts、lib/types.ts,避免把 VPS 的对话框组件拖进依赖图。
 
-import type { C2LootKind, C2Listener, C2PayloadFormat, C2SessionStatus, C2TaskKind, C2TaskStatus } from "@/lib/types";
+import { Badge } from "@/components/ui/badge";
+import type {
+  C2EvasionTargetAV,
+  C2JobKind,
+  C2JobStatus,
+  C2LootKind,
+  C2Listener,
+  C2PayloadFormat,
+  C2SessionStatus,
+  C2StaticReport,
+  C2TaskKind,
+  C2TaskStatus,
+} from "@/lib/types";
+import { cn } from "@/lib/utils";
 
 // ---- 格式化 ----
 
@@ -210,4 +223,153 @@ export function c2TaskInputText(input: string): string {
   } catch {
     return s;
   }
+}
+
+// ══ 二期(契约 §12-§15):免杀档案 / 异步作业 / 静态报告 ══
+
+// ---- 目标 AV(免杀档案)----
+
+const EVASION_AV_META: Record<C2EvasionTargetAV, { label: string; badge: string }> = {
+  defender: { label: "Defender", badge: "bg-blue-500/15 text-blue-600 border-blue-500/30" },
+  "360": { label: "360", badge: "bg-emerald-500/15 text-emerald-600 border-emerald-500/30" },
+  huorong: { label: "火绒", badge: "bg-amber-500/15 text-amber-600 border-amber-500/30" },
+  generic: { label: "通用", badge: "bg-purple-500/15 text-purple-600 border-purple-500/30" },
+  custom: { label: "自定义", badge: "bg-muted text-muted-foreground" },
+};
+
+export const C2_EVASION_AVS: C2EvasionTargetAV[] = ["defender", "360", "huorong", "generic", "custom"];
+
+export function c2EvasionAVMeta(av: string): { label: string; badge: string } {
+  return EVASION_AV_META[av as C2EvasionTargetAV] ?? { label: av, badge: "bg-muted text-muted-foreground" };
+}
+
+// 档案来源:manual(手工维护)/ llm(AI 生成)。
+export function c2EvasionSourceMeta(source: string): { label: string; badge: string } {
+  return source === "llm"
+    ? { label: "AI 生成", badge: "bg-violet-500/15 text-violet-600 border-violet-500/30" }
+    : { label: "手工", badge: "bg-muted text-muted-foreground" };
+}
+
+// ---- 异步作业(c2_jobs:evasion | build)----
+
+const JOB_STATUS_META: Record<C2JobStatus, { label: string; badge: string }> = {
+  queued: { label: "排队中", badge: "bg-amber-500/15 text-amber-600 border-amber-500/30" },
+  running: { label: "运行中", badge: "bg-blue-500/15 text-blue-600 border-blue-500/30" },
+  done: { label: "完成", badge: "bg-emerald-500/15 text-emerald-600 border-emerald-500/30" },
+  error: { label: "失败", badge: "bg-red-500/15 text-red-600 border-red-500/30" },
+};
+
+export function c2JobStatusMeta(status: string): { label: string; badge: string } {
+  return JOB_STATUS_META[status as C2JobStatus] ?? { label: status, badge: "bg-muted text-muted-foreground" };
+}
+
+const JOB_KIND_META: Record<C2JobKind, { label: string; badge: string }> = {
+  evasion: { label: "AI 变形", badge: "bg-violet-500/15 text-violet-600 border-violet-500/30" },
+  build: { label: "VPS 构建", badge: "bg-cyan-500/15 text-cyan-600 border-cyan-500/30" },
+};
+
+export function c2JobKindMeta(kind: string): { label: string; badge: string } {
+  return JOB_KIND_META[kind as C2JobKind] ?? { label: kind, badge: "bg-muted text-muted-foreground" };
+}
+
+// ---- 静态自测风险等级(契约 §13:low<3 | medium 3-5 | high>5 按命中数分档)----
+
+const RISK_META: Record<string, { label: string; badge: string }> = {
+  low: { label: "低", badge: "bg-emerald-500/15 text-emerald-600 border-emerald-500/30" },
+  medium: { label: "中", badge: "bg-amber-500/15 text-amber-600 border-amber-500/30" },
+  high: { label: "高", badge: "bg-red-500/15 text-red-600 border-red-500/30" },
+};
+
+export function c2RiskMeta(risk: string): { label: string; badge: string } {
+  return RISK_META[risk] ?? { label: risk, badge: "bg-muted text-muted-foreground" };
+}
+
+// ---- VPS 机器状态标注(listeners/payloads 页的机器下拉用,不引 vps-shared 依赖)----
+
+export function c2VpsStatusLabel(status: string): string {
+  const map: Record<string, string> = {
+    online: "在线",
+    offline: "离线",
+    busy: "占用中",
+    maintenance: "维护中",
+    unknown: "未测活",
+  };
+  return map[status] ?? (status || "未知");
+}
+
+// ---- 静态自测报告渲染:免杀页作业详情与载荷页构建详情共用 ----
+
+// C2StaticReportView 渲染 c2_jobs.result 的约定形状(契约 §13/§14):
+// 风险等级徽标 + 熵值 + 变形轮次 + 特征串命中列表 + PLAN 说明;
+// build 作业另带 build_log(VPS 构建日志尾部),有则一并渲染。
+export function C2StaticReportView({
+  report,
+  className,
+}: {
+  report: C2StaticReport | null | undefined;
+  className?: string;
+}) {
+  if (!report || (!report.hits?.length && !num(report.entropy) && !report.plan && !report.build_log)) {
+    return <p className="text-muted-foreground text-xs">暂无自测报告(作业完成后此处展示)。</p>;
+  }
+  const hits = report.hits ?? [];
+  const entropy = num(report.entropy);
+  const risk = c2RiskMeta(report.risk ?? "low");
+  return (
+    <div className={cn("grid gap-3", className)}>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 text-xs">
+        <Badge variant="outline" className={risk.badge} title="按特征串命中数分档:<3 低 / 3-5 中 / >5 高">
+          静态风险:{risk.label}
+        </Badge>
+        <span className="text-muted-foreground" title="Shanon 熵,>5.5 视为偏高">
+          熵值:<span className="text-foreground font-mono tabular-nums">{entropy > 0 ? entropy.toFixed(2) : "—"}</span>
+          {entropy > 5.5 ? <span className="text-amber-600">(偏高)</span> : null}
+        </span>
+        {num(report.rounds) > 0 ? (
+          <span className="text-muted-foreground">
+            变形轮次:<span className="text-foreground tabular-nums">{num(report.rounds)}</span>
+          </span>
+        ) : null}
+      </div>
+
+      <div>
+        <p className="mb-1.5 text-xs font-medium">特征串命中({hits.length})</p>
+        {hits.length === 0 ? (
+          <p className="text-muted-foreground text-xs">未命中任何已知特征串。</p>
+        ) : (
+          <ul className="grid gap-1">
+            {hits.map((h) => (
+              <li
+                key={h.marker}
+                className="flex items-center justify-between gap-2 rounded-md border bg-muted/30 px-2 py-1"
+              >
+                <code className="min-w-0 truncate font-mono text-xs" title={h.marker}>
+                  {h.marker}
+                </code>
+                <span className="text-muted-foreground shrink-0 text-xs tabular-nums">×{num(h.count)}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      {report.plan ? (
+        <div>
+          <p className="mb-1 text-xs font-medium">变形说明(PLAN)</p>
+          <pre className="max-h-44 overflow-auto rounded-md border bg-muted/30 p-2 font-mono text-xs leading-relaxed whitespace-pre-wrap break-all">
+            {report.plan}
+          </pre>
+        </div>
+      ) : null}
+
+      {report.build_log ? (
+        <div>
+          <p className="mb-1 text-xs font-medium">VPS 构建日志(尾部)</p>
+          <pre className="max-h-52 overflow-auto rounded-md border bg-muted/30 p-2 font-mono text-xs leading-relaxed whitespace-pre-wrap break-all">
+            {report.build_log}
+          </pre>
+        </div>
+      ) : null}
+    </div>
+  );
 }

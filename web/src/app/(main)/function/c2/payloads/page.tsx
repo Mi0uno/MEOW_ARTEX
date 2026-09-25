@@ -5,10 +5,14 @@
 // 生成:选监听器(回调地址为空的项禁选)+ 格式 + 目标 → 后端渲染源码落盘,
 // 返回 oneliner(目标机一行执行命令)。列表支持下载、复制一行命令、复制投递 URL
 // (<callback>/<url_path>/p/<token>)与删除。
-// 页底「免杀工作台」是二期占位:只读说明 + 徽标,不放任何可点控件。
+// 二期(契约 §13/§14):format=gosrc 可选指派一台 VPS 机器,生成转为异步构建
+// 作业(源码经 SSH 通道在机器上 go build,产物自动回传),前端 3 秒轮询作业状态;
+// 免杀档案变形过的载荷标「已变形」,VPS 编译出的标「已编译」。变形与静态自测
+// 在「免杀工作台」页。
 
 import * as React from "react";
 
+import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 
 import {
@@ -28,8 +32,11 @@ import { toast } from "sonner";
 
 import { TablePagination } from "@/components/table-pagination";
 import {
+  C2StaticReportView,
+  c2JobStatusMeta,
   c2PayloadFormatMeta,
   c2PayloadTargetLabel,
+  c2VpsStatusLabel,
   fmtBytes,
   fmtTime,
   num,
@@ -63,7 +70,7 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectVa
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
-import type { C2Listener, C2Payload, C2PayloadFormat, C2PayloadTarget } from "@/lib/types";
+import type { C2Job, C2Listener, C2Payload, C2PayloadFormat, C2PayloadTarget, VpsMachine } from "@/lib/types";
 import { copyText } from "@/lib/utils";
 
 const PAGE_SIZE = 50;
@@ -96,6 +103,13 @@ function C2PayloadsInner() {
   const [genTarget, setGenTarget] = React.useState<C2PayloadTarget>("windows");
   const [genName, setGenName] = React.useState("");
   const [generating, setGenerating] = React.useState(false);
+  // gosrc 的 VPS 构建(二期):空串 = 不编译,只出源码 zip。
+  const [machines, setMachines] = React.useState<VpsMachine[]>([]);
+  const [genBuildMachine, setGenBuildMachine] = React.useState("");
+  // 构建作业轮询:job 未结束时生成按钮保持转圈,结束后刷新列表。
+  const [pollJobId, setPollJobId] = React.useState<number | null>(null);
+  const [polledJob, setPolledJob] = React.useState<C2Job | null>(null);
+  const [viewingJob, setViewingJob] = React.useState<C2Job | null>(null);
   // 列表筛选(客户端搜索 + 服务端 listener_id 过滤)与排序/分页。
   const [filterListener, setFilterListener] = React.useState(() => {
     const v = Number(searchParams.get("listener_id"));
@@ -140,7 +154,44 @@ function C2PayloadsInner() {
     load(filterListener);
   }, [filterListener, load]);
 
-  const reload = () => load(filterListener);
+  // gosrc 第一次选中时拉一次机器列表(构建下拉用)。
+  React.useEffect(() => {
+    if (genFormat !== "gosrc" || machines.length > 0) return;
+    api
+      .vpsMachines()
+      .then((r) => setMachines(r.machines ?? []))
+      .catch(() => setMachines([]));
+  }, [genFormat, machines.length]);
+
+  const reload = React.useCallback(() => load(filterListener), [load, filterListener]);
+
+  // 构建作业轮询:每 3 秒拉一次,结束( done / error )即停并刷新列表。
+  React.useEffect(() => {
+    if (!pollJobId) return;
+    let alive = true;
+    const t = setInterval(() => {
+      api
+        .c2Job(pollJobId)
+        .then((j) => {
+          if (!alive) return;
+          setPolledJob(j);
+          if (j.status === "running" || j.status === "queued") return;
+          clearInterval(t);
+          if (j.status === "done") {
+            toast.success(`VPS 构建完成(作业 #${j.id}),载荷已就绪`);
+          } else {
+            toast.error(`VPS 构建失败:${j.error || "未知原因"}`);
+          }
+          setPollJobId(null);
+          reload();
+        })
+        .catch(() => {});
+    }, 3000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, [pollJobId, reload]);
 
   const generate = async () => {
     if (!genListener) {
@@ -159,8 +210,17 @@ function C2PayloadsInner() {
         format: genFormat,
         target: genTarget,
         name: genName.trim() || undefined,
+        // gosrc 且选了机器 → 走 VPS 构建作业(异步);否则保持一期直出源码 zip。
+        build_vps_machine_id:
+          genFormat === "gosrc" && genBuildMachine ? Number(genBuildMachine) : undefined,
       });
-      toast.success(`载荷已生成(#${r.id}),可在列表下载或复制投递命令`);
+      if (r.job_id) {
+        toast.success(`构建作业 #${r.job_id} 已创建,正在 VPS 上编译…`);
+        setPolledJob(null);
+        setPollJobId(r.job_id);
+      } else {
+        toast.success(`载荷已生成(#${r.id}),可在列表下载或复制投递命令`);
+      }
       setGenName("");
       reload();
     } catch (e) {
@@ -338,12 +398,84 @@ function C2PayloadsInner() {
                   onChange={(e) => setGenName(e.target.value)}
                   placeholder="留空自动命名"
                 />
-                <Button onClick={() => void generate()} disabled={generating}>
-                  {generating ? "生成中…" : "生成"}
+                <Button onClick={() => void generate()} disabled={generating || pollJobId != null}>
+                  {pollJobId != null ? (
+                    <>
+                      <RefreshCwIcon className="size-3.5 animate-spin" />
+                      构建中…
+                    </>
+                  ) : generating ? (
+                    "生成中…"
+                  ) : (
+                    "生成"
+                  )}
                 </Button>
               </div>
             </div>
           </div>
+
+          {/* gosrc 专属:可选指派一台 VPS 机器编译(二期,契约 §14)。 */}
+          {genFormat === "gosrc" ? (
+            <div className="mt-3 grid gap-3 lg:grid-cols-5">
+              <div className="grid gap-1.5 lg:col-span-2">
+                <Label>在 VPS 上编译(可选)</Label>
+                <Select
+                  value={genBuildMachine}
+                  onValueChange={(v) => setGenBuildMachine(v === "__none__" ? "" : v)}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue placeholder="不编译,只出源码 zip" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      <SelectItem value="__none__">不编译,只出源码 zip</SelectItem>
+                      {machines.length === 0 ? (
+                        <SelectItem value="__no_machines__" disabled>
+                          没有可选机器,请先到「VPS 中心」录入
+                        </SelectItem>
+                      ) : (
+                        machines.map((m) => (
+                          <SelectItem key={m.id} value={String(m.id)}>
+                            {m.name}({m.host}) · {c2VpsStatusLabel(String(m.status))}
+                          </SelectItem>
+                        ))
+                      )}
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+                <p className="text-muted-foreground text-[10px]">
+                  选机器后生成转为异步构建作业:源码经 SSH 通道在机器上编译,产物自动回传(机器需装 Go)
+                </p>
+              </div>
+            </div>
+          ) : null}
+
+          {/* 构建作业进度条(gosrc + VPS 编译时):轮询中每 3 秒刷新。 */}
+          {pollJobId != null || polledJob != null ? (
+            <div className="mt-3 flex flex-wrap items-center gap-2 rounded-md border px-3 py-2 text-xs">
+              <RefreshCwIcon
+                className={pollJobId != null ? "size-3.5 animate-spin text-blue-600" : "text-muted-foreground size-3.5"}
+              />
+              <span className="tabular-nums">构建作业 #{pollJobId ?? polledJob?.id}</span>
+              {polledJob ? (
+                <Badge variant="outline" className={c2JobStatusMeta(String(polledJob.status)).badge}>
+                  {c2JobStatusMeta(String(polledJob.status)).label}
+                </Badge>
+              ) : null}
+              {polledJob?.status === "error" && polledJob.error ? (
+                <span className="min-w-0 flex-1 truncate text-red-600" title={polledJob.error}>
+                  {polledJob.error}
+                </span>
+              ) : (
+                <span className="text-muted-foreground">源码上传 → 远程 go build → 产物回传,全程经 SSH 通道</span>
+              )}
+              {polledJob && (polledJob.status === "done" || polledJob.status === "error") ? (
+                <Button variant="outline" size="xs" onClick={() => setViewingJob(polledJob)}>
+                  查看详情
+                </Button>
+              ) : null}
+            </div>
+          ) : null}
         </CardContent>
       </Card>
 
@@ -412,9 +544,9 @@ function C2PayloadsInner() {
                 <TableHeader>
                   <TableRow className="hover:bg-transparent">
                     {/* 名称列不设宽度:table-fixed 下自动吃掉余量。
-                        固定列合计 592px(64+80+112+80+144+112),常规容器下余量充足。 */}
+                        固定列合计 624px(96+80+112+80+144+112),常规容器下余量充足。 */}
                     <SortHead field="name">名称</SortHead>
-                    <TableHead className="w-16">格式</TableHead>
+                    <TableHead className="w-24">格式</TableHead>
                     <TableHead className="w-20">目标</TableHead>
                     <TableHead className="w-28">SHA256</TableHead>
                     <TableHead className="w-20">大小</TableHead>
@@ -439,9 +571,29 @@ function C2PayloadsInner() {
                           </span>
                         </TableCell>
                         <TableCell>
-                          <Badge variant="outline" className={fm.badge}>
-                            {fm.label}
-                          </Badge>
+                          <div className="flex flex-col items-start gap-0.5">
+                            <Badge variant="outline" className={fm.badge}>
+                              {fm.label}
+                            </Badge>
+                            {p.evasion_profile_id > 0 ? (
+                              <Badge
+                                variant="outline"
+                                className="border-amber-500/30 bg-amber-500/15 text-amber-600"
+                                title={`经免杀档案 #${p.evasion_profile_id} 变形生成`}
+                              >
+                                已变形
+                              </Badge>
+                            ) : null}
+                            {p.built_on_vps ? (
+                              <Badge
+                                variant="outline"
+                                className="border-cyan-500/30 bg-cyan-500/15 text-cyan-600"
+                                title="已指派 VPS 编译出二进制,下载即可用"
+                              >
+                                已编译
+                              </Badge>
+                            ) : null}
+                          </div>
                         </TableCell>
                         <TableCell className="text-xs">{c2PayloadTargetLabel(String(p.target))}</TableCell>
                         <TableCell className="min-w-0">
@@ -505,23 +657,73 @@ function C2PayloadsInner() {
         </CardContent>
       </Card>
 
-      {/* ── 免杀工作台占位(二期):只读说明,不放任何可点控件 ── */}
+      {/* ── 免杀工作台指引(二期已上线,变形入口在专属页) ── */}
       <Card>
         <CardContent className="pt-4">
           <div className="flex flex-wrap items-center gap-2">
             <ShieldIcon className="text-muted-foreground size-4" />
             <p className="text-sm font-medium">免杀工作台</p>
-            <Badge variant="outline" className="border-amber-500/30 bg-amber-500/15 text-amber-600">
-              二期建设中
-            </Badge>
+            <Link
+              href="/function/c2/evasion"
+              className="inline-flex items-center gap-1 text-xs text-blue-600 hover:underline"
+            >
+              打开免杀工作台
+              <LinkIcon className="size-3" />
+            </Link>
           </div>
           <p className="text-muted-foreground mt-2 text-xs">
-            规划中的能力:LLM 对载荷做变形混淆(变量重命名、字符串编码、分段加载)并本地静态自测(特征串 / 熵值),
-            产出对抗评分与建议。全程不接外部沙箱——载荷上传第三方服务等于泄漏。Go 编译型载荷同期经指派 VPS 的
-            SSH 通道构建,当前版本只提供源码工程(gosrc)。
+            LLM 按免杀档案对脚本载荷做变形混淆(变量重命名、常量改写、字符串拆分),变形后本地静态自测
+            (特征串 / 熵值 / 风险分档)。静态自测仅本地特征扫描,任何载荷内容不会发送到本平台 LLM 之外的服务。
+            Go 源码载荷(gosrc)可在上方生成时指派 VPS 机器编译,构建作业进度见生成表单下方。
           </p>
         </CardContent>
       </Card>
+
+      {/* ── 构建作业详情(静态报告 / 构建日志,共用 C2StaticReportView) ── */}
+      <Dialog open={!!viewingJob} onOpenChange={(o) => !o && setViewingJob(null)}>
+        <DialogContent className="max-h-[88vh] overflow-y-auto sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle className="flex flex-wrap items-center gap-2">
+              构建作业 #{viewingJob?.id ?? "—"}
+              {viewingJob ? (
+                <Badge variant="outline" className={c2JobStatusMeta(String(viewingJob.status)).badge}>
+                  {c2JobStatusMeta(String(viewingJob.status)).label}
+                </Badge>
+              ) : null}
+            </DialogTitle>
+            <DialogDescription>
+              VPS 构建作业的信息与日志尾部。构建在指派机器上进行,产物经 SSH 通道回传落盘。
+            </DialogDescription>
+          </DialogHeader>
+          {viewingJob ? (
+            <div className="grid gap-3">
+              {viewingJob.status === "error" && viewingJob.error ? (
+                <p className="rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-600 dark:text-red-400">
+                  失败原因:{viewingJob.error}
+                </p>
+              ) : null}
+              <div className="text-muted-foreground grid gap-1 text-xs">
+                <span>
+                  载荷:#{viewingJob.payload_id > 0 ? viewingJob.payload_id : "—"} · 构建机器:
+                  #{viewingJob.vps_machine_id > 0 ? viewingJob.vps_machine_id : "—"}
+                </span>
+                <span>
+                  创建:{fmtTime(viewingJob.created_at)}
+                  {viewingJob.done_at ? ` · 完成:${fmtTime(viewingJob.done_at)}` : ""}
+                </span>
+              </div>
+              <C2StaticReportView report={viewingJob.result ?? null} />
+            </div>
+          ) : (
+            <p className="text-muted-foreground py-8 text-center text-xs">加载中…</p>
+          )}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setViewingJob(null)}>
+              关闭
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* ── 一行命令查看 ── */}
       <Dialog open={!!viewing} onOpenChange={(o) => !o && setViewing(null)}>

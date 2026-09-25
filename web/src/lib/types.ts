@@ -168,6 +168,8 @@ export interface VulnEntry {
   refs: string[];
   tags: string[];
   poc_count: number;
+  // 在野利用标记(CISA KEV 已知被在野利用目录,采集器维护)。
+  kev?: boolean;
   status: string;
   created_at: string;
   updated_at: string;
