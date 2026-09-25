@@ -554,6 +554,8 @@ func (s *Server) listVpsExecutions(w http.ResponseWriter, r *http.Request) {
 		MachineID: machineID,
 		TaskID:    taskID,
 		Source:    strings.TrimSpace(q.Get("source")),
+		Q:         strings.TrimSpace(q.Get("q")),
+		Status:    strings.TrimSpace(q.Get("status")),
 		Limit:     atoiDefault(q.Get("limit"), 0),
 		Offset:    atoiDefault(q.Get("offset"), 0),
 	})

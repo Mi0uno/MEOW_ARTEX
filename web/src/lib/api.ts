@@ -2116,11 +2116,13 @@ export const api = {
   vpsExec: (machineId: number, command: string, timeoutSec?: number) =>
     post<VpsExecResult>(`/vps/exec`, { machine_id: machineId, command, timeout_sec: timeoutSec }),
   // 执行流水(按机器或任务筛选;machineId/taskId 至少给一个,0 = 不限)。
-  vpsExecutions: (input: { machineId?: number; taskId?: number; source?: string; limit?: number; offset?: number }) => {
+  vpsExecutions: (input: { machineId?: number; taskId?: number; source?: string; q?: string; status?: string; limit?: number; offset?: number }) => {
     const p = new URLSearchParams();
     if (input.machineId) p.set("machine_id", String(input.machineId));
     if (input.taskId) p.set("task_id", String(input.taskId));
     if (input.source) p.set("source", input.source);
+    if (input.q) p.set("q", input.q);
+    if (input.status) p.set("status", input.status);
     p.set("limit", String(input.limit ?? 50));
     p.set("offset", String(input.offset ?? 0));
     return get<{ executions: VpsExecution[]; total: number }>(`/vps/executions?${p.toString()}`).then((r) => ({

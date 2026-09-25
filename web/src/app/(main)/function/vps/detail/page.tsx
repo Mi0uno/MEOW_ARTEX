@@ -10,6 +10,8 @@
 //   指派历史 —— 这台机器被哪些任务占过。
 //
 // 支持 /function/vps/detail?id=1&tab=terminal 深链(列表页「终端」按钮会带过来)。
+// 返回链接跟随来源:任务页「机器详情 / 打开终端」进来带 from=task&taskId=N,页头返回
+// 改「返回任务」指回任务详情;其余入口一律「返回机器池」。
 
 import * as React from "react";
 
@@ -103,10 +105,13 @@ function VpsDetailInner() {
   const searchParams = useSearchParams();
   const id = Number(searchParams.get("id") ?? "0");
   const tabParam = searchParams.get("tab") ?? "";
+  // 来源参数:任务页跳转带 from=task&taskId=<任务id>;非法 / 缺失一律按 0(回机器池)。
+  const fromTaskRaw = searchParams.get("from") === "task" ? Number(searchParams.get("taskId") ?? "0") : 0;
+  const fromTask = Number.isFinite(fromTaskRaw) && fromTaskRaw > 0 ? fromTaskRaw : 0;
   // 无效 id 必须在任何数据 hook 之前早退:「读参数」与「用参数」拆成两个组件,
   // 才能既早退又不在同一组件里条件调用 hook(与代理组详情页同一手法)。
   if (!id || Number.isNaN(id)) return <MissingMachine />;
-  return <VpsDetailBody machineId={id} initialTab={tabParam} />;
+  return <VpsDetailBody machineId={id} initialTab={tabParam} fromTask={fromTask} />;
 }
 
 function MissingMachine() {
@@ -125,7 +130,7 @@ function MissingMachine() {
   );
 }
 
-function VpsDetailBody({ machineId, initialTab }: { machineId: number; initialTab: string }) {
+function VpsDetailBody({ machineId, initialTab, fromTask }: { machineId: number; initialTab: string; fromTask: number }) {
   const [tab, setTab] = React.useState<TabValue>(
     (TAB_VALUES as readonly string[]).includes(initialTab) ? (initialTab as TabValue) : "overview",
   );
@@ -204,15 +209,19 @@ function VpsDetailBody({ machineId, initialTab }: { machineId: number; initialTa
   const machine = detail?.machine ?? null;
   const detections = detail?.detections ?? [];
   const currentTask = detail?.current_task ?? null;
+  // 返回链接跟随来源:from=task 时回任务详情,其余回机器池(与当前页签无关)。
+  const backHref = fromTask > 0 ? `/function/tasks/detail?id=${fromTask}` : "/function/vps/list";
+  const backLabel = fromTask > 0 ? "返回任务" : "返回机器池";
 
   return (
     <div className="flex flex-1 flex-col">
       {/* ── 页头:返回 / 机器名 / 状态 / 全局操作 ── */}
       <header className="sticky top-0 z-10 border-b bg-background/95 px-4 py-3 backdrop-blur lg:px-6">
         <div className="flex flex-wrap items-center gap-2">
-          <Button asChild variant="ghost" size="icon" className="size-7">
-            <Link href="/function/vps/list" aria-label="返回机器池">
-              <ArrowLeftIcon />
+          <Button asChild variant="ghost" size="sm" className="text-muted-foreground">
+            <Link href={backHref} aria-label={backLabel}>
+              <ArrowLeftIcon className="size-3.5" />
+              {backLabel}
             </Link>
           </Button>
           <h1 className="min-w-0 truncate font-semibold text-lg">

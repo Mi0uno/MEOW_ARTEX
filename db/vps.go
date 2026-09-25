@@ -621,8 +621,12 @@ type VpsExecutionFilter struct {
 	MachineID int64
 	TaskID    int64
 	Source    string
-	Limit     int
-	Offset    int
+	// Q 按命令内容模糊匹配(ILIKE);%/_/\ 自动转义。
+	Q string
+	// Status 结果状态筛选:ok(退出码 0)/ fail(非零退出码)/ transport(传输层失败:负数或空退出码)。空 = 不限。
+	Status string
+	Limit  int
+	Offset int
 }
 
 // ListVpsExecutions 分页检索执行流水(total 在全部筛选之后算)。
@@ -650,6 +654,21 @@ func (d *DB) ListVpsExecutions(f VpsExecutionFilter) ([]*VpsExecution, int, erro
 			return nil, 0, fmt.Errorf("无效来源: %q", f.Source)
 		}
 		add("source = $%d", f.Source)
+	}
+	if f.Q != "" {
+		esc := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(f.Q)
+		add("command ILIKE $%d", "%"+esc+"%")
+	}
+	switch f.Status {
+	case "":
+	case "ok":
+		add("exit_code = $%d", 0)
+	case "fail":
+		add("exit_code > $%d", 0)
+	case "transport":
+		add("(exit_code < $%d OR exit_code IS NULL)", 0)
+	default:
+		return nil, 0, fmt.Errorf("无效状态筛选: %q", f.Status)
 	}
 	kw := strings.Join(where, " AND ")
 
