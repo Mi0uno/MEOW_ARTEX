@@ -2125,3 +2125,157 @@ CREATE TABLE IF NOT EXISTS vps_tool_detections (
     detected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (machine_id, tool_name)
 );
+
+-- ───────────────────────── C2 中心（自研轻量 beacon，契约见 C2_CONTRACTS.md）─────────────────────────
+-- 监听器:beacon HTTP 回连入口。enc_key 是 secretbox 密文(32B 明文只活在 server 内存,
+-- 接口永不回显);url_path 是信道路径随机段;callback 是写进载荷的回调 base URL。
+CREATE TABLE IF NOT EXISTS c2_listeners (
+    id          BIGSERIAL PRIMARY KEY,
+    name        TEXT NOT NULL,
+    -- http(https 二期)
+    proto       TEXT NOT NULL DEFAULT 'http',
+    bind_host   TEXT NOT NULL DEFAULT '0.0.0.0',
+    port        INT NOT NULL DEFAULT 0,          -- 0=启动时自动分配
+    url_path    TEXT NOT NULL DEFAULT '',
+    callback    TEXT NOT NULL DEFAULT '',        -- 如 http://1.2.3.4:8443,生成载荷必填
+    enc_key     BYTEA NOT NULL,
+    enabled     BOOLEAN NOT NULL DEFAULT true,
+    notes       TEXT NOT NULL DEFAULT '',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (proto IN ('http'))
+);
+CREATE INDEX IF NOT EXISTS idx_c2_listeners_enabled ON c2_listeners(enabled) WHERE enabled;
+DROP TRIGGER IF EXISTS trg_c2_listeners_upd ON c2_listeners;
+CREATE TRIGGER trg_c2_listeners_upd BEFORE UPDATE ON c2_listeners
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- 会话:一台上线主机。sid 是 beacon 持有的会话令牌;listener_id+beacon_uid 幂等
+-- (同一主机重连=同一会话复活);task_id 绑定任务(可空);sleep/jitter 由平台下发控制。
+CREATE TABLE IF NOT EXISTS c2_sessions (
+    id           BIGSERIAL PRIMARY KEY,
+    listener_id  BIGINT NOT NULL,
+    beacon_uid   TEXT NOT NULL DEFAULT '',
+    sid          TEXT NOT NULL,
+    hostname     TEXT NOT NULL DEFAULT '',
+    username     TEXT NOT NULL DEFAULT '',
+    elevated     BOOLEAN NOT NULL DEFAULT false,
+    os           TEXT NOT NULL DEFAULT '',
+    arch         TEXT NOT NULL DEFAULT '',
+    local_ips    TEXT NOT NULL DEFAULT '',
+    pid          INT NOT NULL DEFAULT 0,
+    process      TEXT NOT NULL DEFAULT '',
+    sleep_sec    INT NOT NULL DEFAULT 10,
+    jitter_pct   INT NOT NULL DEFAULT 20,
+    task_id      BIGINT,
+    -- online(心跳正常)/offline(超时未归)/dead(平台终止)
+    status       TEXT NOT NULL DEFAULT 'online',
+    labels       TEXT NOT NULL DEFAULT '',
+    meta         JSONB NOT NULL DEFAULT '{}',
+    first_seen   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (status IN ('online','offline','dead'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_c2_sessions_sid ON c2_sessions(sid);
+CREATE INDEX IF NOT EXISTS idx_c2_sessions_listener ON c2_sessions(listener_id);
+CREATE INDEX IF NOT EXISTS idx_c2_sessions_status ON c2_sessions(status, last_seen);
+CREATE INDEX IF NOT EXISTS idx_c2_sessions_task ON c2_sessions(task_id) WHERE task_id IS NOT NULL;
+DROP TRIGGER IF EXISTS trg_c2_sessions_upd ON c2_sessions;
+CREATE TRIGGER trg_c2_sessions_upd BEFORE UPDATE ON c2_sessions
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- 下发任务队列:平台写 queued,beacon 长轮询取走(→sent),结果回传置 done/error。
+-- 大输出(>256KB)落 <BaseDir>/c2/outputs/,表内只留预览与大小(vps_executions 同款)。
+CREATE TABLE IF NOT EXISTS c2_tasks (
+    id           BIGSERIAL PRIMARY KEY,
+    session_id   BIGINT NOT NULL,
+    -- shell(命令)/files_list(目录浏览)/upload/download(文件传输)/loot/info(主机采集)
+    kind         TEXT NOT NULL DEFAULT 'shell',
+    input        TEXT NOT NULL DEFAULT '',
+    output       TEXT NOT NULL DEFAULT '',
+    output_path  TEXT NOT NULL DEFAULT '',
+    output_size  BIGINT NOT NULL DEFAULT 0,
+    -- queued(待发)/sent(已发未归)/done/error
+    status       TEXT NOT NULL DEFAULT 'queued',
+    -- user(人在页面下发)/agent(AI 工具下发)
+    actor        TEXT NOT NULL DEFAULT 'user',
+    created_by   TEXT NOT NULL DEFAULT '',
+    error        TEXT NOT NULL DEFAULT '',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    sent_at      TIMESTAMPTZ,
+    done_at      TIMESTAMPTZ,
+    CHECK (kind IN ('shell','files_list','upload','download','loot','info')),
+    CHECK (status IN ('queued','sent','done','error')),
+    CHECK (actor IN ('user','agent'))
+);
+CREATE INDEX IF NOT EXISTS idx_c2_tasks_session ON c2_tasks(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_c2_tasks_status ON c2_tasks(status) WHERE status IN ('queued','sent');
+
+-- 文件传输:up(平台→目标)/down(目标→平台)的分块传输记录。
+-- up 的平台侧暂存 blob 与 down 的产物都落 <BaseDir>/c2/ 下,表内只存路径。
+CREATE TABLE IF NOT EXISTS c2_transfers (
+    id           BIGSERIAL PRIMARY KEY,
+    session_id   BIGINT NOT NULL,
+    task_id      BIGINT,
+    direction    TEXT NOT NULL DEFAULT 'down',
+    remote_path  TEXT NOT NULL DEFAULT '',
+    size         BIGINT NOT NULL DEFAULT 0,
+    done_size    BIGINT NOT NULL DEFAULT 0,
+    -- queued/running/done/error
+    status       TEXT NOT NULL DEFAULT 'queued',
+    local_path   TEXT NOT NULL DEFAULT '',
+    error        TEXT NOT NULL DEFAULT '',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    done_at      TIMESTAMPTZ,
+    CHECK (direction IN ('up','down')),
+    CHECK (status IN ('queued','running','done','error'))
+);
+CREATE INDEX IF NOT EXISTS idx_c2_transfers_session ON c2_transfers(session_id, id);
+
+-- 战利品:凭据/哈希/文件/截图的归档。credential/hash 的 content 是 secretbox 密文;
+-- 大文件落 <BaseDir>/c2/loot/,finding_id 二期联动发现。
+CREATE TABLE IF NOT EXISTS c2_loot (
+    id           BIGSERIAL PRIMARY KEY,
+    session_id   BIGINT NOT NULL,
+    task_id      BIGINT,
+    -- credential/hash/file/screenshot/other
+    kind         TEXT NOT NULL DEFAULT 'other',
+    name         TEXT NOT NULL DEFAULT '',
+    content      TEXT NOT NULL DEFAULT '',
+    blob_path    TEXT NOT NULL DEFAULT '',
+    source_path  TEXT NOT NULL DEFAULT '',
+    finding_id   BIGINT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (kind IN ('credential','hash','file','screenshot','other'))
+);
+CREATE INDEX IF NOT EXISTS idx_c2_loot_kind ON c2_loot(kind);
+CREATE INDEX IF NOT EXISTS idx_c2_loot_session ON c2_loot(session_id);
+
+-- 载荷:由监听器生成的 beacon 投递物。token 用于监听器免鉴权投递端点
+-- /<url_path>/p/<token>(不可猜);文件落 <BaseDir>/c2/payloads/。
+CREATE TABLE IF NOT EXISTS c2_payloads (
+    id           BIGSERIAL PRIMARY KEY,
+    listener_id  BIGINT NOT NULL,
+    name         TEXT NOT NULL DEFAULT '',
+    -- ps1/bash/py(解释型)/gosrc(Go 源码工程)
+    format       TEXT NOT NULL DEFAULT 'ps1',
+    -- windows/linux/macos/cross
+    target       TEXT NOT NULL DEFAULT 'windows',
+    token        TEXT NOT NULL,
+    file_path    TEXT NOT NULL DEFAULT '',
+    sha256       TEXT NOT NULL DEFAULT '',
+    size         BIGINT NOT NULL DEFAULT 0,
+    oneliner     TEXT NOT NULL DEFAULT '',
+    created_by   TEXT NOT NULL DEFAULT '',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (format IN ('ps1','bash','py','gosrc')),
+    CHECK (target IN ('windows','linux','macos','cross'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_c2_payloads_token ON c2_payloads(token);
+CREATE INDEX IF NOT EXISTS idx_c2_payloads_listener ON c2_payloads(listener_id);
+DROP TRIGGER IF EXISTS trg_c2_payloads_upd ON c2_payloads;
+CREATE TRIGGER trg_c2_payloads_upd BEFORE UPDATE ON c2_payloads
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();

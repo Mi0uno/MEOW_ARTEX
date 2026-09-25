@@ -12,12 +12,16 @@ import {
   FileText,
   FolderOpen,
   FolderSync,
+  Gauge,
+  Gem,
   Layers,
   LayoutDashboard,
   LayoutTemplateIcon,
   type LucideIcon,
   MessageSquare,
+  MonitorSmartphone,
   Network,
+  PackageOpen,
   Plug,
   Radar,
   Radio,
@@ -82,7 +86,8 @@ export interface NavGroup {
 //   AI管理     —— Agent 的模型与能力配置（LLM/Decision/Agent/MCP/Skill/LLM 录制）
 //   渗透测试/信息搜集/后渗透 —— 三阶段分组：各组带本阶段任务(?stage=锁定)与对话
 //                 (?stage= 只看本阶段 agent 的会话)，外加本阶段的专属工具面
-//   C2/VPS     —— 规划中的模块，先占位（badge=soon，子项禁用）
+//   C2 中心 —— 后渗透指挥控制：监听器/上线会话/载荷与免杀/战利品（契约 C2_CONTRACTS.md）
+//   VPS 中心 —— 任务级执行环境：机器池/终端/工具集
 //   系统设置   —— 平台自身的配置（工具/系统功能/系统设置）
 export const sidebarItems: NavGroup[] = [
   {
@@ -221,10 +226,20 @@ export const sidebarItems: NavGroup[] = [
       },
       {
         id: "c2",
-        title: "C2",
+        title: "C2 中心",
         icon: RadioTower,
-        badge: "soon",
-        subItems: [{ id: "c2-todo", title: "建设中", url: "#", disabled: true }],
+        subItems: [
+          // 总览:在线/失联会话、监听器状态、排队任务与最近上线事件。
+          { id: "c2-overview", title: "总览", url: "/function/c2", icon: Gauge },
+          // 监听器:beacon 回连入口的创建/启停(独立端口 HTTP server)。
+          { id: "c2-listeners", title: "监听器", url: "/function/c2/listeners", icon: Radio },
+          // 会话:上线主机列表与详情(交互/文件/流水/档案)。
+          { id: "c2-sessions", title: "会话", url: "/function/c2/sessions", icon: MonitorSmartphone },
+          // 载荷与免杀:beacon 载荷生成与投递(免杀工作台二期)。
+          { id: "c2-payloads", title: "载荷与免杀", url: "/function/c2/payloads", icon: PackageOpen },
+          // 战利品:凭据/哈希/文件归档(二期联动发现与报告)。
+          { id: "c2-loot", title: "战利品", url: "/function/c2/loot", icon: Gem },
+        ],
       },
       {
         id: "vps",

