@@ -592,10 +592,13 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetProxy(proxyAddr, proxyCA)
 	wk.SetWebSearch(s.webSearchFor("worker"))
 	wk.SetConstraintInject(s.constraintInjectWorker) // 操作约束注入 worker(可配置,默认开)
-	// VPS 执行环境(契约 §6):任务指派了机器时,worker 的 Bash 换成 SSH 版、系统提示词
-	// 追加机器档案。与上面 ProxyAddrForTask 同一位置、同一模式——resolver 在这里定义
-	// 并一次下传,worker 每 run 开头解析一次(晚指派/改派的下一个意图即生效),不在
-	// worker 工具执行路径上散落 MachineForTask 查询。
+	// VPS 执行环境(契约 §6):任务指派了机器时,三个 agent 的 Bash 都换成 SSH 版、
+	// 系统提示词追加机器档案。worker 是主力执行,但 planner 的开局探测与 main agent
+	// 对话同样带 Bash——只换 worker 的话命令会从这两个角色漏回本机(掉马甲)。
+	// resolver 在这里定义并一次下传,每 run 开头解析一次(晚指派/改派下一意图即生效),
+	// 不在工具执行路径上散落 MachineForTask 查询。查询失败时 resolver 返回 fail-closed
+	// 占位 Bash(拒绝执行),保证指派了机器的任务绝不静默回落本机。planner/main 的
+	// 接线在各自构造之后。
 	wk.SetVPSContext(s.vpsContextResolver())
 	pl := agent.NewPlanner(plannerRuntime, "task-router", s.m.dir, tx, plannerRuntime.CompactionWindow(), s.agentMaxTurns("planner"))
 	pl.SetFindingRecorder(s.evidenceStore())
@@ -621,6 +624,9 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	main.SetProxy(proxyAddr, proxyCA)
 	main.SetWebSearch(s.webSearchFor("mainagent"))
 	main.SetSteerWork(s.engine.SteerWork) // steer_work：人对运行中 work 实时纠偏
+	// VPS 执行环境:planner/main 与 worker 共用同一个 per-run 解析器(见 worker 处注释)。
+	pl.SetVPSContext(s.vpsContextResolver())
+	main.SetVPSContext(s.vpsContextResolver())
 	bundle := &taskAgentBundle{
 		runtime: goalRuntime, plannerRuntime: plannerRuntime, workerRuntime: workerRuntime,
 		mainRuntime: mainRuntime, pl: pl, wk: wk, main: main,

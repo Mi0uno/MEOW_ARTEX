@@ -47,10 +47,15 @@ const (
 
 // ---- 1. 远程执行环境(worker 的 SSH Bash + 提示词注入) ----
 
-// vpsContextResolver 返回挂在任务 worker 上的 per-run 解析器(与 agentsForTask 里
-// ProxyAddrForTask 的解析同位、同模式):每个 run 开头查一次 MachineForTask,任务
-// 晚指派/改派的下一个意图即生效;未指派返回 nil(worker 维持本机执行,零开销)。
-// 机器句柄不在工具执行路径上散落查询——一次解析,整个 run 复用。
+// vpsContextResolver 返回挂在任务 agent(worker/planner/main)上的 per-run 解析器
+// (与 agentsForTask 里 ProxyAddrForTask 的解析同位、同模式):每个 run 开头查一次
+// MachineForTask,任务晚指派/改派的下一个意图即生效;未指派返回 nil(维持本机执行,
+// 零开销)。机器句柄不在工具执行路径上散落查询——一次解析,整个 run 复用。
+//
+// 严格模式:查询出错 ≠ 未指派。任务可能正绑定在远程机器上,此刻静默回落本机执行
+// 就是「掉马甲」——宁可整个 run 在远端语义上失败,也绝不把命令泄漏到平台本机。
+// 因此 err != nil 时返回一个 fail-closed 占位 Bash(同名同 schema、拒绝执行),
+// 而不是 nil。
 func (s *Server) vpsContextResolver() func(taskID int64) *agent.VPSRunContext {
 	return func(taskID int64) *agent.VPSRunContext {
 		mgr := VPSManager()
@@ -58,7 +63,13 @@ func (s *Server) vpsContextResolver() func(taskID int64) *agent.VPSRunContext {
 			return nil
 		}
 		machine, err := mgr.MachineForTask(taskID)
-		if err != nil || machine == nil {
+		if err != nil {
+			return &agent.VPSRunContext{
+				Bash:        s.vpsBashUnavailableTool(err),
+				SystemBlock: vpsUnavailableSystemBlock(err),
+			}
+		}
+		if machine == nil {
 			return nil
 		}
 		return &agent.VPSRunContext{
@@ -66,6 +77,35 @@ func (s *Server) vpsContextResolver() func(taskID int64) *agent.VPSRunContext {
 			SystemBlock: s.vpsSystemBlock(machine, taskID),
 		}
 	}
+}
+
+// vpsBashUnavailableTool fail-closed 占位 Bash:与 SDK Bash 同名同 schema(替换后
+// 模型视角不变),任何调用都明确报错,绝不落到本机执行。错误信息区分「指派在但查
+// 不出来」与「命令失败」,引导模型稍后重试而不是对目标下结论。
+func (s *Server) vpsBashUnavailableTool(resolveErr error) actool.CoreTool {
+	ref := actool.NewBash()
+	return actool.Build(actool.Spec{
+		Name:        ref.Name(),
+		Description: ref.Description(),
+		Prompt:      ref.Prompt(),
+		Schema:      ref.InputSchema(),
+		Permissions: func(context.Context, json.RawMessage, permission.Context) permission.Decision {
+			return permission.Allowed()
+		},
+		Run: func(context.Context, json.RawMessage, *actool.ToolContext) (actool.Result, error) {
+			return actool.Errorf(fmt.Sprintf(
+				"任务执行环境无法确认(读取 VPS 指派失败:%v)。为杜绝命令意外落到平台本机执行,"+
+					"Bash 已暂停;这是平台侧故障,不是命令失败,请稍后重试。", resolveErr)), nil
+		},
+	})
+}
+
+// vpsUnavailableSystemBlock fail-closed 期间追加的系统提示段:告诉模型为什么 Bash
+// 会报错、该怎么做(等待恢复),避免模型误判成目标不可达或转投本机工具。
+func vpsUnavailableSystemBlock(resolveErr error) string {
+	return "\n\n**执行环境：远程 VPS（指派状态暂时无法确认）**\n" +
+		"平台此刻读取本任务的 VPS 指派失败(" + resolveErr.Error() + ")。" +
+		"为杜绝命令落到平台本机,Bash 暂被禁用;请稍后重试(下一个动作会重新解析指派)。\n"
 }
 
 // vpsBashTool 构造 SSH 版 Bash:与 SDK 默认 Bash 同名、同 schema、同描述/提示

@@ -33,12 +33,20 @@ type MainAgent struct {
 	nonStreamingFn  func() bool                            // resolver: use non-streaming (Complete) path? (nil = streaming)
 	noaEnabledFn    func() bool                            // resolver: use experimental noa compaction? (nil = off)
 	maxTokensFn     func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
+	// vpsContextFn 每 run(每次 Chat)解析一次远程执行环境:任务指派了 VPS 时主 agent
+	// 对话里的 Bash 同样必须在远端执行——主 agent 把命令落到本机也是掉马甲。
+	// nil resolver 或 nil 结果 = 本机执行(原行为)。
+	vpsContextFn func(taskID int64) *VPSRunContext
 }
 
 // SetNoaEnabled wires a resolver deciding whether runs use the experimental noa
 // context-compression mechanism. nil/unset = off (built-in compaction). Read per
 // run so the settings toggle takes effect without rebuilding the agent.
 func (m *MainAgent) SetNoaEnabled(fn func() bool) { m.noaEnabledFn = fn }
+
+// SetVPSContext wires the per-run remote-execution resolver (same contract as
+// Worker.SetVPSContext)。每次 Chat 开头解析一次:指派/改派下一条消息即生效。
+func (m *MainAgent) SetVPSContext(fn func(taskID int64) *VPSRunContext) { m.vpsContextFn = fn }
 
 // SetNonStreaming wires a resolver deciding whether runs use the non-streaming
 // model path (true = non-streaming). nil/unset = streaming (default).
@@ -124,14 +132,24 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	tsx.steerWork = m.steerWork   // enable steer_work tool (nil = unavailable)
 	// 领域工具 + 基础默认工具集（Read/Write/Edit/MultiEdit/LS/Glob/Grep/Bash）
 	// 资产覆盖度功能关闭时剔除 add_task_scope/list_untested_assets（不入 prompt）。
-	base := append(tsx.DropCoverageTools(tsx.MainAgentTools()), actool.DefaultTools()...)
+	// 远程执行环境(每次 Chat 解析一次):任务指派了 VPS 时,主 agent 对话里的 Bash
+	// 同名换成 SSH 版——对话里的命令落到本机也是掉马甲。
+	var vps *VPSRunContext
+	if m.vpsContextFn != nil {
+		vps = m.vpsContextFn(taskID)
+	}
+	base := applyVPSBashSwap(append(tsx.DropCoverageTools(tsx.MainAgentTools()), actool.DefaultTools()...), vps)
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts)})
 	tools, def, cleanup := AugmentTools(ctx, "mainagent", base)
 	defer cleanup()
 	// 本任务的工作目录 <workDir>/tasks/<taskID>，先建好。
 	mainDir := ensureRunDir(m.workDir, taskID, 0)
 	ctx = intercept.WithReviewWorkingDirectory(ctx, mainDir)
-	system, boundary := deferredSystem(mainAgentSystem(goal, m.workDir, mainDir), def)
+	sysBody := mainAgentSystem(goal, m.workDir, mainDir)
+	if vps != nil {
+		sysBody += vps.SystemBlock // 远程执行环境:机器档案 + Bash 走 SSH 的使用规约
+	}
+	system, boundary := deferredSystem(sysBody, def)
 	opts := agentcore.Options{
 		Provider:        m.prov,
 		SystemPrompt:    system,

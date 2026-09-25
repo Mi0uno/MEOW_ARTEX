@@ -459,11 +459,15 @@ func (d *DB) UpdateVpsMachineCheck(id int64, status string, ok bool, info *VpsSy
 	return err
 }
 
-// ListStaleVpsAssignedMachines 取「指派悬空」的机器:assigned_task_id 指向的
-// 任务行不存在,或任务已不在 running/paused 状态(开机对账用,自动 Release)。
+// ListStaleVpsAssignedMachines 取「指派悬空」的机器:assigned_task_id 指向的任务
+// 行不存在,或任务已到终态(done/failed/timeout——与任务终态自动释放的判据一致)。
+// 判据必须是「终态才算悬空」,不能写成「非 running/paused 就算悬空」:created 状态
+// 同样持有指派(创建即指派;并发受限排队时任务状态列也停在 created,queued 只是
+// 布尔标记),开机对账若把这类任务当悬空释放,重启后任务开跑就掉回本机执行
+// (掉马甲)。paused 不释放同理——会话可恢复。
 func (d *DB) ListStaleVpsAssignedMachines() ([]*VpsMachine, error) {
 	rows, err := d.Query(`SELECT ` + vpsMachineCols + vpsMachineFrom + `
-WHERE m.assigned_task_id IS NOT NULL AND (t.id IS NULL OR t.status NOT IN ('running','paused'))
+WHERE m.assigned_task_id IS NOT NULL AND (t.id IS NULL OR t.status IN ('done','failed','timeout'))
 ORDER BY m.id`)
 	if err != nil {
 		return nil, err

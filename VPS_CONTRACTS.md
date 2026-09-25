@@ -131,8 +131,11 @@ Agent C 的三个（不在 A 范围）：`POST /api/tasks/{id}/vps`（`{machine_
 - **任务创建**：`TaskCreateOptions` 加 `VPSMachineID int64` 与 `VPSAuto bool`；`POST /api/tasks` 的 body 加
   `vps_machine_id`/`vps_auto`；创建成功后（进入 running 前）调 `vpscenter.Manager.Assign`（失败不阻断建任务，
   任务照常本机跑 + 返回体带 warning）。任务 DTO 加 `vps_machine: {id,name,host,status} | null`（仅创建/详情返回）。
-- **执行路由**：worker 的 Bash 工具在 `MachineForTask(taskID) != nil` 时改走 `ExecCommand(source="agent")`，
-  输出截尾 256KB；否则维持 SDK 默认本机执行。改造点在 norma SDK 工具组装处（`server/task_llm.go` 的
+- **执行路由**：**worker/planner/mainagent 三个角色**的 Bash 工具在 `MachineForTask(taskID) != nil` 时统一改走
+  `ExecCommand(source="agent")`，输出截尾 256KB；否则维持 SDK 默认本机执行。只换 worker 的话，planner 的
+  开局探测与 main agent 对话里的命令会漏回本机执行（掉马甲）。三角色必须共用同一个按名替换入口
+  （`agent.applyVPSBashSwap`）与同一个 per-run 解析器（`server.vpsContextResolver`）；解析器查询**出错**时
+  返回 fail-closed 占位 Bash（拒绝执行），绝不静默回落本机。改造点在 norma SDK 工具组装处（`server/task_llm.go` 的
   `agentsForTask` 解析一次机器句柄下传，与该函数既有的代理出口解析同构；不要在 worker.go 里散落查询）。
   SDK 的 Read/Write/Grep 保持本机（它们操作本地工作区文件），prompt 里说清楚。
 - **额外工具**（两个新领域工具，照 `server/recon_tools.go` 的 actool.CoreTool 闭包写法）：
@@ -141,8 +144,10 @@ Agent C 的三个（不在 A 范围）：`POST /api/tasks/{id}/vps`（`{machine_
 - **prompt 注入**：有指派时 worker 系统提示词追加一段：「你的所有 Bash 命令将在 Linux 机器
   `<name>(<host>)` 上执行：OS <os_name> <arch>，已装工具: <清单>；每次调用是独立 shell，工作目录固定
   `<ws>`，持久状态请落盘文件；平台 Read/Write 工具操作的是本地工作区，远程文件请用 Bash cat/tee」。
-- **释放**：任务终态（done/failed/cancelled）自动 `Release(taskID, "task_end")`——挂进 `SetTaskTerminalHook`
-  既有回调链（与报告归档共存，不得覆盖）。paused 不释放（会话可恢复）。
+- **释放**：任务终态（done/failed/timeout）自动 `Release(taskID, "task_end")`——挂进 `SetTaskTerminalHook`
+  既有回调链（与报告归档共存，不得覆盖）。paused 不释放（会话可恢复）。**开机对账判据必须与终态一致**
+  （任务行消失或 status IN done/failed/timeout 才算悬空）——created/排队中的任务同样持有指派,判据写成
+  「非 running/paused」会把它们的机器放掉,重启后任务开跑掉回本机执行。
 - 额外：终端/agent 之外任何人不得绕过 Manager 直接 SSH（凭据解密只发生在 vpscenter.Dial 前）。
 
 ## 7. 前端契约（Agent B）

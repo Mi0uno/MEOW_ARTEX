@@ -110,6 +110,25 @@ type VPSRunContext struct {
 // machine. nil resolver or nil result = local execution (unchanged behavior).
 func (w *Worker) SetVPSContext(fn func(taskID int64) *VPSRunContext) { w.vpsContextFn = fn }
 
+// applyVPSBashSwap replaces the SDK default Bash in tools (matched by NAME) with
+// the host-provided SSH-backed one. The swap is same-name/same-schema so the
+// LLM's view is unchanged — only execution moves to the remote machine. Shared
+// by worker/planner/mainagent: 任务指派了机器后,任何一个角色把 Bash 落在本机执行
+// 都是「掉马甲」,三个角色的工具组装必须走同一个替换入口。nil context or nil Bash
+// = 返回原切片不动。
+func applyVPSBashSwap(tools []actool.CoreTool, vps *VPSRunContext) []actool.CoreTool {
+	if vps == nil || vps.Bash == nil {
+		return tools
+	}
+	for i, t := range tools {
+		if t.Name() == vps.Bash.Name() {
+			tools[i] = vps.Bash
+			break
+		}
+	}
+	return tools
+}
+
 // WorkerSessionID returns the stable transcript key used by a worker intent.
 // Worker slots are reusable, so the intent id (rather than work#N) is the
 // session identity. Keep this helper public so the Worker message API and UI
@@ -405,15 +424,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	base := append(tsx.WorkerTools(), w.extraTools...)
 	// worker 刻意不给 MultiEdit/Glob/Grep：文件精改用 Edit、检索走 Bash(grep/find)，
 	// 收敛工具面、减少低价值调用。其余 SDK 默认工具(Read/Write/Edit/LS/Bash/Sleep)照常。
-	sdkTools := defaultToolsExcept("MultiEdit", "Glob", "Grep")
-	if vps != nil && vps.Bash != nil {
-		for i, t := range sdkTools {
-			if t.Name() == vps.Bash.Name() {
-				sdkTools[i] = vps.Bash
-				break
-			}
-		}
-	}
+	sdkTools := applyVPSBashSwap(defaultToolsExcept("MultiEdit", "Glob", "Grep"), vps)
 	base = append(base, sdkTools...)
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts), IntentID: intent.ID})
 	tools, def, cleanup := AugmentTools(ctx, "worker", base)

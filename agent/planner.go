@@ -40,6 +40,11 @@ type Planner struct {
 	maxTokensFn       func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
 	compactor         *Compactor                             // cold-node compaction (§7); nil = disabled
 
+	// vpsContextFn 每 run 解析一次远程执行环境:任务指派了 VPS 时 planner 的 Bash
+	// (开局探测 curl 等)同样必须在远端执行——planner 把命令落到本机也是掉马甲。
+	// nil resolver 或 nil 结果 = 本机执行(原行为)。
+	vpsContextFn func(taskID int64) *VPSRunContext
+
 	// todos keeps ONE plan-scratchpad per task (keyed by exploration id) so the
 	// planner's multi-step plan survives across wake-ups — each Plan() is a fresh
 	// session, but the shared store lets it record a serial exploit chain once and
@@ -51,6 +56,10 @@ type Planner struct {
 func NewPlanner(prov llm.Provider, model, workDir string, tx *transcript.Store, window, maxTurns int) *Planner {
 	return &Planner{prov: prov, model: model, workDir: workDir, tx: tx, window: window, maxTurns: maxTurns, todos: map[int64]*actool.TodoStore{}}
 }
+
+// SetVPSContext wires the per-run remote-execution resolver (same contract as
+// Worker.SetVPSContext). planner 每 run 开头解析一次:晚指派/改派下一轮即生效。
+func (p *Planner) SetVPSContext(fn func(taskID int64) *VPSRunContext) { p.vpsContextFn = fn }
 
 func (p *Planner) SetCompactionWindowResolver(fn func() int) { p.windowFn = fn }
 
@@ -372,7 +381,13 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	}
 	// 领域工具 + 基础默认工具集（Read/Write/Edit/MultiEdit/LS/Glob/Grep/Bash）
 	// 资产覆盖度功能关闭时剔除 add_task_scope/list_untested_assets（不入 prompt）。
-	base := append(tsx.DropCoverageTools(tsx.PlannerTools()), actool.DefaultTools()...)
+	// 远程执行环境(每 run 解析一次):任务指派了 VPS 时,planner 的 Bash(开局探测
+	// curl 等)同名换成 SSH 版——planner 把探测命令落到本机也是掉马甲。
+	var vps *VPSRunContext
+	if p.vpsContextFn != nil {
+		vps = p.vpsContextFn(taskID)
+	}
+	base := applyVPSBashSwap(append(tsx.DropCoverageTools(tsx.PlannerTools()), actool.DefaultTools()...), vps)
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts)})
 	tools, def, cleanup := AugmentTools(ctx, "planner", base)
 	defer cleanup()
@@ -393,6 +408,9 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	sysBody := plannerSystem(goal, p.workDir, taskDir)
 	if p.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,框定探索边界
+	}
+	if vps != nil {
+		sysBody += vps.SystemBlock // 远程执行环境:机器档案 + Bash 走 SSH 的使用规约(与约束注入同一层追加)
 	}
 	system, boundary := deferredSystem(sysBody, def)
 	// planner 无自身墙钟预算;有 deadline 时把 MaxDuration 夹逼到剩余,让在跑的规划轮在
