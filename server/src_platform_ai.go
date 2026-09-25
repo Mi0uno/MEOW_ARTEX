@@ -42,9 +42,10 @@ var specPolishFields = map[string]string{
 	"rules":            "规范:必须保留全部流程要求与提交约束",
 }
 
-// specAIFillTimeout LLM 调用超时。整理数万字规范文档比普通分类任务慢得多,
-// 60s 会在长文档上白白失败,给足 120s。
-const specAIFillTimeout = 120 * time.Second
+// specAIFillTimeout LLM 调用超时。整理数万字规范文档比普通分类任务慢得多:
+// 实测 deepseek 对 1.7 万字附件的结构化归类会超过 120s,60s 更是必超时——
+// 给足 300s(与报告模板分析的 280-300s 同一量级)。
+const specAIFillTimeout = 300 * time.Second
 
 // srcSpecSuggestion 是 AI 识别的输出结构,四个文本字段与平台规范一一对应,
 // note 说明识别依据(用了哪些附件、哪些内容存疑)。
@@ -112,13 +113,17 @@ func (s *Server) specAIFill(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), specAIFillTimeout)
 	defer cancel()
+	start := time.Now()
 	sug, err := s.specAIComplete(ctx, prov, platform.Name, corpus)
 	if err != nil {
+		// 失败必须留痕:用户报「超时」时,日志要能回答是慢、是挂、还是输出被截断。
+		log.Printf("[src-platform] AI 识别失败:平台 #%d,附件 %d 份,耗时 %s,错误: %v",
+			platformID, len(used), time.Since(start).Round(time.Second), err)
 		writeErr(w, 502, "AI 识别失败:"+err.Error())
 		return
 	}
-	log.Printf("[src-platform] AI 识别填入:平台 #%d «%s» 用了 %d 份附件(%s)",
-		platformID, platform.Name, len(used), strings.Join(used, "、"))
+	log.Printf("[src-platform] AI 识别填入:平台 #%d «%s» 用了 %d 份附件(%s),耗时 %s",
+		platformID, platform.Name, len(used), strings.Join(used, "、"), time.Since(start).Round(time.Second))
 	writeJSON(w, 200, map[string]any{"suggestion": sug})
 }
 
@@ -172,11 +177,11 @@ func (s *Server) specAIComplete(ctx context.Context, prov llm.Provider, platform
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
-				return nil, fmt.Errorf("识别超时")
+				return nil, fmt.Errorf("识别超时(%s):附件正文较长,可减少勾选的附件后重试", specAIFillTimeout)
 			default:
 			}
 		}
-		out, err := analyzeCompletion(ctx, prov, system, user)
+		out, err := specAIStreamCollect(ctx, prov, system, user, 16384)
 		if err != nil {
 			lastErr = err
 			continue
@@ -191,6 +196,30 @@ func (s *Server) specAIComplete(ctx context.Context, prov llm.Provider, platform
 		lastErr = fmt.Errorf("未知错误")
 	}
 	return nil, lastErr
+}
+
+// specAIStreamCollect 与 analyzeCompletion 同一套流式收集,但 MaxTokens 可调:
+// 归类数万字节附件正文的结构化 JSON 输出可能超过 8192 token 上限——被截断的
+// JSON 永远解析失败,重试两次也一样,表现为「AI 识别失败」而非超时,难排查。
+func specAIStreamCollect(ctx context.Context, prov llm.Provider, system, user string, maxTokens int) (string, error) {
+	temp := 0.2
+	req := llm.CompletionRequest{
+		System:      []string{system},
+		Messages:    []llm.Message{llm.UserText(user)},
+		MaxTokens:   maxTokens,
+		Temperature: &temp,
+		Thinking:    "disabled",
+	}
+	var sb strings.Builder
+	for ev, err := range prov.Stream(ctx, req) {
+		if err != nil {
+			return "", err
+		}
+		if ev.Type == llm.SETextDelta {
+			sb.WriteString(ev.Text)
+		}
+	}
+	return sb.String(), nil
 }
 
 // parseSRCSpecSuggestion 剥 ```json 围栏与散文前后缀,再反序列化;
@@ -276,21 +305,26 @@ func (s *Server) polishSpecField(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), specAIFillTimeout)
 	defer cancel()
+	start := time.Now()
 	system := "你是渗透测试平台的安全规范编辑。任务:对用户给出的这一段 SRC 平台「" + label +
 		"」文本做润色——优化结构、分条表述、修正错别字与语病,让它更清晰地约束 AI 行为。\n" +
 		"铁律:所有事实一个都不能改——金额、分值、等级、禁令、流程、数值范围必须原样保留;" +
 		"不许新增原文没有的规则,不许删除原文已有的规则;只输出润色后的文本本身,不要任何解释或围栏。"
 	out, err := analyzeCompletion(ctx, prov, system, text)
 	if err != nil {
+		// 失败留痕:与 AI 识别同因——用户报「超时」时日志要能回答卡在哪一步。
+		log.Printf("[src-platform] 规范润色失败:字段 %s,输入 %d 字,耗时 %s,错误: %v",
+			req.Field, utf8.RuneCountInString(text), time.Since(start).Round(time.Second), err)
 		writeErr(w, 502, "AI 润色失败:"+err.Error())
 		return
 	}
 	polished := strings.TrimSpace(out)
 	if polished == "" {
+		log.Printf("[src-platform] 规范润色失败:字段 %s,模型返回为空", req.Field)
 		writeErr(w, 502, "AI 润色失败:模型返回为空")
 		return
 	}
-	log.Printf("[src-platform] 规范润色:字段 %s,输入 %d 字 → 输出 %d 字", req.Field,
-		utf8.RuneCountInString(text), utf8.RuneCountInString(polished))
+	log.Printf("[src-platform] 规范润色:字段 %s,输入 %d 字 → 输出 %d 字,耗时 %s", req.Field,
+		utf8.RuneCountInString(text), utf8.RuneCountInString(polished), time.Since(start).Round(time.Second))
 	writeJSON(w, 200, map[string]any{"polished": polished})
 }

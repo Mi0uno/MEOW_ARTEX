@@ -1186,12 +1186,12 @@ export const api = {
     });
   },
   // 单段规范 AI 润色:只改措辞结构不改事实,返回润色后文本(前端预填人工确认)。
-  // LLM 润色可达 1-2 分钟,显式给 180s 信号覆盖 http() 默认 60s 超时。
+  // 必须大于服务端 ctx 的 300s——前端先超时会丢掉后端仍在生成的结果。
   polishSpecField: (field: string, text: string) =>
     http<{ polished: string }>(`/src/platforms/spec/polish`, {
       method: "POST",
       body: JSON.stringify({ field, text }),
-      signal: AbortSignal.timeout(180_000),
+      signal: AbortSignal.timeout(320_000),
     }),
   // 附件下载走原生导航(带 token 的 fetch 拿不到浏览器下载语义)
   srcPlatformFileDownloadUrl: (platformId: number, fileId: number) =>

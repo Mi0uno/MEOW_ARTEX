@@ -44,9 +44,10 @@ import { fmtBytes, ParseStatusBadge, parseStatusMeta, SPEC_FIELDS, SpecTextarea 
 // 页签切换明显卡顿;2000 字足够判断「解析出来的是不是我要的那份文档」。
 const PREVIEW_LIMIT = 2000;
 
-// AI_FILL_TIMEOUT_MS 是 AI 识别请求的硬上限。LLM 结构化识别常要 1-2 分钟,
-// 60s 的默认超时必杀请求,这里放宽到 180s 并在按钮文案里如实告知等待时长。
-const AI_FILL_TIMEOUT_MS = 180_000;
+// AI_FILL_TIMEOUT_MS 是 AI 识别请求的硬上限。LLM 结构化识别实测在 deepseek 上
+// 会超过 120s(1.7 万字附件),必须大于服务端 ctx 的 300s——前端先超时的话,
+// 用户看到的是超时错误,而后端其实还在继续算,结果被白白丢弃。
+const AI_FILL_TIMEOUT_MS = 320_000;
 
 // KIND_OPTIONS 是类别改派下拉的候选 = 四类规范 + 未归类。'other' 不在
 // SRC_PLATFORM_FILE_KINDS 里(它不是规范类别,是统一上传的暂存类别),
