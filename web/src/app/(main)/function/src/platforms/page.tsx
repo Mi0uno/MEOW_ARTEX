@@ -163,6 +163,8 @@ export default function SRCPlatformsPage() {
               删除已选 (<span className="tabular-nums">{checkedIds.size}</span>)
             </Button>
           )}
+          {/* 创建轻量化的入口说明放在按钮旁:用户点开前就知道不必准备规范材料。 */}
+          <span className="text-muted-foreground text-xs">仅填名称即可，规范进详情页再完善 / AI 识别填入</span>
           <Button size="sm" onClick={() => setCreating(true)}>
             <PlusIcon className="size-4" />
             新建平台

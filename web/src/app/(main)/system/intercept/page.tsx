@@ -66,6 +66,12 @@ function groupTools(dbTools: Tool[]) {
 
 // ---- form state ----
 
+// 适用范围在契约里是 ""(全部任务) / "src"(仅 SRC 任务),但 Radix Select 的 item
+// 不接受空字符串 value,所以表单里存哨兵串,提交/回显时再双向映射。
+type ScopeChoice = "__all__" | "__src__";
+const scopeToChoice = (scope: string): ScopeChoice => (scope === "src" ? "__src__" : "__all__");
+const choiceToScope = (choice: ScopeChoice): string => (choice === "__src__" ? "src" : "");
+
 type RuleForm = {
   name: string;
   enabled: boolean;
@@ -78,6 +84,7 @@ type RuleForm = {
   timeout_enabled: boolean;
   timeout_seconds: number;
   timeout_action: "deny" | "allow";
+  scope: ScopeChoice;
 };
 
 const defaultForm = (): RuleForm => ({
@@ -92,6 +99,7 @@ const defaultForm = (): RuleForm => ({
   timeout_enabled: true,
   timeout_seconds: 60,
   timeout_action: "deny",
+  scope: "__all__",
 });
 
 // ---- small components ----
@@ -226,6 +234,8 @@ export default function InterceptPage() {
       timeout_enabled: rule.timeout_enabled,
       timeout_seconds: rule.timeout_seconds,
       timeout_action: rule.timeout_action,
+      // 契约值 ""/"src" 映射回哨兵串,空/未知值一律按「全部任务」回显。
+      scope: scopeToChoice(rule.scope ?? ""),
     });
     setRegexErr("");
     setOpen(true);
@@ -246,11 +256,13 @@ export default function InterceptPage() {
     }
     setSaving(true);
     try {
+      // 哨兵串映射回契约值(""=全部任务 / "src"=仅 SRC 任务)后再提交。
+      const payload = { ...form, scope: choiceToScope(form.scope) };
       if (editing) {
-        await api.updateInterceptRule(editing.id, form);
+        await api.updateInterceptRule(editing.id, payload);
         toast.success("规则已更新");
       } else {
-        await api.createInterceptRule(form);
+        await api.createInterceptRule(payload);
         toast.success("规则已创建");
       }
       setOpen(false);
@@ -403,6 +415,7 @@ export default function InterceptPage() {
                     <TableHead className="w-[80px]">类型</TableHead>
                     <TableHead>模式</TableHead>
                     <TableHead className="w-[88px]">策略</TableHead>
+                    <TableHead className="w-[96px]">适用范围</TableHead>
                     <TableHead className="w-[64px] text-center">启用</TableHead>
                     <TableHead className="w-[80px]" />
                   </TableRow>
@@ -431,6 +444,21 @@ export default function InterceptPage() {
                       </TableCell>
                       <TableCell>
                         <ActionBadge action={rule.action} />
+                      </TableCell>
+                      <TableCell>
+                        {rule.scope === "src" ? (
+                          <Badge
+                            variant="outline"
+                            className="border-violet-400/60 text-violet-600 dark:text-violet-400"
+                            title="仅对勾选了 SRC 模式的任务生效"
+                          >
+                            仅 SRC 任务
+                          </Badge>
+                        ) : (
+                          <Badge variant="outline" className="text-muted-foreground">
+                            全部任务
+                          </Badge>
+                        )}
                       </TableCell>
                       <TableCell className="text-center">
                         <Switch checked={rule.enabled} onCheckedChange={() => handleToggle(rule)} />
@@ -478,6 +506,21 @@ export default function InterceptPage() {
                 value={form.priority}
                 onChange={(e) => set({ priority: parseInt(e.target.value, 10) || 0 })}
               />
+            </Field>
+
+            <Field label="适用范围">
+              <Select value={form.scope} onValueChange={(v) => set({ scope: v as ScopeChoice })}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__all__">全部任务</SelectItem>
+                  <SelectItem value="__src__">仅 SRC 任务</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-muted-foreground text-xs">
+                仅 SRC 任务 = 只对勾选了 SRC 模式的任务生效；全部任务 = 既有行为不变。
+              </p>
             </Field>
 
             <Separator />

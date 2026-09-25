@@ -72,7 +72,7 @@ func TestTaskGuardWithoutResolverKeepsRulesActive(t *testing.T) {
 	defer d.Close()
 
 	tool := "TaskGuardNoResolverTool"
-	rule, err := d.CreateInterceptRule("task-guard-nores-"+t.Name(), "tool_name", "string", tool, "deny", "", 9999, true, false, 0, "deny")
+	rule, err := d.CreateInterceptRule("task-guard-nores-"+t.Name(), "tool_name", "string", tool, "deny", "", 9999, true, false, 0, "deny", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +98,7 @@ func TestTaskGuardOffDisablesRules(t *testing.T) {
 	defer d.Close()
 
 	tool := "TaskGuardOffTool"
-	rule, err := d.CreateInterceptRule("task-guard-off-"+t.Name(), "tool_name", "string", tool, "deny", "", 9999, true, false, 0, "deny")
+	rule, err := d.CreateInterceptRule("task-guard-off-"+t.Name(), "tool_name", "string", tool, "deny", "", 9999, true, false, 0, "deny", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func TestTaskGuardNonOffModesFollowGlobal(t *testing.T) {
 	defer d.Close()
 
 	tool := "TaskGuardInheritTool"
-	rule, err := d.CreateInterceptRule("task-guard-inherit-"+t.Name(), "tool_name", "string", tool, "deny", "", 9999, true, false, 0, "deny")
+	rule, err := d.CreateInterceptRule("task-guard-inherit-"+t.Name(), "tool_name", "string", tool, "deny", "", 9999, true, false, 0, "deny", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,12 +165,12 @@ func TestTaskGuardRuleIDsRestrictMatching(t *testing.T) {
 
 	// 两条规则匹配同一个工具名,靠 id 区分谁生效。
 	tool := "TaskGuardRuleIDsTool"
-	first, err := d.CreateInterceptRule("task-guard-rid-a-"+t.Name(), "tool_name", "string", tool, "deny", "", 9998, true, false, 0, "deny")
+	first, err := d.CreateInterceptRule("task-guard-rid-a-"+t.Name(), "tool_name", "string", tool, "deny", "", 9998, true, false, 0, "deny", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer d.Exec(`DELETE FROM intercept_rules WHERE id=$1`, first.ID)
-	second, err := d.CreateInterceptRule("task-guard-rid-b-"+t.Name(), "tool_name", "string", tool, "flag", "", 9999, true, false, 0, "deny")
+	second, err := d.CreateInterceptRule("task-guard-rid-b-"+t.Name(), "tool_name", "string", tool, "flag", "", 9999, true, false, 0, "deny", "")
 	if err != nil {
 		t.Fatal(err)
 	}

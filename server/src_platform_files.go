@@ -1,23 +1,31 @@
 package server
 
-// 平台规范附件的物理 I/O 与解析(与 HTTP handler 分离)。
+// 平台规范附件的物理 I/O 与解析,以及附件类别改派的 HTTP handler。
 //
 // 与字典库(wordbook_files.go)同样的分层理由:路径 containment 校验集中在一处,
 // handler 不直调 os.*——只要有一个入口漏了检查,用户的文件名就能把文件写到 dataDir 之外。
-// 本文件不含任何 HTTP 输入解析;参数均为已验证的 int64 id 与文件名。
+// 解析与落盘的参数均为已验证的 int64 id 与文件名;唯一承载 HTTP 输入的入口是
+// 末尾的 updateSRCPlatformFile(改派只收 {kind},不触碰任何路径)。
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"unicode/utf8"
 
+	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/report"
+	pdf "github.com/ledongthuc/pdf"
+	"github.com/xuri/excelize/v2"
 )
 
 // srcPlatformFileMaxBytes 是单份规范附件的上限(32MB)。
@@ -102,19 +110,27 @@ type srcPlatformFormat int
 const (
 	srcFormatText   srcPlatformFormat = iota // .md/.markdown/.txt:直接当 UTF-8 文本
 	srcFormatDocx                            // .docx:程序化解析成 markdown
+	srcFormatXlsx                            // .xlsx:excelize 全工作表文本化
+	srcFormatPDF                             // .pdf:ledongthuc/pdf 逐页抽文本
 	srcFormatLegacy                          // .doc:老二进制格式,入口即拒绝
-	srcFormatOther                           // 其余(含 pdf/xlsx):只存档不解析
+	srcFormatOther                           // 其余:只存档不解析
 )
 
 // srcPlatformFormatOf 按原始文件名判档。
 // 为什么 .doc 单独拒绝而不是也走「仅存档」:.doc 是用户「以为能解析」的最常见误传,
 // 直接给出「另存为 .docx」的可行指引,比让它静默变成一条不注入的死附件有用得多。
+// .xlsx/.pdf 升级为可解析:统一上传入口先收文件再归类,正文能不能抽出来直接决定
+// AI 识别填入有没有原料——纯存档会让这两个最常见格式的附件永远进不了 AI 约束。
 func srcPlatformFormatOf(filename string) srcPlatformFormat {
 	switch strings.ToLower(filepath.Ext(strings.TrimSpace(filename))) {
 	case ".md", ".markdown", ".txt":
 		return srcFormatText
 	case ".docx":
 		return srcFormatDocx
+	case ".xlsx":
+		return srcFormatXlsx
+	case ".pdf":
+		return srcFormatPDF
 	case ".doc":
 		return srcFormatLegacy
 	}
@@ -191,9 +207,102 @@ func parseSRCPlatformFile(path string, format srcPlatformFormat) srcPlatformPars
 			Status: "skipped",
 			Note:   "老版 .doc 二进制格式无法解析，仅存档；不会注入 AI 约束",
 		}
+	case srcFormatXlsx:
+		text, sheets, rows, err := xlsxToText(path)
+		if err != nil {
+			return srcPlatformParse{Status: "failed", Note: "xlsx 解析失败:" + err.Error()}
+		}
+		text = sanitizeSRCText(text)
+		return srcPlatformParse{
+			ContentText: text,
+			Status:      "parsed",
+			Note: fmt.Sprintf("xlsx 解析:工作表 %d · 行 %d · 约 %d 字",
+				sheets, rows, utf8.RuneCountInString(text)),
+		}
+	case srcFormatPDF:
+		text, pages, err := pdfToText(path)
+		if err != nil {
+			// 解析报错不挡上传:原件已落盘,failed 只是让界面明示「这份没进 AI 约束」。
+			return srcPlatformParse{Status: "failed", Note: "pdf 解析失败:" + err.Error()}
+		}
+		if strings.TrimSpace(text) == "" {
+			// 一页文本都抽不到基本是扫描件/纯图片 PDF:明说原因,而不是让用户
+			// 以为「传上去了就是生效了」。
+			return srcPlatformParse{
+				Status: "failed",
+				Note:   fmt.Sprintf("pdf 共 %d 页,未抽取到文本(可能是扫描件/图片型 PDF,请改用文字版)", pages),
+			}
+		}
+		text = sanitizeSRCText(text)
+		return srcPlatformParse{
+			ContentText: text,
+			Status:      "parsed",
+			Note:        fmt.Sprintf("pdf 解析:%d 页 · 约 %d 字", pages, utf8.RuneCountInString(text)),
+		}
 	default:
 		return srcPlatformParse{Status: "skipped", Note: srcPlatformArchiveNote}
 	}
+}
+
+// xlsxToText 把工作簿的全部工作表文本化:每行一条,单元格间用制表符分隔,
+// 行与行之间换行。表格化的奖励标准(等级×分数)拍平成制表符矩阵后 LLM 仍能按列理解,
+// 且比试图重建 markdown 表格简单可靠得多。
+// 返回 (正文, 工作表数, 总行数, 错误);空行跳过,省正文配额。
+func xlsxToText(path string) (string, int, int, error) {
+	f, err := excelize.OpenFile(path)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	defer f.Close()
+	var b strings.Builder
+	sheets, rows := 0, 0
+	for _, sheet := range f.GetSheetList() {
+		grid, err := f.GetRows(sheet)
+		if err != nil {
+			return "", 0, 0, fmt.Errorf("读取工作表 «%s» 失败: %w", sheet, err)
+		}
+		sheets++
+		for _, row := range grid {
+			cells := make([]string, 0, len(row))
+			for _, c := range row {
+				cells = append(cells, strings.TrimSpace(c))
+			}
+			if strings.Join(cells, "") == "" {
+				continue
+			}
+			b.WriteString(strings.Join(cells, "\t"))
+			b.WriteString("\n")
+			rows++
+		}
+	}
+	return b.String(), sheets, rows, nil
+}
+
+// pdfToText 逐页抽取 PDF 文本(纯 Go,无外部依赖)。
+// 页与页之间补一个换行,避免上一页末行与下一页首行粘连;空页跳过。
+// 返回 (正文, 页数, 错误)。扫描件/图片型 PDF 抽出来是空正文,由调用方给 failed+note。
+func pdfToText(path string) (string, int, error) {
+	fd, r, err := pdf.Open(path)
+	if err != nil {
+		return "", 0, err
+	}
+	defer fd.Close()
+	total := r.NumPage()
+	var b strings.Builder
+	for p := 1; p <= total; p++ {
+		// GetPlainText 内部已处理空内容页(返回 "", nil);单个页面结构异常时
+		// 它会把 panic 转成 error 返回,这里直接降级为解析失败,原件照常存档。
+		text, err := r.Page(p).GetPlainText(nil)
+		if err != nil {
+			return "", total, fmt.Errorf("第 %d 页文本抽取失败: %w", p, err)
+		}
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		b.WriteString(strings.TrimRight(text, "\n"))
+		b.WriteString("\n")
+	}
+	return b.String(), total, nil
 }
 
 // sanitizeSRCText 清掉 NUL 与非法 UTF-8。
@@ -304,4 +413,59 @@ func removeSRCPlatformDir(dataDir string, platformID int64) {
 		return
 	}
 	_ = os.RemoveAll(dir)
+}
+
+// ---- 类别改派 ----
+
+// updateSRCPlatformFile PUT /api/src/platforms/{id}/files/{fid}  body: {kind}
+//
+// 统一上传入口先收文件(kind='other'),用户/AI 再在这里把附件归入四类之一。
+// 类别决定附件正文在平台规范注入里的分组标签(srcFileKindLabel),改派即改语义,
+// 所以必须重走一遍 kind 校验,而不是只信前端 Select 的取值。
+func (s *Server) updateSRCPlatformFile(w http.ResponseWriter, r *http.Request) {
+	platformID, ok := pathInt(r, "id")
+	if !ok || platformID <= 0 {
+		writeErr(w, 400, "bad platform id")
+		return
+	}
+	fileID, ok := pathInt(r, "fid")
+	if !ok || fileID <= 0 {
+		writeErr(w, 400, "bad file id")
+		return
+	}
+	var req struct {
+		Kind string `json:"kind"`
+	}
+	if err := decode(r, &req); err != nil {
+		writeErr(w, 400, "invalid JSON: "+err.Error())
+		return
+	}
+	kind := strings.TrimSpace(req.Kind)
+	if !db.ValidSRCFileKind(kind) {
+		writeErr(w, 400, "kind 必须是 reward_standard / scoring_standard / code_of_conduct / rules / other")
+		return
+	}
+	// 平台存在性单独确认:没有平台上下文的 404 与「附件不存在」语义不同,
+	// 前端据此提示刷新列表还是跳回平台页。
+	platform, err := s.m.PG().GetSRCPlatform(platformID)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if platform == nil {
+		writeErr(w, 404, "平台不存在")
+		return
+	}
+	row, err := s.m.PG().UpdateSRCPlatformFileKind(platformID, fileID, kind)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeErr(w, 404, "附件不存在")
+			return
+		}
+		writeErr(w, 500, err.Error())
+		return
+	}
+	log.Printf("[src-platform] 平台 #%d «%s» 附件 #%d «%s» 类别改派为 %s",
+		platformID, platform.Name, fileID, row.Filename, kind)
+	writeJSON(w, 200, map[string]any{"file": row})
 }

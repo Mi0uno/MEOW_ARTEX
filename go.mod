@@ -36,6 +36,7 @@ require (
 	github.com/jchv/go-webview2 v0.0.0-20260205173254-56598839c808 // indirect
 	github.com/jchv/go-winloader v0.0.0-20250406163304-c1995be93bd1 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
+	github.com/ledongthuc/pdf v0.0.0-20260907135840-6c8c28e0e8a0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/microcosm-cc/bluemonday v1.0.27 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect

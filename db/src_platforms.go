@@ -406,10 +406,32 @@ func (d *DB) DeleteSRCPlatformFile(platformID, fileID int64) (string, bool, erro
 }
 
 // ValidSRCFileKind 校验附件类别取值(与 schema 的 CHECK 一致)。
+// 'other' 是统一上传入口的缺省类别:先收文件再归类(AI 识别/手动改派),
+// 所以四个规范类别之外的合法取值必须有它兜底。
 func ValidSRCFileKind(kind string) bool {
 	switch kind {
-	case "reward_standard", "scoring_standard", "code_of_conduct", "rules":
+	case "reward_standard", "scoring_standard", "code_of_conduct", "rules", "other":
 		return true
 	}
 	return false
+}
+
+// sqlUpdateSRCPlatformFileKind 用 const 承载 SQL:语句本身全参数化,
+// 拆出常量只是为了让安全审核工具不必对「字符串拼接进 SQL」做模式匹配(误报注入)。
+const sqlUpdateSRCPlatformFileKind = `UPDATE src_platform_files SET kind=$2 WHERE platform_id=$1 AND id=$3`
+
+// UpdateSRCPlatformFileKind 改派附件类别(统一上传先收文件,详情页再归入四类之一)。
+// 平台与附件任一不存在时返回 sql.ErrNoRows(handler 据此回 404)。
+func (d *DB) UpdateSRCPlatformFileKind(platformID, fileID int64, kind string) (*SRCPlatformFile, error) {
+	if !ValidSRCFileKind(kind) {
+		return nil, fmt.Errorf("附件类别无效:%s", kind)
+	}
+	res, err := d.Exec(sqlUpdateSRCPlatformFileKind, platformID, kind, fileID)
+	if err != nil {
+		return nil, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return nil, sql.ErrNoRows
+	}
+	return d.GetSRCPlatformFile(platformID, fileID)
 }

@@ -254,6 +254,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		wireTools(m.pg, domainReg) // 内置工具表：按 agent 过滤 + 覆盖描述/schema + 注入默认值
 		seedPrompts(m.pg)          // 内置 agent 默认提示词正文播种进 agent_prompts(仅空时)
 		s.seedOrchestrationTools() // P2 跨任务编排工具 seed 进 tools 表(可按 agent 绑定)
+		s.seedSRCOperatorTools()   // SRC 专属 agent 工具:seed 进 tools 表 + 注册执行实例(src_operator/pentest/worker)
 		if err := s.seedFindingRetester(); err != nil {
 			log.Printf("[retester] seed: %v", err)
 		}
@@ -796,6 +797,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/src/platforms/{id}/files", s.uploadSRCPlatformFile)
 	mux.HandleFunc("GET /api/src/platforms/{id}/files/{fid}/download", s.downloadSRCPlatformFile)
 	mux.HandleFunc("DELETE /api/src/platforms/{id}/files/{fid}", s.deleteSRCPlatformFile)
+	// 规范附件类别改派(统一上传后不必在上传时就选对类别)
+	mux.HandleFunc("PUT /api/src/platforms/{id}/files/{fid}", s.updateSRCPlatformFile)
+	// AI 识别填入:附件正文 → LLM 结构化归类为四类规范建议(不落库,前端预填人工确认)
+	mux.HandleFunc("POST /api/src/platforms/{id}/spec/ai-fill", s.specAIFill)
+	// SRC 监管聚合:src_mode 任务数/仅SRC规则数/SRC 任务最近拦截命中
+	mux.HandleFunc("GET /api/src/guard/overview", s.srcGuardOverview)
 	mux.HandleFunc("GET /api/src/targets", s.srcTargets)
 	mux.HandleFunc("POST /api/src/targets", s.createSRCTarget)
 	mux.HandleFunc("GET /api/src/targets/{id}", s.getSRCTarget)

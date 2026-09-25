@@ -22,6 +22,7 @@ import {
   PlugZapIcon,
   ScanSearchIcon,
   ScrollTextIcon,
+  ShieldCheckIcon,
   SlidersHorizontalIcon,
   UserCheckIcon,
   WorkflowIcon,
@@ -36,9 +37,17 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
-import type { DecisionEngine, JevThresholds, JevThresholdsResponse, JudgeConfig, LLMProfile } from "@/lib/types";
+import type {
+  DecisionEngine,
+  JevThresholds,
+  JevThresholdsResponse,
+  JudgeConfig,
+  LLMProfile,
+  SRCGuardOverview,
+} from "@/lib/types";
 
 import { GuardOverview } from "./_components/guard-overview";
 import { TaskGuardNotes } from "./_components/task-guard-notes";
@@ -745,6 +754,229 @@ function JudgeCard() {
   );
 }
 
+// ---- SRC 监管(监管联动聚合) ----
+
+// 时间展示与审批记录组件(approval-records)同款格式:SRC 命中行与全局审批记录
+// 是同一套审计数据,格式一致才方便两边对照着看。
+function srcFmtTime(value?: string) {
+  if (!value) return "—";
+  return new Date(value).toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+// SRC 审计行的动作徽标,配色与 intercept 页的 ActionBadge 同款(拦截=红、判疑=琥珀、
+// 转人工=蓝、放通=灰绿)。ActionBadge 是 intercept 页的局部组件,这里内联同款映射;
+// 审计行的 action 是自由字符串,对不上四档 token 时原样显示中性徽标,不猜颜色。
+function SrcActionBadge({ action }: { action: string }) {
+  if (action === "deny") return <Badge variant="destructive">禁止</Badge>;
+  if (action === "flag")
+    return (
+      <Badge
+        variant="outline"
+        className="border-amber-400 text-amber-600"
+        title="判疑放通：工具照常执行，仅写一条「已判疑」记录供事后复盘"
+      >
+        判疑放通
+      </Badge>
+    );
+  if (action === "ask")
+    return (
+      <Badge
+        variant="outline"
+        className="border-blue-400 text-blue-600"
+        title="转人工：等待用户审批，期间工具调用被阻塞"
+      >
+        申请
+      </Badge>
+    );
+  if (action === "allow") return <Badge variant="secondary">允许</Badge>;
+  return <Badge variant="outline">{action || "未知"}</Badge>;
+}
+
+function SrcGuardCard() {
+  const [ov, setOv] = React.useState<SRCGuardOverview | null>(null);
+  const [loading, setLoading] = React.useState(true);
+  const [failed, setFailed] = React.useState(false);
+  // 改一下就重跑加载 effect(手动重试),数据本身不参与闭包。
+  const [reloadKey, setReloadKey] = React.useState(0);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: reloadKey 不在闭包里被读取,它的作用就是"改一下就重跑本 effect"(手动重试)。
+  React.useEffect(() => {
+    let alive = true;
+    void (async () => {
+      setLoading(true);
+      try {
+        const data = await api.srcGuardOverview();
+        if (!alive) return;
+        // 旧后端/兜底响应会把缺字段当 undefined:把缺失当 0 显示会编造"没有 SRC 任务、
+        // 没有 SRC 规则"的错误结论,所以字段不全直接按加载失败处理(与门限总览同策略)。
+        if (
+          typeof data?.src_task_count !== "number" ||
+          typeof data?.src_task_active !== "number" ||
+          typeof data?.rules_scoped_src !== "number" ||
+          typeof data?.rules_total !== "number" ||
+          !Array.isArray(data?.recent_blocks)
+        ) {
+          setOv(null);
+          setFailed(true);
+          return;
+        }
+        setOv(data);
+        setFailed(false);
+      } catch {
+        if (!alive) return;
+        setOv(null);
+        setFailed(true);
+      } finally {
+        if (alive) setLoading(false);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [reloadKey]);
+
+  if (loading && !ov) {
+    return (
+      <Card>
+        <CardContent className="p-4">
+          <p className="py-6 text-center text-muted-foreground text-sm">加载 SRC 监管…</p>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  // 加载失败整块降级:只塌这一张卡,页面其它流水线卡片照常可用。
+  if (!ov) {
+    return (
+      <Card>
+        <CardContent className="flex flex-wrap items-center justify-between gap-3 p-4">
+          <div className="flex min-w-0 items-start gap-2 text-sm">
+            <InfoIcon className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+            <div>
+              <p className="font-medium">SRC 监管加载失败</p>
+              <p className="mt-0.5 text-muted-foreground text-xs">
+                无法获取 SRC 监管聚合数据（可能后端版本较旧或服务不可用），请重试。页面其它内容不受影响。
+              </p>
+            </div>
+          </div>
+          <Button variant="outline" size="sm" className="shrink-0" onClick={() => setReloadKey((k) => k + 1)}>
+            重试
+          </Button>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  // 四个数字卡。第四格用 rules_total(全部拦截规则数,契约注释即"全部拦截规则数"),
+  // 不标"启用"——把它读成启用数会高估 SRC 之外的生效范围,启用明细以拦截规则页为准。
+  const stats: Array<{ label: string; value: number; hint: string }> = [
+    { label: "SRC 任务总数", value: ov.src_task_count, hint: "勾选了 SRC 模式的任务" },
+    { label: "运行中 SRC 任务", value: ov.src_task_active, hint: "当前运行中的 SRC 任务" },
+    { label: "仅 SRC 规则数", value: ov.rules_scoped_src, hint: "适用范围为「仅 SRC 任务」的拦截规则" },
+    { label: "全部规则数", value: ov.rules_total, hint: "全部拦截规则（含未启用）" },
+  ];
+
+  return (
+    <Card>
+      <CardContent className="space-y-4 p-4">
+        <div className="flex flex-wrap items-center gap-2">
+          <ShieldCheckIcon className="h-4 w-4 text-muted-foreground" />
+          <p className="font-medium text-sm">SRC 监管</p>
+          <span className="text-muted-foreground text-xs">
+            SRC 模式任务的监管聚合：任务规模 · 仅 SRC 生效的规则 · 最近拦截命中
+          </span>
+        </div>
+
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+          {stats.map((s) => (
+            <div key={s.label} className="rounded-lg border bg-muted/20 p-3">
+              <p className="text-[11px] text-muted-foreground">{s.label}</p>
+              <p className="mt-1 font-semibold text-2xl tabular-nums">{s.value}</p>
+              <p className="mt-1 text-[10px] leading-snug text-muted-foreground">{s.hint}</p>
+            </div>
+          ))}
+        </div>
+
+        <div className="space-y-2">
+          <p className="font-semibold text-[10px] text-muted-foreground uppercase tracking-wider">
+            SRC 任务最近拦截命中
+          </p>
+          {ov.recent_blocks.length === 0 ? (
+            <p className="rounded-md border border-dashed px-3 py-6 text-center text-muted-foreground text-sm">
+              暂无 SRC 任务拦截记录
+            </p>
+          ) : (
+            <div className="rounded-md border">
+              <Table>
+                <TableHeader>
+                  <TableRow className="hover:bg-transparent">
+                    <TableHead className="w-[120px]">时间</TableHead>
+                    <TableHead>任务</TableHead>
+                    <TableHead className="w-[90px]">agent</TableHead>
+                    <TableHead className="w-[100px]">工具</TableHead>
+                    <TableHead className="w-[88px]">动作</TableHead>
+                    <TableHead>消息</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {ov.recent_blocks.map((row) => (
+                    <TableRow key={row.id}>
+                      <TableCell className="whitespace-nowrap text-muted-foreground text-xs tabular-nums">
+                        {srcFmtTime(row.created_at)}
+                      </TableCell>
+                      <TableCell className="max-w-[180px]">
+                        {row.task_id ? (
+                          <Link
+                            href={`/function/tasks/detail?id=${row.task_id}`}
+                            className="truncate font-medium text-sm underline-offset-2 hover:underline"
+                            title={row.task_name || row.task_id}
+                          >
+                            {row.task_name || row.task_id}
+                          </Link>
+                        ) : (
+                          <span className="font-medium text-sm">{row.task_name || `#${row.id}`}</span>
+                        )}
+                      </TableCell>
+                      <TableCell className="truncate text-muted-foreground text-xs">{row.agent_name || "—"}</TableCell>
+                      <TableCell>
+                        {row.tool_name ? (
+                          <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">{row.tool_name}</code>
+                        ) : (
+                          <span className="text-muted-foreground text-xs">—</span>
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        <SrcActionBadge action={row.action} />
+                      </TableCell>
+                      <TableCell className="max-w-[260px]">
+                        <span className="line-clamp-2 text-muted-foreground text-xs" title={row.message ?? ""}>
+                          {row.message || "—"}
+                        </span>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          )}
+        </div>
+
+        <div className="flex justify-end">
+          <Button variant="ghost" size="sm" className="h-7 text-xs" asChild>
+            <Link href="/system/intercept">配置仅 SRC 适用的拦截规则 →</Link>
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
 // ---- page ----
 
 export default function AiGuardPage() {
@@ -793,6 +1025,8 @@ export default function AiGuardPage() {
       </div>
       <JudgeCard />
       <TaskGuardNotes />
+      {/* SRC 监管放在板块底部:它是既有监管体系对 SRC 任务的聚合视图,不挤掉上面的流水线卡片。 */}
+      <SrcGuardCard />
     </div>
   );
 }

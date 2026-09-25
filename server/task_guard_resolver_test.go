@@ -130,7 +130,7 @@ func TestTaskGuardResolverIsWiredIntoInterceptor(t *testing.T) {
 	rule, err := s.m.pg.CreateInterceptRule(
 		fmt.Sprintf("guard-test-%d", time.Now().UnixNano()),
 		"tool_name", "string", "Bash", "deny", "guard test rule",
-		100, true, false, 0, "deny",
+		100, true, false, 0, "deny", "",
 	)
 	if err != nil {
 		t.Fatal(err)

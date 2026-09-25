@@ -22,8 +22,11 @@ type InterceptRule struct {
 	TimeoutEnabled bool      `json:"timeout_enabled"`
 	TimeoutSeconds int       `json:"timeout_seconds"`
 	TimeoutAction  string    `json:"timeout_action"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	// Scope 是规则适用范围:''=全部任务(缺省,既有行为不变);'src'=仅 SRC 模式任务。
+	// 取值白名单与 schema.sql 的 intercept_rules_scope_check 保持一致(ValidRuleScope)。
+	Scope     string    `json:"scope"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // InterceptPending is one row of intercept_pending.
@@ -42,15 +45,26 @@ type InterceptPending struct {
 	CreatedAt      time.Time       `json:"created_at"`
 }
 
-const interceptRuleCols = `id, name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action, created_at, updated_at`
+const interceptRuleCols = `id, name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action, scope, created_at, updated_at`
 
 func scanInterceptRule(row interface{ Scan(...any) error }) (InterceptRule, error) {
 	var r InterceptRule
 	err := row.Scan(&r.ID, &r.Name, &r.Enabled, &r.Priority,
 		&r.MatchTarget, &r.MatchType, &r.Pattern, &r.Action, &r.Message,
 		&r.TimeoutEnabled, &r.TimeoutSeconds, &r.TimeoutAction,
-		&r.CreatedAt, &r.UpdatedAt)
+		&r.Scope, &r.CreatedAt, &r.UpdatedAt)
 	return r, err
+}
+
+// ValidRuleScope 报告 s 是否为合法的 intercept_rules.scope 取值:''=全部任务、
+// 'src'=仅 SRC 模式任务。CRUD 入口用它在写库前拒绝非法值(库侧还有 CHECK 兜底)。
+func ValidRuleScope(s string) bool {
+	switch s {
+	case "", "src":
+		return true
+	default:
+		return false
+	}
 }
 
 // ListInterceptRules returns all rules ordered by priority DESC then id.
@@ -71,26 +85,26 @@ func (d *DB) ListInterceptRules() ([]InterceptRule, error) {
 	return out, rows.Err()
 }
 
-// CreateInterceptRule inserts a new rule.
-func (d *DB) CreateInterceptRule(name, matchTarget, matchType, pattern, action, message string, priority int, enabled bool, timeoutEnabled bool, timeoutSeconds int, timeoutAction string) (InterceptRule, error) {
+// CreateInterceptRule inserts a new rule. scope: ''=全部任务,'src'=仅 SRC 任务。
+func (d *DB) CreateInterceptRule(name, matchTarget, matchType, pattern, action, message string, priority int, enabled bool, timeoutEnabled bool, timeoutSeconds int, timeoutAction, scope string) (InterceptRule, error) {
 	row := d.QueryRow(`
-INSERT INTO intercept_rules(name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+INSERT INTO intercept_rules(name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action, scope)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 RETURNING `+interceptRuleCols,
-		name, enabled, priority, matchTarget, matchType, pattern, action, message, timeoutEnabled, timeoutSeconds, timeoutAction)
+		name, enabled, priority, matchTarget, matchType, pattern, action, message, timeoutEnabled, timeoutSeconds, timeoutAction, scope)
 	return scanInterceptRule(row)
 }
 
 // UpdateInterceptRule replaces all editable fields of an existing rule.
-func (d *DB) UpdateInterceptRule(id int64, name, matchTarget, matchType, pattern, action, message string, priority int, enabled bool, timeoutEnabled bool, timeoutSeconds int, timeoutAction string) (InterceptRule, error) {
+func (d *DB) UpdateInterceptRule(id int64, name, matchTarget, matchType, pattern, action, message string, priority int, enabled bool, timeoutEnabled bool, timeoutSeconds int, timeoutAction, scope string) (InterceptRule, error) {
 	row := d.QueryRow(`
 UPDATE intercept_rules
    SET name=$2, enabled=$3, priority=$4, match_target=$5,
        match_type=$6, pattern=$7, action=$8, message=$9,
-       timeout_enabled=$10, timeout_seconds=$11, timeout_action=$12
+       timeout_enabled=$10, timeout_seconds=$11, timeout_action=$12, scope=$13
 WHERE id=$1
 RETURNING `+interceptRuleCols,
-		id, name, enabled, priority, matchTarget, matchType, pattern, action, message, timeoutEnabled, timeoutSeconds, timeoutAction)
+		id, name, enabled, priority, matchTarget, matchType, pattern, action, message, timeoutEnabled, timeoutSeconds, timeoutAction, scope)
 	return scanInterceptRule(row)
 }
 
@@ -432,4 +446,89 @@ func (d *DB) listInterceptsPage(taskID string, page, size int, filter InterceptA
 		out = append(out, r)
 	}
 	return out, total, rows.Err()
+}
+
+// --- SRC 监管聚合(GET /api/src/guard/overview) ---
+//
+// 监管&规则中心的「SRC 监管」板块一次拿全:SRC 任务数/活跃数、scope='src' 的规则
+// 占比、SRC 任务最近的拦截/判疑流水。与上面的 AI监管总览聚合同理:计数放 SQL 侧,
+// 页面要的是数字而不是全表。
+
+// srcGuardTaskCountsSQL 统计 SRC 模式任务总数与活跃数。活跃=运行中或排队:
+// tasks.status 的 CHECK 白名单里没有 'queued'(只有 created/running/paused/done/
+// failed/timeout),"排队"是独立的布尔列 tasks.queued,所以 queued 落在布尔列上。
+const srcGuardTaskCountsSQL = `SELECT COUNT(*),
+       COUNT(*) FILTER (WHERE status = 'running' OR queued)
+FROM tasks
+WHERE src_mode AND deleted_at IS NULL`
+
+// srcGuardRuleCountsSQL 规则计数:scope='src' 且启用的条数 + 全部启用条数。
+// rules_total 与 AI 监管总览的 rules_enabled 同口径(面板对比的是"仅 SRC 规则
+// 在生效规则里的占比",禁用规则两边都不算)。
+const srcGuardRuleCountsSQL = `SELECT COUNT(*) FILTER (WHERE scope = 'src'), COUNT(*)
+FROM intercept_rules
+WHERE enabled`
+
+// srcGuardRecentBlocksSQL 取 SRC 任务最近的拦截/判疑流水。三个细节:
+//   - join 用 t.id::text = ip.task_id:intercept_pending.task_id 是 TEXT,把 BIGINT
+//     侧转成 text,非数字的 task_id 不会像 ::BIGINT 反向转换那样让整条查询报错;
+//   - 排除 status='allowed':面板语义是「被拦截/待审/判疑」(types.ts 的
+//     recent_blocks 注释),纯放行的审计行不是监管事件,混进来只会淹没列表;
+//   - 只统计未删除的 SRC 任务(deleted_at IS NULL),与 src_task_count 同口径。
+const srcGuardRecentBlocksSQL = `SELECT ip.id, ip.task_id,
+       COALESCE(t.name, '') AS task_name,
+       ip.agent_name, ip.tool_name, ip.status AS action, ip.reason AS message,
+       ip.created_at
+FROM intercept_pending ip
+JOIN tasks t ON t.id::text = ip.task_id AND t.src_mode AND t.deleted_at IS NULL
+WHERE ip.status <> 'allowed'
+ORDER BY ip.created_at DESC, ip.id DESC
+LIMIT $1`
+
+// SRCGuardBlock 是 SRC 监管板块 recent_blocks 的一行(字段名与
+// web/src/lib/types.ts 的 SRCGuardOverview.recent_blocks 严格对齐)。
+type SRCGuardBlock struct {
+	ID        int64     `json:"id"`
+	TaskID    *string   `json:"task_id"`
+	TaskName  string    `json:"task_name"`
+	AgentName string    `json:"agent_name"`
+	ToolName  string    `json:"tool_name"`
+	Action    string    `json:"action"`
+	Message   string    `json:"message"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// CountSRCModeTasks returns (total, active) SRC-mode task counts. active =
+// running or queued.
+func (d *DB) CountSRCModeTasks() (total, active int, err error) {
+	err = d.QueryRow(srcGuardTaskCountsSQL).Scan(&total, &active)
+	return total, active, err
+}
+
+// CountInterceptRulesByScope returns (scopedSRC, enabledTotal) enabled-rule
+// counts, where scopedSRC counts rules with scope='src'.
+func (d *DB) CountInterceptRulesByScope() (scopedSRC, enabledTotal int, err error) {
+	err = d.QueryRow(srcGuardRuleCountsSQL).Scan(&scopedSRC, &enabledTotal)
+	return scopedSRC, enabledTotal, err
+}
+
+// ListSRCRecentBlocks returns up to limit intercept rows belonging to SRC-mode
+// tasks, newest first. Never nil: the handler serialises it directly and a nil
+// slice would render as JSON null.
+func (d *DB) ListSRCRecentBlocks(limit int) ([]SRCGuardBlock, error) {
+	rows, err := d.Query(srcGuardRecentBlocksSQL, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []SRCGuardBlock{}
+	for rows.Next() {
+		var b SRCGuardBlock
+		if err := rows.Scan(&b.ID, &b.TaskID, &b.TaskName, &b.AgentName,
+			&b.ToolName, &b.Action, &b.Message, &b.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
 }

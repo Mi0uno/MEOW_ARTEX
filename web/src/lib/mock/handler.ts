@@ -2405,7 +2405,12 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (seg[0] === "visibility" && m === "GET") return { agents: [] };
 
   // ── intercept ──
-  if (path === "/intercept/rules" && m === "GET") return { rules: D.interceptRules };
+  // 夹具本体(data.ts)不动,在 handler 层补 scope 字段:第一条规则演示「仅 SRC 任务」,
+  // 其余保持缺省「全部任务」,让 intercept 页的适用范围列两种状态都可见。
+  if (path === "/intercept/rules" && m === "GET")
+    return {
+      rules: D.interceptRules.map((rule) => ({ ...rule, scope: rule.id === 1 ? "src" : "" })),
+    };
   if (seg[0] === "intercept" && seg[1] === "rules" && seg[3] === "toggle")
     return { ok: true, enabled: b.enabled ?? true };
   if (path === "/intercept/pending" && m === "GET")
@@ -2471,6 +2476,50 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       ask_timeout_action: "deny",
     };
   if (path === "/intercept/judge" && m === "PUT") return { ok: true };
+
+  // ── SRC 监管聚合(AI监管页 · SRC 监管板块) ──
+  // 结构对齐 types.ts 的 SRCGuardOverview。recent_blocks 引用既有夹具里的任务
+  // (t-acme-web/t-acme-api),任务名链接才能真的跳到任务详情;动作覆盖 deny/flag/ask,
+  // 让五档徽标的三种非放通配色在 demo 里都可见。
+  if (path === "/src/guard/overview" && m === "GET")
+    return {
+      src_task_count: 3,
+      src_task_active: 1,
+      rules_scoped_src: 1,
+      rules_total: D.interceptRules.length,
+      recent_blocks: [
+        {
+          id: 901,
+          task_id: "t-acme-web",
+          task_name: "ACME Web 渗透",
+          agent_name: "src_operator",
+          tool_name: "Bash",
+          action: "deny",
+          message: "命中「仅 SRC」规则：整库导出外发，超出授权范围",
+          created_at: "2026-07-26T04:12:00Z",
+        },
+        {
+          id: 902,
+          task_id: "t-acme-api",
+          task_name: "ACME API 测试",
+          agent_name: "src_operator",
+          tool_name: "WebFetch",
+          action: "flag",
+          message: "访问非授权关联域名，判疑留痕待复盘",
+          created_at: "2026-07-26T03:40:00Z",
+        },
+        {
+          id: 903,
+          task_id: "t-acme-web",
+          task_name: "ACME Web 渗透",
+          agent_name: "worker#2",
+          tool_name: "shell_send",
+          action: "ask",
+          message: "对生产网段的弱口令尝试需人工确认",
+          created_at: "2026-07-26T02:05:00Z",
+        },
+      ],
+    };
 
   // ── 旁路提问(/btw)：demo 无旁路会话 ──
   // 必须显式命中：路径以 s 结尾会被下面的读兜底判成集合返回 []，items 就成了 undefined。

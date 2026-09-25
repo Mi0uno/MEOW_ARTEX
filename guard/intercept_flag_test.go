@@ -40,7 +40,7 @@ func TestFlagActionPassesThroughAndAudits(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rule, err := d.CreateInterceptRule("flag-fixture-"+t.Name(), "tool_name", "string", "Bash", "flag", "", 9999, true, false, 0, "deny")
+	rule, err := d.CreateInterceptRule("flag-fixture-"+t.Name(), "tool_name", "string", "Bash", "flag", "", 9999, true, false, 0, "deny", "")
 	if err != nil {
 		t.Fatal(err)
 	}

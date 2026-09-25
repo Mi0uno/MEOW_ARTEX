@@ -2,13 +2,17 @@
 
 import * as React from "react";
 
+import Link from "next/link";
+
 import {
   ActivityIcon,
   AlertTriangleIcon,
   BugIcon,
   CheckIcon,
+  ChevronDownIcon,
   ClockIcon,
   CoinsIcon,
+  GlobeIcon,
   ListChecksIcon,
   PencilIcon,
   PlusIcon,
@@ -20,8 +24,11 @@ import {
   XIcon,
 } from "lucide-react";
 
-import { StatusBadge } from "@/components/status-badge";import { Button } from "@/components/ui/button";
+import { StatusBadge } from "@/components/status-badge";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Input } from "@/components/ui/input";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { Progress } from "@/components/ui/progress";
@@ -29,6 +36,8 @@ import { api } from "@/lib/api";
 import type {
   Finding,
   ModelTokenStat,
+  SRCPlatform,
+  SRCTargetLink,
   Stats,
   Task,
   TaskConstraint,
@@ -101,6 +110,21 @@ function StatCard({
   );
 }
 
+// SRC 平台规范的单个折叠段:默认收起,点标题展开/收起。空内容的段由调用方过滤,这里不再判空。
+function SrcSpecSection({ title, content }: { title: string; content: string }) {
+  return (
+    <Collapsible className="rounded-md border">
+      <CollapsibleTrigger className="group flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-sm font-medium hover:bg-muted/50">
+        {title}
+        <ChevronDownIcon className="text-muted-foreground size-3.5 shrink-0 transition-transform group-data-[state=open]:rotate-180" />
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        <p className="whitespace-pre-wrap break-words border-t px-3 py-2 text-sm">{content}</p>
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
+
 export function OverviewTab({ taskId }: { taskId: string }) {
   const [task, setTask] = React.useState<Task | null>(null);
   const [stats, setStats] = React.useState<Stats | null>(null);
@@ -142,6 +166,12 @@ export function OverviewTab({ taskId }: { taskId: string }) {
   const [editingConId, setEditingConId] = React.useState<string | null>(null);
   const [editConText, setEditConText] = React.useState("");
   const [editConKind, setEditConKind] = React.useState<TaskConstraint["kind"]>("deny");
+  // SRC 平台上下文:平台与目标授权两块各自独立加载,谁失败只降级谁,互不拖垮。
+  // platform 只分 loading/done 两态:null 即「已删除/拉不到」;link 需要区分「加载失败」与「无关联」。
+  const [srcPlatform, setSrcPlatform] = React.useState<SRCPlatform | null>(null);
+  const [srcPlatformState, setSrcPlatformState] = React.useState<"loading" | "done">("loading");
+  const [srcLink, setSrcLink] = React.useState<SRCTargetLink | null>(null);
+  const [srcLinkState, setSrcLinkState] = React.useState<"loading" | "ok" | "error">("loading");
 
   const loadTokens = React.useCallback(async () => {
     try {
@@ -439,6 +469,58 @@ export function OverviewTab({ taskId }: { taskId: string }) {
     { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, calls: 0 },
   );
 
+  // SRC 平台上下文的门槛:非 SRC 任务或旧数据(两个 id 缺失/为 0)不渲染该卡片。
+  const srcPlatformId = task?.src_platform_id ?? 0;
+  const srcTargetId = task?.src_target_id ?? 0;
+  const showSrcCard = !!task?.src_mode && srcPlatformId > 0 && srcTargetId > 0;
+  // 禁止事项按行拆分(过滤空行);key 用 index+内容,避免重复行撞 key。
+  const srcForbiddenLines = (srcLink?.forbidden ?? "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  // SRC 平台上下文:平台与目标授权在任务创建时即绑定,一次性拉取即可,不进 3s 轮询。
+  // 两个请求各自独立 catch:平台已删/接口挂了只降级平台块,目标授权范围照常展示,反之亦然。
+  React.useEffect(() => {
+    if (!showSrcCard) return;
+    let cancelled = false;
+    setSrcPlatform(null);
+    setSrcPlatformState("loading");
+    setSrcLink(null);
+    setSrcLinkState("loading");
+    api
+      .getSRCPlatform(srcPlatformId)
+      .then((p) => {
+        if (cancelled) return;
+        // 返回空对象/空 id 视同平台已删除,四类规范整块降级,目标授权不受影响。
+        setSrcPlatform(p && p.id ? p : null);
+      })
+      .catch(() => {
+        // 拉取失败(含平台已删的 404)同样按「已删除」降级,不让任务页报错。
+        if (cancelled) return;
+        setSrcPlatform(null);
+      })
+      .finally(() => {
+        if (!cancelled) setSrcPlatformState("done");
+      });
+    api
+      .srcTargetLinks(srcTargetId)
+      .then((links) => {
+        if (cancelled) return;
+        // 同一目标可关联多个平台,取 platform_id 匹配本任务的那条授权。
+        setSrcLink(links.find((l) => l.platform_id === srcPlatformId) ?? null);
+        setSrcLinkState("ok");
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setSrcLink(null);
+        setSrcLinkState("error");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [showSrcCard, srcPlatformId, srcTargetId]);
+
   return (
     <div className="flex flex-col gap-4">
       {/* 原始任务描述与目标(创建时填写的),置顶便于随时回看。 */}
@@ -585,6 +667,119 @@ export function OverviewTab({ taskId }: { taskId: string }) {
           )}
         </CardContent>
       </Card>
+      {/* SRC 平台上下文:平台是谁、四类规范说了什么、这个目标允许测什么、评分标准与守则。
+          数据在任务创建时绑定,一次性拉取,不进 3s 轮询;放在「操作约束」上方,因为下方
+          约束正是这些平台规范/授权范围转成的硬约束——先看出处,再看落点。 */}
+      {showSrcCard && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <GlobeIcon className="size-4 text-primary" /> SRC 平台上下文
+              <Badge variant="outline" className="font-normal">SRC 任务</Badge>
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-3">
+            {/* 头部:平台名(链详情)+ 主页外链 + 目标名(链详情,带 platform 回跳参数)。 */}
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm">
+              <span className="text-muted-foreground text-xs">平台</span>
+              {srcPlatform ? (
+                <>
+                  <Link
+                    href={`/function/src/platforms/detail?id=${srcPlatform.id}`}
+                    className="font-medium hover:underline"
+                  >
+                    {srcPlatform.name}
+                  </Link>
+                  {srcPlatform.homepage && (
+                    <a
+                      href={srcPlatform.homepage}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center gap-1 text-xs text-blue-500 hover:underline"
+                    >
+                      <GlobeIcon className="size-3" /> 主页
+                    </a>
+                  )}
+                </>
+              ) : srcPlatformState === "loading" ? (
+                <span className="text-muted-foreground">加载中…</span>
+              ) : (
+                <span className="text-muted-foreground">所属平台已删除（#{srcPlatformId}）</span>
+              )}
+              <span className="text-muted-foreground">·</span>
+              <span className="text-muted-foreground text-xs">目标</span>
+              <Link
+                href={`/function/src/targets/detail?id=${srcTargetId}&platform=${srcPlatformId}`}
+                className="font-medium hover:underline"
+              >
+                {srcLink?.target_name?.trim() || `目标 #${srcTargetId}`}
+              </Link>
+            </div>
+            {/* 目标授权范围:最重要,默认展开——这个目标到底允许测什么、禁止测什么。 */}
+            <div className="flex flex-col gap-2 rounded-md border p-3">
+              <div className="text-xs font-medium text-muted-foreground">
+                目标授权范围（这个目标允许测什么）
+              </div>
+              {srcLinkState === "loading" ? (
+                <p className="text-muted-foreground text-sm">加载中…</p>
+              ) : srcLinkState === "error" ? (
+                <p className="text-sm text-red-500">加载失败</p>
+              ) : !srcLink ? (
+                <p className="text-muted-foreground text-sm">未找到该目标与本平台的授权关联。</p>
+              ) : (
+                <div className="flex flex-col gap-2 text-sm">
+                  {srcLink.scope_note.trim() && (
+                    <p className="whitespace-pre-wrap break-words">{srcLink.scope_note}</p>
+                  )}
+                  {srcForbiddenLines.length > 0 && (
+                    <div className="flex flex-col gap-0.5">
+                      <span className="text-xs font-medium text-red-500">禁止事项</span>
+                      {srcForbiddenLines.map((line, idx) => (
+                        <span key={`${idx}-${line}`} className="break-words">• {line}</span>
+                      ))}
+                    </div>
+                  )}
+                  {srcLink.allowed_types.trim() && (
+                    <p className="break-words">
+                      <span className="text-muted-foreground text-xs">允许的漏洞类型：</span>
+                      {srcLink.allowed_types}
+                    </p>
+                  )}
+                  {srcLink.rate_limit.trim() && (
+                    <p className="break-words">
+                      <span className="text-muted-foreground text-xs">频率限制：</span>
+                      {srcLink.rate_limit}
+                    </p>
+                  )}
+                  {!srcLink.scope_note.trim() &&
+                    srcForbiddenLines.length === 0 &&
+                    !srcLink.allowed_types.trim() &&
+                    !srcLink.rate_limit.trim() && (
+                      <p className="text-muted-foreground text-sm">该目标未填写授权范围。</p>
+                    )}
+                </div>
+              )}
+            </div>
+            {/* 四类规范折叠段:默认收起,点开看全文;空字段的段不渲染。 */}
+            {srcPlatform && srcPlatform.scoring_standard.trim() && (
+              <SrcSpecSection title="评分标准" content={srcPlatform.scoring_standard} />
+            )}
+            {srcPlatform && srcPlatform.reward_standard.trim() && (
+              <SrcSpecSection title="奖励标准" content={srcPlatform.reward_standard} />
+            )}
+            {srcPlatform && srcPlatform.code_of_conduct.trim() && (
+              <SrcSpecSection title="守则" content={srcPlatform.code_of_conduct} />
+            )}
+            {srcPlatform && srcPlatform.rules.trim() && (
+              <SrcSpecSection title="规范" content={srcPlatform.rules} />
+            )}
+            <p className="text-muted-foreground text-xs">
+              以上规范与授权范围已在任务创建时转成硬约束注入 AI
+              （对应下方「操作约束」面板，共 {constraints.length} 条）。
+            </p>
+          </CardContent>
+        </Card>
+      )}
       {/* 操作约束管理：allow=允许 / deny=禁止。约束会在下一轮规划时注入 planner/worker 的系统
           提示以框定探索边界（注入范围可在 系统设置 里按 planner/worker 开关）。改动不即时打断，
           下一轮规划自然读到。 */}

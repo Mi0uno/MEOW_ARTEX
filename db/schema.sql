@@ -1965,3 +1965,23 @@ BEGIN
     ON CONFLICT (key) DO NOTHING;
 END $$;
 
+
+-- ============================================================
+-- SRC 增强(2026-09-25):规范附件统一上传 + 拦截规则 SRC 适用范围。
+-- ============================================================
+
+-- 平台规范附件放开「未分类」:统一上传入口先收文件,AI 识别填入时再把正文
+-- 归类进四类规范文本;文件本身的类别可随时改派(不必在上传时就选对)。
+ALTER TABLE src_platform_files DROP CONSTRAINT IF EXISTS src_platform_files_kind_check;
+ALTER TABLE src_platform_files ADD CONSTRAINT src_platform_files_kind_check
+    CHECK (kind IN ('reward_standard','scoring_standard','code_of_conduct','rules','other'));
+
+-- 拦截规则适用范围:''=全部任务(既有行为不变);'src'=仅 SRC 模式任务。
+-- 为什么放规则上而不是另建一套 SRC 执行系统:拦截管线是工具调用的唯一咽喉,
+-- 两套执行真相会让「这条规则到底拦没拦」无法回答。SRC 维度只是匹配时的一个
+-- 任务级过滤条件(任务 src_mode 与规则 scope 须同时满足)。
+ALTER TABLE intercept_rules ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT '';
+ALTER TABLE intercept_rules DROP CONSTRAINT IF EXISTS intercept_rules_scope_check;
+ALTER TABLE intercept_rules ADD CONSTRAINT intercept_rules_scope_check
+    CHECK (scope IN ('','src'));
+CREATE INDEX IF NOT EXISTS idx_intercept_rules_scope ON intercept_rules(scope) WHERE scope <> '';

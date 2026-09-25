@@ -39,9 +39,11 @@ export function Field({ label, children }: { label: string; children: React.Reac
   );
 }
 
-// SRCPlatformTextField 就是四类规范文本域的列名——与附件 kind 取值完全一致,
-// 所以直接复用 SRCPlatformFileKind,避免再多一个同形不同名的联合类型。
-export type SRCPlatformTextField = SRCPlatformFileKind;
+// SRCPlatformTextField 就是四类规范文本域的列名。用 Exclude 收窄而不是直接复用
+// SRCPlatformFileKind:kind 联合加入 'other'(统一上传的暂存类别)后,'other' 不是
+// 平台表的列,再用整个 kind 联合索引 Partial<SRCPlatform> 会报 TS7053——
+// 而四个文本域恰好对应除 other 外的四个 kind,语义上也正该排除。
+export type SRCPlatformTextField = Exclude<SRCPlatformFileKind, "other">;
 
 // SPEC_FIELDS 定义四个规范文本域的顺序、标签与示例。
 // placeholder 必须给真实示例而不是「请输入…」:这四段文本会被渲染成 AI 的硬约束,

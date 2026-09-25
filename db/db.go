@@ -216,6 +216,11 @@ var builtinAgents = []builtinAgent{
 	// 报告模板工程师:内置「模板工程师」agent(报告中心阶段)。AI 占位模板识别任务的过程
 	// 会话绑在它名下(报告中心→对话 ?stage=report 监看);识别完成后也可在本会话里继续追问改稿。
 	{"template_engineer", "模板工程师", "assistant", "报告模板工程师：把渗透测试报告模板改写为「数据占位版」——保留章节结构与固定文字,数据位置替换为平台内置变量。", nil, false, intp(600), "report"},
+	// SRC 测试:内置「SRC 测试」agent。agents.stage 白名单没有 src,SRC 任务即 exploit
+	// 阶段。职责=在平台规范与目标授权范围内挖掘/验证/自评/起草提交;三个专属工具
+	// src_get_context/src_score_finding/src_draft_submission 由 server.seedSRCOperatorTools
+	// 播种并默认绑到它(另绑 pentest/worker)。交互式 shell 与不限时对齐 pentest。
+	{"src_operator", "SRC 测试", "assistant", "SRC 测试 agent：在 SRC 平台规范与目标授权范围内做漏洞挖掘与无害化验证，按平台评分标准自评、按奖励标准择向，并按平台要求起草提交报告。", nil, true, intp(0), "exploit"},
 }
 
 // seedBuiltins inserts the fixed built-in agents and their variable catalog (idempotent).

@@ -25,7 +25,7 @@ func TestTaskGuardOffPassesThroughWithoutAudit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rule, err := d.CreateInterceptRule("task-off-"+t.Name(), "tool_name", "string", "Bash", "deny", "", 9999, true, false, 0, "deny")
+	rule, err := d.CreateInterceptRule("task-off-"+t.Name(), "tool_name", "string", "Bash", "deny", "", 9999, true, false, 0, "deny", "")
 	if err != nil {
 		t.Fatal(err)
 	}

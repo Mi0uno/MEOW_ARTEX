@@ -39,6 +39,24 @@ func (s *Server) chatGuard() *guard.Guard {
 func (s *Server) wireInterceptReviewer() {
 	s.m.interceptor.SetDecisionEngine(s.jevDecisionEngine())
 	s.m.interceptor.SetReviewer(s.llmReviewer())
+	// scope='src' 规则的任务侧过滤条件也在这里接:同为闭包读内存句柄,后续改动
+	// 无需重新注入。放在 New 一次性调用的 wireInterceptReviewer 里,避免再动 server.go。
+	s.m.interceptor.SetTaskSRCResolver(s.taskSRCResolver())
+}
+
+// taskSRCResolver 回答"这个任务是不是 SRC 模式",是 intercept 侧 scope='src' 规则
+// 的适用条件。只读内存任务句柄(Manager.ResolveTask),不查库——与 taskGuardResolver
+// 同一个理由:回调挂在每次工具调用的 Match 入口,查库会把监管热路径拖成慢路径。
+// 任务为空/不在内存/非 SRC 一律返回 false,由 intercept 侧跳过 scope='src' 的规则:
+// 这是新增的过滤维度,方向必须"宁漏勿误"——解析失败绝不能把 SRC 规则放宽到普通任务。
+func (s *Server) taskSRCResolver() func(taskID string) bool {
+	return func(taskID string) bool {
+		if s == nil || s.m == nil {
+			return false
+		}
+		t := s.m.ResolveTask(taskID)
+		return t != nil && t.SRCMode
+	}
 }
 
 // jevDecisionEngine 把 JEV 前置分类器包成独立的决策引擎回调。开关与凭据都在
@@ -159,7 +177,7 @@ func (s *Server) interceptCreateRule(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	rule, err := pg.CreateInterceptRule(req.Name, req.MatchTarget, req.MatchType, req.Pattern, req.Action, req.Message, req.Priority, req.Enabled, req.TimeoutEnabled, req.TimeoutSeconds, req.TimeoutAction)
+	rule, err := pg.CreateInterceptRule(req.Name, req.MatchTarget, req.MatchType, req.Pattern, req.Action, req.Message, req.Priority, req.Enabled, req.TimeoutEnabled, req.TimeoutSeconds, req.TimeoutAction, req.Scope)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -187,7 +205,7 @@ func (s *Server) interceptUpdateRule(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	rule, err := pg.UpdateInterceptRule(id, req.Name, req.MatchTarget, req.MatchType, req.Pattern, req.Action, req.Message, req.Priority, req.Enabled, req.TimeoutEnabled, req.TimeoutSeconds, req.TimeoutAction)
+	rule, err := pg.UpdateInterceptRule(id, req.Name, req.MatchTarget, req.MatchType, req.Pattern, req.Action, req.Message, req.Priority, req.Enabled, req.TimeoutEnabled, req.TimeoutSeconds, req.TimeoutAction, req.Scope)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -551,11 +569,17 @@ type interceptRuleReq struct {
 	TimeoutEnabled bool   `json:"timeout_enabled"`
 	TimeoutSeconds int    `json:"timeout_seconds"`
 	TimeoutAction  string `json:"timeout_action"`
+	// Scope 规则适用范围:''=全部任务(缺省,既有行为零变化);'src'=仅 SRC 模式任务。
+	// 空串即合法缺省,非法值在 validateInterceptRuleReq 里 400。
+	Scope string `json:"scope"`
 }
 
 func validateInterceptRuleReq(req interceptRuleReq) error {
 	if req.Name == "" {
 		return fmt.Errorf("name 不能为空")
+	}
+	if !db.ValidRuleScope(req.Scope) {
+		return fmt.Errorf("scope 必须是空串(全部任务)或 src(仅 SRC 任务)")
 	}
 	switch req.MatchTarget {
 	case "tool_name", "tool_input":

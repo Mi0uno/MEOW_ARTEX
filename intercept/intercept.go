@@ -181,6 +181,10 @@ type Interceptor struct {
 	reviewer     Reviewer       // nil = LLM fallback judge not wired
 	engine       DecisionEngine // nil = pre-decision engine (JEV/Laya) not wired
 	guardRes     TaskGuardResolver
+	// srcRes 判断一个任务是否 SRC 模式,是 scope='src' 规则的适用条件。nil 时这些
+	// 规则一律不生效——这是新增维度,缺解析器时按"非 SRC"跳过(宁漏勿误),绝不能
+	// 反向把 SRC 规则放宽到全部任务。
+	srcRes func(taskID string) bool
 }
 
 // SetTaskGuardResolver installs the task-level guard resolver. Passing nil
@@ -188,6 +192,16 @@ type Interceptor struct {
 func (i *Interceptor) SetTaskGuardResolver(r TaskGuardResolver) {
 	i.mu.Lock()
 	i.guardRes = r
+	i.mu.Unlock()
+}
+
+// SetTaskSRCResolver installs the "is this task SRC-mode" callback used to apply
+// rules with scope='src' only to SRC tasks. Passing nil keeps every such rule
+// inert: an unwired resolver must fail closed (skip the rule), never widen
+// SRC-scoped rules to all tasks.
+func (i *Interceptor) SetTaskSRCResolver(r func(taskID string) bool) {
+	i.mu.Lock()
+	i.srcRes = r
 	i.mu.Unlock()
 }
 
@@ -719,6 +733,17 @@ func (i *Interceptor) Match(ctx context.Context, toolName string, input []byte) 
 	if guardOff {
 		return Decision{}, false
 	}
+	// scope='src' 的规则只对 SRC 模式任务生效。判定在循环外做一次(回调读内存
+	// 句柄,无 IO),而不是逐条规则查库。taskID 为空(无任务上下文,如纯聊天)、
+	// 解析器未接、任务不存在——三种情况一律按"非 SRC"跳过这些规则:宁漏勿误。
+	taskID, _ := taskInfoFromCtx(ctx)
+	srcTask := false
+	if taskID != "" {
+		i.mu.RLock()
+		srcRes := i.srcRes
+		i.mu.RUnlock()
+		srcTask = srcRes != nil && srcRes(taskID)
+	}
 	rules, err := i.rules()
 	if err != nil || len(rules) == 0 {
 		return Decision{}, false
@@ -737,6 +762,10 @@ func (i *Interceptor) Match(ctx context.Context, toolName string, input []byte) 
 		rules = filtered
 	}
 	for _, r := range rules {
+		// 与任务级规则集限定(only)是"且"关系:两个过滤维度各自收窄,互不放宽。
+		if r.Scope == "src" && !srcTask {
+			continue
+		}
 		if ruleMatches(r, toolName, input) {
 			msg := r.Message
 			if msg == "" {
