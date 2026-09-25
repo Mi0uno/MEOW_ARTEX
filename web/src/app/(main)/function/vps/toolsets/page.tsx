@@ -9,19 +9,23 @@
 
 import * as React from "react";
 
-import { toast } from "sonner";
-
 import {
+  ArrowDownIcon,
+  ArrowUpDownIcon,
+  ArrowUpIcon,
+  HardDriveDownloadIcon,
   LockIcon,
   PencilIcon,
   PlusIcon,
   RefreshCwIcon,
+  SearchIcon,
   Trash2Icon,
-  Wand2Icon,
   WrenchIcon,
+  XIcon,
 } from "lucide-react";
+import { toast } from "sonner";
 
-import { num } from "@/components/vps-shared";
+import { TablePagination } from "@/components/table-pagination";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -47,9 +51,12 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
+import { num } from "@/components/vps-shared";
 import { api } from "@/lib/api";
+import { type SortDirection, useStoredSortPreference } from "@/lib/sort-preference";
 import type { VpsMachine, VpsToolset } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -57,6 +64,73 @@ function fmtTime(iso?: string): string {
   if (!iso) return "—";
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString();
+}
+
+type ToolsetSortField = "name" | "updated";
+type ToolsetKindFilter = "all" | "builtin" | "custom";
+
+const TOOLSET_SORT_FIELDS: readonly ToolsetSortField[] = ["name", "updated"];
+// 排序偏好落 localStorage:工具集总量小但会被反复进出,记住上次排序少一次点击。
+const TOOLSET_SORT_PREFERENCE_KEY = "artex_vps_toolset_sort";
+
+// 排序比较;并列时按 id 收尾保证顺序稳定(翻页/重渲染不闪跳)。
+function compareToolsets(a: VpsToolset, b: VpsToolset, field: ToolsetSortField, direction: SortDirection): number {
+  let compared = 0;
+  if (field === "name") {
+    compared = a.name.localeCompare(b.name, "zh-Hans-CN", { numeric: true, sensitivity: "base" });
+  } else {
+    const av = Date.parse(a.updated_at ?? "");
+    const bv = Date.parse(b.updated_at ?? "");
+    compared = (Number.isNaN(av) ? 0 : av) - (Number.isNaN(bv) ? 0 : bv);
+  }
+  if (compared !== 0) return direction === "asc" ? compared : -compared;
+  return num(a.id) - num(b.id);
+}
+
+// 三态图标分开写而非嵌套三元:仓库 Biome 基线禁 noNestedTernary。
+function toolsetSortIcon(active: boolean, direction: SortDirection) {
+  if (!active) {
+    return <ArrowUpDownIcon className="size-3.5 opacity-40 transition-opacity group-hover/sort:opacity-100" />;
+  }
+  if (direction === "asc") return <ArrowUpIcon className="size-3.5" />;
+  return <ArrowDownIcon className="size-3.5" />;
+}
+
+function SortableToolsetHead({
+  field,
+  label,
+  activeField,
+  direction,
+  className,
+  onSort,
+}: {
+  field: ToolsetSortField;
+  label: string;
+  activeField: ToolsetSortField;
+  direction: SortDirection;
+  className?: string;
+  onSort: (field: ToolsetSortField) => void;
+}) {
+  const active = activeField === field;
+  let ariaSort: React.AriaAttributes["aria-sort"] = "none";
+  if (active) ariaSort = direction === "asc" ? "ascending" : "descending";
+
+  let actionLabel = `按${label}倒序排序`;
+  if (active) actionLabel = `${label}当前${direction === "asc" ? "正序" : "倒序"}，点击切换排序方向`;
+
+  return (
+    <TableHead aria-sort={ariaSort} className={className}>
+      <button
+        type="button"
+        className="group/sort inline-flex h-full w-full items-center gap-1 outline-none focus-visible:underline"
+        aria-label={actionLabel}
+        onClick={() => onSort(field)}
+      >
+        <span>{label}</span>
+        {toolsetSortIcon(active, direction)}
+      </button>
+    </TableHead>
+  );
 }
 
 export default function VpsToolsetsPage() {
@@ -67,6 +141,19 @@ export default function VpsToolsetsPage() {
   const [editing, setEditing] = React.useState<VpsToolset | null>(null);
   const [deleting, setDeleting] = React.useState<VpsToolset | null>(null);
   const [applyTarget, setApplyTarget] = React.useState<VpsToolset | null>(null);
+  // 列表页标准四件套:搜索(名称/描述/脚本内容) + 内置/自定义分类 + 点表头排序 + 分页。
+  // 工具集是一次性全量拉取的小列表,筛选排序分页都在前端做,与任务列表同模式。
+  const [query, setQuery] = React.useState("");
+  const [kindFilter, setKindFilter] = React.useState<ToolsetKindFilter>("all");
+  const [sortPreference, setSortPreference] = useStoredSortPreference(
+    TOOLSET_SORT_PREFERENCE_KEY,
+    TOOLSET_SORT_FIELDS,
+    "updated",
+    "desc",
+  );
+  const { field: sortField, direction: sortDirection } = sortPreference;
+  const [page, setPage] = React.useState(1);
+  const [pageSize, setPageSize] = React.useState(20);
 
   const load = React.useCallback(() => {
     setLoading(true);
@@ -84,6 +171,47 @@ export default function VpsToolsetsPage() {
   React.useEffect(() => {
     load();
   }, [load]);
+
+  // 搜索命中名称/描述/脚本内容——工具集的描述常是一句「装了什么」,而脚本里才有
+  // 具体包名,两处都搜才能用「nmap」这类关键词直接定位。
+  const filtered = React.useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return toolsets.filter((t) => {
+      if (kindFilter === "builtin" && !t.builtin) return false;
+      if (kindFilter === "custom" && t.builtin) return false;
+      if (!q) return true;
+      return (
+        t.name.toLowerCase().includes(q) ||
+        (t.description ?? "").toLowerCase().includes(q) ||
+        (t.script ?? "").toLowerCase().includes(q)
+      );
+    });
+  }, [toolsets, query, kindFilter]);
+
+  const ordered = React.useMemo(
+    () => [...filtered].sort((a, b) => compareToolsets(a, b, sortField, sortDirection)),
+    [filtered, sortField, sortDirection],
+  );
+  const paginated = React.useMemo(
+    () => ordered.slice((page - 1) * pageSize, page * pageSize),
+    [ordered, page, pageSize],
+  );
+
+  // 名称列首次点击给正序(字典序自然),其余给倒序(最新在前)——与资产主体选择页一致。
+  const sortToolsetsBy = React.useCallback(
+    (field: ToolsetSortField) => {
+      setSortPreference((current) => {
+        if (current.field !== field) return { field, direction: field === "name" ? "asc" : "desc" };
+        return { field, direction: current.direction === "asc" ? "desc" : "asc" };
+      });
+    },
+    [setSortPreference],
+  );
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: 筛选/排序变化时有意重置回第一页。
+  React.useEffect(() => {
+    setPage(1);
+  }, [query, kindFilter, sortField, sortDirection]);
 
   const remove = async () => {
     if (!deleting) return;
@@ -104,8 +232,8 @@ export default function VpsToolsetsPage() {
         <div>
           <h1 className="font-semibold text-xl">VPS 中心 · 工具集</h1>
           <p className="text-muted-foreground text-sm">
-            把常用的渗透工具安装脚本存成一键工具集,应用到机器后 agent 就能感知并直接使用这些工具;机器上缺什么也可以让 agent
-            自己调工具集装。
+            把常用的渗透工具安装脚本存成一键工具集,应用到机器后 agent 就能感知并直接使用这些工具;机器上缺什么也可以让
+            agent 自己调工具集装。
           </p>
         </div>
         <Button
@@ -127,6 +255,40 @@ export default function VpsToolsetsPage() {
               <WrenchIcon className="text-muted-foreground size-4" />
               工具集清单
             </span>
+            <div className="relative w-full sm:max-w-xs">
+              <SearchIcon className="text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2" />
+              <Input
+                placeholder="搜索名称 / 描述 / 脚本内容"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                className="pl-8"
+              />
+              {query && (
+                <button
+                  type="button"
+                  onClick={() => setQuery("")}
+                  aria-label="清除搜索"
+                  className="text-muted-foreground hover:text-foreground absolute top-1/2 right-2 -translate-y-1/2"
+                >
+                  <XIcon className="size-4" />
+                </button>
+              )}
+            </div>
+            <Select value={kindFilter} onValueChange={(v) => setKindFilter(v as ToolsetKindFilter)}>
+              <SelectTrigger className="w-32">
+                <SelectValue placeholder="分类" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectItem value="all">全部分类</SelectItem>
+                  <SelectItem value="builtin">内置</SelectItem>
+                  <SelectItem value="custom">自定义</SelectItem>
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+            <span className="text-muted-foreground text-xs tabular-nums">
+              {filtered.length}/{toolsets.length} 个
+            </span>
             <Button variant="ghost" size="sm" onClick={load} className="ml-auto">
               <RefreshCwIcon className="size-3.5" />
               刷新
@@ -143,95 +305,126 @@ export default function VpsToolsetsPage() {
                 服务暂不可用;也可以新建自己的脚本包。
               </span>
             </div>
+          ) : filtered.length === 0 ? (
+            <p className="text-muted-foreground py-16 text-center text-sm">没有匹配的工具集,调整搜索或分类再试。</p>
           ) : (
-            <Table className="table-fixed">
-              <TableHeader>
-                <TableRow className="hover:bg-transparent">
-                  {/* 工具集列不设宽度:table-fixed 下自动吃掉余量(名称 + 描述两行)。 */}
-                  <TableHead>工具集</TableHead>
-                  <TableHead className="w-16">内置</TableHead>
-                  <TableHead className="w-20">脚本</TableHead>
-                  <TableHead className="w-36">更新时间</TableHead>
-                  <TableHead className="w-32">操作</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {toolsets.map((t) => (
-                  <TableRow key={t.id}>
-                    <TableCell className="min-w-0">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setEditing(t);
-                          setDialogOpen(true);
-                        }}
-                        className="block w-full truncate text-left font-medium hover:underline"
-                        title={t.name}
-                      >
-                        {t.name}
-                      </button>
-                      <span className="text-muted-foreground block truncate text-xs" title={t.description || undefined}>
-                        {t.description || "—"}
-                      </span>
-                    </TableCell>
-                    <TableCell>
-                      {t.builtin ? (
-                        <Badge variant="outline" className="border-purple-500/30 bg-purple-500/15 text-purple-600">
-                          <LockIcon className="size-3" />
-                          内置
-                        </Badge>
-                      ) : (
-                        <span className="text-muted-foreground text-xs">自定义</span>
-                      )}
-                    </TableCell>
-                    <TableCell className="text-muted-foreground text-xs tabular-nums">{num(t.script?.length)} 字符</TableCell>
-                    <TableCell className="text-muted-foreground text-xs tabular-nums">{fmtTime(t.updated_at)}</TableCell>
-                    <TableCell>
-                      <div className="flex items-center gap-0.5">
-                        <Button
-                          variant="ghost"
-                          size="icon-xs"
-                          title={t.builtin ? "查看脚本(内置不可修改)" : "编辑"}
+            <>
+              <Table className="table-fixed">
+                <TableHeader>
+                  <TableRow className="hover:bg-transparent">
+                    {/* 工具集列不设宽度:table-fixed 下自动吃掉余量(名称 + 描述两行)。 */}
+                    <SortableToolsetHead
+                      field="name"
+                      label="工具集"
+                      activeField={sortField}
+                      direction={sortDirection}
+                      onSort={sortToolsetsBy}
+                    />
+                    <TableHead className="w-16">内置</TableHead>
+                    <TableHead className="w-20">脚本</TableHead>
+                    <SortableToolsetHead
+                      field="updated"
+                      label="更新时间"
+                      activeField={sortField}
+                      direction={sortDirection}
+                      className="w-36"
+                      onSort={sortToolsetsBy}
+                    />
+                    <TableHead className="w-32">操作</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {paginated.map((t) => (
+                    <TableRow key={t.id}>
+                      <TableCell className="min-w-0">
+                        <button
+                          type="button"
                           onClick={() => {
                             setEditing(t);
                             setDialogOpen(true);
                           }}
+                          className="block w-full truncate text-left font-medium hover:underline"
+                          title={t.name}
                         >
-                          <PencilIcon className="size-3.5" />
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="icon-xs"
-                          title="应用到机器"
-                          onClick={() => setApplyTarget(t)}
+                          {t.name}
+                        </button>
+                        <span
+                          className="text-muted-foreground block truncate text-xs"
+                          title={t.description || undefined}
                         >
-                          <Wand2Icon className="size-3.5" />
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="icon-xs"
-                          disabled={t.builtin}
-                          title={t.builtin ? "内置工具集不可删除" : "删除工具集"}
-                          onClick={() => setDeleting(t)}
-                        >
-                          <Trash2Icon className="text-muted-foreground size-3.5" />
-                        </Button>
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
+                          {t.description || "—"}
+                        </span>
+                      </TableCell>
+                      <TableCell>
+                        {t.builtin ? (
+                          <Badge variant="outline" className="border-purple-500/30 bg-purple-500/15 text-purple-600">
+                            <LockIcon className="size-3" />
+                            内置
+                          </Badge>
+                        ) : (
+                          <span className="text-muted-foreground text-xs">自定义</span>
+                        )}
+                      </TableCell>
+                      <TableCell className="text-muted-foreground text-xs tabular-nums">
+                        {num(t.script?.length)} 字符
+                      </TableCell>
+                      <TableCell className="text-muted-foreground text-xs tabular-nums">
+                        {fmtTime(t.updated_at)}
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex items-center gap-0.5">
+                          <Button
+                            variant="ghost"
+                            size="icon-xs"
+                            title={t.builtin ? "查看脚本(内置不可修改)" : "编辑"}
+                            onClick={() => {
+                              setEditing(t);
+                              setDialogOpen(true);
+                            }}
+                          >
+                            <PencilIcon className="size-3.5" />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="icon-xs"
+                            title="应用到机器"
+                            aria-label="应用到机器"
+                            onClick={() => setApplyTarget(t)}
+                          >
+                            {/* 魔棒图标与编辑铅笔在 12px 下几乎无法区分,换成「装进磁盘」语义的图标。 */}
+                            <HardDriveDownloadIcon className="size-3.5" />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="icon-xs"
+                            disabled={t.builtin}
+                            title={t.builtin ? "内置工具集不可删除" : "删除工具集"}
+                            onClick={() => setDeleting(t)}
+                          >
+                            <Trash2Icon className="text-muted-foreground size-3.5" />
+                          </Button>
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+              <TablePagination
+                page={page}
+                pageSize={pageSize}
+                total={filtered.length}
+                onPageChange={setPage}
+                onPageSizeChange={(nextPageSize) => {
+                  setPageSize(nextPageSize);
+                  setPage(1);
+                }}
+              />
+            </>
           )}
         </CardContent>
       </Card>
 
-      <ToolsetDialog
-        open={dialogOpen}
-        onOpenChange={setDialogOpen}
-        toolset={editing}
-        onSaved={() => load()}
-      />
+      <ToolsetDialog open={dialogOpen} onOpenChange={setDialogOpen} toolset={editing} onSaved={() => load()} />
 
       <ApplyDialog toolset={applyTarget} onOpenChange={(o) => !o && setApplyTarget(null)} />
 
@@ -339,7 +532,12 @@ function ToolsetDialog({
         <div className="grid gap-4">
           <div className="grid gap-1.5">
             <Label>名称 *</Label>
-            <Input value={name} onChange={(e) => setName(e.target.value)} disabled={readonly} placeholder="如:内网横向工具包" />
+            <Input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              disabled={readonly}
+              placeholder="如:内网横向工具包"
+            />
           </div>
           <div className="grid gap-1.5">
             <Label>描述</Label>
@@ -452,9 +650,7 @@ function ApplyDialog({ toolset, onOpenChange }: { toolset: VpsToolset | null; on
     <Dialog open={toolset != null} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-xl">
         <DialogHeader>
-          <DialogTitle>
-            应用「{toolset?.name}」到机器
-          </DialogTitle>
+          <DialogTitle>应用「{toolset?.name}」到机器</DialogTitle>
           <DialogDescription className="text-xs">
             脚本将在所选在线机器上同步执行(每台可能需要数分钟);输出完整落执行流水,可在机器详情「执行流水」回看。
           </DialogDescription>
@@ -505,9 +701,11 @@ function ApplyDialog({ toolset, onOpenChange }: { toolset: VpsToolset | null; on
                   machines.map((m) => (
                     <label
                       key={m.id}
+                      htmlFor={`apply-machine-${m.id}`}
                       className="hover:bg-muted/40 flex cursor-pointer items-center gap-2.5 rounded-md px-2 py-1.5 text-sm"
                     >
                       <Checkbox
+                        id={`apply-machine-${m.id}`}
                         checked={selected.has(m.id)}
                         onCheckedChange={(v) => toggle(m.id, v === true)}
                         aria-label={`选择机器 ${m.name}`}
@@ -524,7 +722,8 @@ function ApplyDialog({ toolset, onOpenChange }: { toolset: VpsToolset | null; on
               </div>
             </ScrollArea>
             <p className="text-muted-foreground text-xs">
-              已选 <span className="text-foreground font-medium tabular-nums">{selected.size}</span> 台 · 仅列出状态为「在线空闲」的机器
+              已选 <span className="text-foreground font-medium tabular-nums">{selected.size}</span> 台 ·
+              仅列出状态为「在线空闲」的机器
             </p>
           </>
         )}
