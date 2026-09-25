@@ -88,12 +88,15 @@ export const sidebarItems: NavGroup[] = [
   {
     id: 1,
     items: [
+      // 顶层直达「仪表盘」：主页入口,不参与折叠(2026-09-25 恢复——8cfe09e 重组时被
+      // 挪进任务中心当「总览」,用户找不到主页入口;两处同指 /dashboard,并存不冲突)。
+      { id: "dashboard", title: "仪表盘", url: "/dashboard", icon: LayoutDashboard },
       {
         id: "task-center",
         title: "任务中心",
         icon: Target,
         subItems: [
-          // 总览 = 原顶层「仪表盘」：全部任务的汇总视图归任务中心统一管理。
+          // 总览 = 同一 /dashboard 页:任务中心语境下的汇总视图入口。
           { id: "overview", title: "总览", url: "/dashboard", icon: LayoutDashboard },
           // 任务 = 全阶段任务总表(不带 stage 锁定)；各阶段分组的任务用 ?stage= 锁定。
           { id: "tasks", title: "任务", url: "/function/tasks", icon: Target },
