@@ -83,6 +83,11 @@ C2 = 后渗透（stage=post）的指挥控制：自研轻量 beacon（HTTP 回�
 
 监听器运行时才能投递载荷；`callback` 为空时生成载荷必须报错提示先填回调地址。
 
+**补充约定（冻结）**：
+- reg 的响应 `t=ack`，`d={sid:"会话令牌"}`（beacon 靠它拿到 sid）。
+- 每个响应的 `meta` 由 server 从会话行派生：`sl`/`jt` 取 sleep_sec/jitter_pct，`kl = (status=="dead")`——终止会话=置 dead，beacon 下次心跳自行退出，无独立 kill 信令。
+- blob 目录读写分工（都在 `<BaseDir>/c2/` 下）：`uploads/` server API 写（上传接口）、c2center 读（beacon pull 分片）；`outputs/` c2center 写（大输出落盘）、server API 读（下载接口）；`downloads/` c2center 写（down 产物）、server API 读；`payloads/` c2center 写（RenderPayload 返回字节，由 server 落盘）、server API 读。文件名一律带数字 id（`<transferID>.bin` 等），路径只由服务端构造。
+
 ## 4. c2center 包公共面（冻结，Agent A 实现）
 
 包路径 `github.com/Autumn-27/artex/c2center`，server 内 import 用包名原样 `c2center`。

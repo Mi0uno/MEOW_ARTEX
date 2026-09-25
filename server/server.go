@@ -173,6 +173,8 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	s.initProxyCenter()
 	// VPS 中心:机器池/终端/工具集/流水。播种内置工具集 + 开机对账 + 测活循环。
 	s.initVPS()
+	// C2 中心:监听器/会话/任务/战利品/载荷。建 blob 目录 + 播种 agent 工具 + 启动运行时。
+	s.initC2()
 	// report_finding 登记后的联动:漏洞库自动归类 + SRC 成果自动创建。
 	s.wireFindingHooks()
 	// 任务进入终态时触发收尾副作用(异步,不阻塞状态写入)。回调链是组合的,不得
@@ -905,6 +907,8 @@ func (s *Server) Handler() http.Handler {
 	s.registerVPSRoutes(mux)
 	// 任务 ↔ VPS 指派(契约 §6):指派/释放/执行环境。
 	s.registerTaskVPSRoutes(mux)
+	// ---- C2 中心 ----
+	s.registerC2Routes(mux)
 	mux.HandleFunc("GET /api/exploration/findings/{id}", s.getFinding)
 	mux.HandleFunc("GET /api/exploration/findings/{id}/lineage", s.findingLineage)
 	mux.HandleFunc("POST /api/exploration/findings/{id}/deepen", s.deepenFinding)

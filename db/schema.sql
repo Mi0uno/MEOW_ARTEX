@@ -1338,8 +1338,10 @@ CREATE TRIGGER trg_external_apis_upd BEFORE UPDATE ON external_apis
 -- 系统设置→工具 统一管理全部。
 -- ============================================================
 ALTER TABLE tools ADD COLUMN IF NOT EXISTS stage TEXT NOT NULL DEFAULT '';
+-- stage 含 'report'(报告中心 2026-09-24 引入)。此前漏列导致 report_writer 四工具
+-- 每次启动播种都被本约束 23514 拒收(2026-09-26 C2 集成时从启动日志发现,顺带修复)。
 ALTER TABLE tools DROP CONSTRAINT IF EXISTS tools_stage_check;
-ALTER TABLE tools ADD CONSTRAINT tools_stage_check CHECK (stage IN ('','recon','exploit','post'));
+ALTER TABLE tools ADD CONSTRAINT tools_stage_check CHECK (stage IN ('','recon','exploit','post','report'));
 CREATE INDEX IF NOT EXISTS idx_tools_stage ON tools(stage) WHERE enabled;
 
 -- 工具手动执行记录(阶段工具执行页的历史底账)
