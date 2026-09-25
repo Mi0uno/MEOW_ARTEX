@@ -104,6 +104,9 @@ function ReportsCenterInner() {
   const [counts, setCounts] = React.useState<Record<string, number>>({});
   const [kind, setKind] = React.useState<string>(initialKind);
   const [query, setQuery] = React.useState("");
+  // 严重度筛选:报告自身没有等级列,后端经 findings 关联推导(漏洞报告=该漏洞等级,
+  // 任务报告=任务下任一发现达标)。空 = 不限。
+  const [severity, setSeverity] = React.useState("all");
   const [loading, setLoading] = React.useState(true);
   const [offset, setOffset] = React.useState(0);
   const [creating, setCreating] = React.useState(false);
@@ -160,7 +163,7 @@ function ReportsCenterInner() {
     [router, searchParams],
   );
 
-  const load = React.useCallback((search: string, k: string, off: number, cid: number | null) => {
+  const load = React.useCallback((search: string, k: string, off: number, cid: number | null, sev: string) => {
     setLoading(true);
     api
       .listReports({
@@ -168,6 +171,7 @@ function ReportsCenterInner() {
         q: search,
         // cid 为 0(全部)时不传 company_id,即不限企业。
         companyId: cid != null && cid > 0 ? cid : undefined,
+        severity: sev === "all" ? undefined : sev,
         limit: PAGE_SIZE,
         offset: off,
       })
@@ -181,10 +185,10 @@ function ReportsCenterInner() {
   }, []);
 
   // 「未关联企业」桶在服务端过滤:company_id=-1 走独立的未归属查询。
-  const loadUnassigned = React.useCallback((search: string, k: string, off: number) => {
+  const loadUnassigned = React.useCallback((search: string, k: string, off: number, sev: string) => {
     setLoading(true);
     api
-      .listUnassignedReports({ kind: k === "all" ? "" : k, q: search, limit: PAGE_SIZE, offset: off })
+      .listUnassignedReports({ kind: k === "all" ? "" : k, q: search, severity: sev === "all" ? undefined : sev, limit: PAGE_SIZE, offset: off })
       .then((r) => {
         setReports(r.reports);
         setTotal(r.total);
@@ -207,19 +211,20 @@ function ReportsCenterInner() {
     // 但 companyID=0(全部)必须照常加载,不能把「全部」误当成「没选」。
     if (companyID === null) return;
     if (companyID === -1) {
-      loadUnassigned(queryRef.current, kind, offset);
+      loadUnassigned(queryRef.current, kind, offset, severity);
       return;
     }
-    load(queryRef.current, kind, offset, companyID);
-  }, [load, loadUnassigned, kind, offset, companyID]);
+    load(queryRef.current, kind, offset, companyID, severity);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- severity/query 经 ref/state 直读,见下
+  }, [load, loadUnassigned, kind, offset, companyID, severity]);
 
   const search = () => {
     setOffset(0);
     if (companyID === -1) {
-      loadUnassigned(query, kind, 0);
+      loadUnassigned(query, kind, 0, severity);
       return;
     }
-    load(query, kind, 0, companyID);
+    load(query, kind, 0, companyID, severity);
   };
 
   const remove = async (r: ReportSummary) => {
@@ -227,8 +232,8 @@ function ReportsCenterInner() {
     try {
       await api.deleteReport(r.id);
       toast.success("报告已删除");
-      if (companyID === -1) loadUnassigned(query, kind, offset);
-      else load(query, kind, offset, companyID);
+      if (companyID === -1) loadUnassigned(query, kind, offset, severity);
+      else load(query, kind, offset, companyID, severity);
     } catch (e) {
       toast.error(`删除失败:${(e as Error).message}`);
     }
@@ -247,8 +252,8 @@ function ReportsCenterInner() {
       else toast.warning(`成功 ${ok} 项，失败 ${fail} 项`);
       setCheckedIds(new Set());
       setConfirmOpen(false);
-      if (companyID === -1) loadUnassigned(query, kind, offset);
-      else load(query, kind, offset, companyID);
+      if (companyID === -1) loadUnassigned(query, kind, offset, severity);
+      else load(query, kind, offset, companyID, severity);
     } finally {
       setDeleting(false);
     }
@@ -457,6 +462,28 @@ function ReportsCenterInner() {
                 </SelectGroup>
               </SelectContent>
             </Select>
+            {/* 严重度筛选:漏洞报告按该漏洞等级,任务报告按任务下任一发现的等级;
+                自定义报告没有严重度,选了等级即被排除(后端语义)。 */}
+            <Select
+              value={severity}
+              onValueChange={(v) => {
+                setOffset(0);
+                setSeverity(v);
+              }}
+            >
+              <SelectTrigger className="w-36">
+                <SelectValue placeholder="严重度" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectItem value="all">全部严重度</SelectItem>
+                  <SelectItem value="critical">严重</SelectItem>
+                  <SelectItem value="high">高</SelectItem>
+                  <SelectItem value="medium">中</SelectItem>
+                  <SelectItem value="low">低</SelectItem>
+                </SelectGroup>
+              </SelectContent>
+            </Select>
             <Tabs
               value={kind}
               onValueChange={(v) => {
@@ -539,8 +566,8 @@ function ReportsCenterInner() {
         onOpenChange={setCreating}
         onCreated={(id) => {
           setCreating(false);
-          if (companyID === -1) loadUnassigned(query, kind, offset);
-          else load(query, kind, offset, companyID);
+          if (companyID === -1) loadUnassigned(query, kind, offset, severity);
+          else load(query, kind, offset, companyID, severity);
           router.push(`/function/reports/detail?id=${id}`);
         }}
       />

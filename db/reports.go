@@ -40,13 +40,20 @@ func scanReport(sc interface{ Scan(...any) error }, withContent bool) (*Report, 
 	return &r, nil
 }
 
-// ListReports 按分类(kind,空=全部)、企业归属(companyID,0=不限)与关键字
-// (q 搜标题/摘要/正文)筛选报告,返回当页列表、命中总数与各分类计数
-// (计数受 q 与 companyID 影响,不受 kind 筛选影响,供分类页签展示)。
+// ListReports 按分类(kind,空=全部)、企业归属(companyID,0=不限)、严重度
+// (severity,空=不限)与关键字(q 搜标题/摘要/正文)筛选报告,返回当页列表、
+// 命中总数与各分类计数(计数受 q/companyID/severity 影响,不受 kind 筛选影响,
+// 供分类页签展示)。
+//
+// 严重度匹配语义:
+//   - 漏洞报告(kind=finding):该漏洞本身的等级;
+//   - 任务报告(kind=task):任务下任一发现达到该等级——任务报告覆盖整场测试,
+//     「含严重发现」是用户筛它的自然语义;
+//   - 自定义报告(kind=custom):没有严重度,选了等级即被排除(无从匹配)。
 //
 // 企业归属经任务链推导:报告 → task_id → task_companies。漏洞报告在 finding
 // 无任务时按其锚定资产的企业兜底(report_company_scope 视图语义,见下方子查询)。
-func (d *DB) ListReports(kind, q string, companyID int64, limit, offset int) ([]*Report, int, map[string]int, error) {
+func (d *DB) ListReports(kind, q, severity string, companyID int64, limit, offset int) ([]*Report, int, map[string]int, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
@@ -79,6 +86,18 @@ func (d *DB) ListReports(kind, q string, companyID int64, limit, offset int) ([]
 	  JOIN assets a ON a.id = ea.asset_id
 	 WHERE f.id = r.finding_id AND a.company_id IS NOT NULL
 )`)
+	}
+	// 严重度筛选:漏洞报告按该发现本身的等级;任务报告按任务下任一发现的等级
+	// (「这场测试打出过严重漏洞」);自定义报告无严重度,任何等级筛选都排除它们。
+	// lower():findings.severity 无 CHECK,历史上大小写混存,统一折小写再比。
+	if severity != "" {
+		where = append(where, fmt.Sprintf(`(
+	EXISTS (SELECT 1 FROM findings f WHERE f.id = r.finding_id AND lower(f.severity) = $%d)
+	OR (r.kind = 'task' AND r.task_id IS NOT NULL AND EXISTS (
+		SELECT 1 FROM findings f WHERE f.task_id = r.task_id AND lower(f.severity) = $%d
+	))
+)`, len(args)+1, len(args)+1))
+		args = append(args, severity)
 	}
 	kw := strings.Join(where, " AND ")
 

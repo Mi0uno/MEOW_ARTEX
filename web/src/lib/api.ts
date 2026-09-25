@@ -1239,11 +1239,12 @@ export const api = {
   srcOverview: () => get<SRCOverview>("/src/overview"),
 
   // ---- 报告中心 ----
-  listReports: (input?: { kind?: string; q?: string; companyId?: number; limit?: number; offset?: number }) => {
+  listReports: (input?: { kind?: string; q?: string; companyId?: number; severity?: string; limit?: number; offset?: number }) => {
     const p = new URLSearchParams();
     if (input?.kind) p.set("kind", input.kind);
     if (input?.q) p.set("q", input.q);
     if (input?.companyId) p.set("company_id", String(input.companyId));
+    if (input?.severity) p.set("severity", input.severity);
     p.set("limit", String(input?.limit ?? 50));
     p.set("offset", String(input?.offset ?? 0));
     return get<{ reports: ReportSummary[]; total: number; counts: Record<string, number> }>(
@@ -1258,10 +1259,11 @@ export const api = {
       unassigned: r.unassigned ?? 0,
     })),
   // 「未关联企业」桶:自定义报告 + 任务/漏洞都没挂企业的报告。
-  listUnassignedReports: (input?: { kind?: string; q?: string; limit?: number; offset?: number }) => {
+  listUnassignedReports: (input?: { kind?: string; q?: string; severity?: string; limit?: number; offset?: number }) => {
     const p = new URLSearchParams();
     if (input?.kind) p.set("kind", input.kind);
     if (input?.q) p.set("q", input.q);
+    if (input?.severity) p.set("severity", input.severity);
     p.set("company_id", "-1");
     p.set("limit", String(input?.limit ?? 50));
     p.set("offset", String(input?.offset ?? 0));

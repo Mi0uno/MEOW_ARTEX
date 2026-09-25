@@ -16,15 +16,24 @@ import (
 // 报告是产出物的持久化快照:任务总结报告 / 漏洞报告(来自 findings.report)
 // 由各自页面归档入库,自定义报告直接在报告中心新建。同一来源重复归档覆盖。
 
-// listReports GET /api/reports?kind=&q=&company_id=&limit=&offset= —
-// 列表 + 分类计数。company_id>0 时只返回归属该企业的报告(经任务链/锚定资产推导)。
+// listReports GET /api/reports?kind=&q=&company_id=&severity=&limit=&offset= —
+// 列表 + 分类计数。company_id>0 时只返回归属该企业的报告(经任务链/锚定资产推导);
+// severity 取 critical/high/medium/low(大小写不敏感),其它非空值 400——静默忽略
+// 会让用户以为筛选生效了却看到全量,更难排查。
 func (s *Server) listReports(w http.ResponseWriter, r *http.Request) {
 	kind := r.URL.Query().Get("kind")
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	companyID, _ := strconv.ParseInt(r.URL.Query().Get("company_id"), 10, 64)
+	severity := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("severity")))
+	switch severity {
+	case "", "critical", "high", "medium", "low":
+	default:
+		writeErr(w, 400, "severity 必须是 critical/high/medium/low 之一")
+		return
+	}
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
-	items, total, counts, err := s.m.PG().ListReports(kind, q, companyID, limit, offset)
+	items, total, counts, err := s.m.PG().ListReports(kind, q, severity, companyID, limit, offset)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
