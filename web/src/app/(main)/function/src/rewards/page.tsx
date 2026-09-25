@@ -16,9 +16,20 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -78,6 +89,10 @@ export default function SRCRewardsPage() {
   const [editing, setEditing] = React.useState<SRCReward | null>(null);
   const [platforms, setPlatforms] = React.useState<SRCPlatform[]>([]);
   const [targets, setTargets] = React.useState<SRCTarget[]>([]);
+  // 行多选与批量删除:三态全选按当前页行计算。
+  const [checkedIds, setCheckedIds] = React.useState<Set<number>>(new Set());
+  const [batchConfirmOpen, setBatchConfirmOpen] = React.useState(false);
+  const [batchDeleting, setBatchDeleting] = React.useState(false);
   // 平台筛选变化时精确拉该平台下的目标列表(比按计数过滤准确)
   React.useEffect(() => {
     if (platformFilter === "all") {
@@ -171,6 +186,51 @@ export default function SRCRewardsPage() {
       reload();
     } catch (e) {
       toast.error(`删除失败:${(e as Error).message}`);
+    }
+  };
+
+  // 当前页行(服务端分页,rewards 即本页)驱动三态全选。
+  const pageIds = React.useMemo(() => rewards.map((r) => r.id), [rewards]);
+  const allChecked = pageIds.length > 0 && pageIds.every((id) => checkedIds.has(id));
+  const someChecked = pageIds.some((id) => checkedIds.has(id));
+
+  // 行首勾选:v 是显式 checked 语义(true 勾上 / false 取消)。
+  const toggleRow = (id: number, checked: boolean) => {
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  };
+
+  // 表头全选:indeterminate 状态点击上报 true → 全选当前页;已全选点击上报 false → 清当前页。
+  const toggleAllPage = (checked: boolean) => {
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      for (const id of pageIds) {
+        if (checked) next.add(id);
+        else next.delete(id);
+      }
+      return next;
+    });
+  };
+
+  // 批量删除:逐条走单删接口,allSettled 保证一条失败不拖垮其余。
+  const confirmBatchDelete = async () => {
+    const ids = Array.from(checkedIds);
+    setBatchDeleting(true);
+    try {
+      const results = await Promise.allSettled(ids.map((id) => api.deleteSRCReward(id)));
+      const ok = results.filter((r) => r.status === "fulfilled").length;
+      const failed = results.length - ok;
+      if (failed === 0) toast.success(`已删除 ${ok} 项`);
+      else toast.warning(`成功 ${ok} 项，失败 ${failed} 项`);
+      setCheckedIds(new Set());
+      reload();
+    } finally {
+      setBatchDeleting(false);
+      setBatchConfirmOpen(false);
     }
   };
 
@@ -358,7 +418,15 @@ export default function SRCRewardsPage() {
                 </SelectGroup>
               </SelectContent>
             </Select>
-            <span className="text-muted-foreground ml-auto text-xs tabular-nums">共 {total} 条</span>
+            <div className="ml-auto flex items-center gap-2">
+              {checkedIds.size > 0 && (
+                <Button variant="destructive" size="sm" onClick={() => setBatchConfirmOpen(true)}>
+                  <Trash2Icon className="size-3.5" />
+                  删除已选 (<span className="tabular-nums">{checkedIds.size}</span>)
+                </Button>
+              )}
+              <span className="text-muted-foreground text-xs tabular-nums">共 {total} 条</span>
+            </div>
           </div>
 
           {loading && rewards.length === 0 ? (
@@ -375,6 +443,13 @@ export default function SRCRewardsPage() {
               <Table>
                 <TableHeader>
                   <TableRow className="hover:bg-transparent">
+                    <TableHead className="w-8">
+                      <Checkbox
+                        checked={allChecked ? true : someChecked ? "indeterminate" : false}
+                        onCheckedChange={(v) => toggleAllPage(v === true)}
+                        aria-label="全选当前页成果"
+                      />
+                    </TableHead>
                     <TableHead>成果标题</TableHead>
                     <TableHead className="w-40">企业</TableHead>
                     <TableHead className="w-20">严重度</TableHead>
@@ -389,7 +464,14 @@ export default function SRCRewardsPage() {
                   {rewards.map((r) => {
                     const meta = STATUS_META[r.status] ?? STATUS_META.pending;
                     return (
-                      <TableRow key={r.id}>
+                      <TableRow key={r.id} className={checkedIds.has(r.id) ? "bg-muted/40" : undefined}>
+                        <TableCell className="w-8" onClick={(e) => e.stopPropagation()}>
+                          <Checkbox
+                            checked={checkedIds.has(r.id)}
+                            onCheckedChange={(v) => toggleRow(r.id, v === true)}
+                            aria-label={`选择成果 ${r.title}`}
+                          />
+                        </TableCell>
                         <TableCell className="max-w-96">
                           <span className="truncate font-medium" title={r.title}>
                             {r.title}
@@ -453,6 +535,32 @@ export default function SRCRewardsPage() {
           )}
         </CardContent>
       </Card>
+
+      {/* 批量删除确认:兄弟节点渲染,不进三元链。 */}
+      <AlertDialog open={batchConfirmOpen} onOpenChange={setBatchConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>确认批量删除成果</AlertDialogTitle>
+            <AlertDialogDescription>
+              将永久删除选中的 <span className="font-semibold tabular-nums">{checkedIds.size}</span>{" "}
+              条成果记录及其提交状态、平台反馈，此操作不可撤销。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={batchDeleting}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                e.preventDefault();
+                void confirmBatchDelete();
+              }}
+              disabled={batchDeleting}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {batchDeleting ? "删除中…" : "确认删除"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <RewardDialog
         reward={editing}

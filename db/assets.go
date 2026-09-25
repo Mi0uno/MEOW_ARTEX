@@ -131,6 +131,17 @@ func (s *AssetStore) resolveCompanyWithICP(rootDomain, ipStr, icp string) (*int6
 	return s.company.ResolveCompanyWithICP(rootDomain, ipStr, icp)
 }
 
+// upsertCompanyID 是各 Upsert 的归属入口:forced>0(文件导入指定 company_id)时
+// 跳过范围/ICP 解析、强制归属该企业(连带 side effect 资产);零值走既有
+// resolveCompanyWithICP,行为完全不变。
+func (s *AssetStore) upsertCompanyID(forced int64, rootDomain, ipStr, icp string) (*int64, error) {
+	if forced > 0 {
+		id := forced
+		return &id, nil
+	}
+	return s.resolveCompanyWithICP(rootDomain, ipStr, icp)
+}
+
 // =====================================================================
 // Helpers
 // =====================================================================
@@ -249,6 +260,8 @@ type UpsertRootDomainReq struct {
 	Domain string
 	ICP    string
 	TaskID int64
+	// CompanyID > 0 强制归属该企业(跳过范围/ICP 自动认领);零值=旧行为。
+	CompanyID int64
 }
 
 // UpsertRootDomain idempotently inserts or merges a root domain asset.
@@ -262,7 +275,7 @@ func (s *AssetStore) UpsertRootDomain(req UpsertRootDomainReq) (int64, error) {
 			return scoped.UpsertRootDomain(req)
 		})
 	}
-	companyID, err := s.resolveCompanyWithICP(domain, "", req.ICP)
+	companyID, err := s.upsertCompanyID(req.CompanyID, domain, "", req.ICP)
 	if err != nil {
 		return 0, err
 	}
@@ -332,6 +345,8 @@ type UpsertIPReq struct {
 	BoundDomains []string
 	OpenPorts    []PortService
 	TaskID       int64
+	// CompanyID > 0 强制归属该企业(跳过范围/ICP 自动认领);零值=旧行为。
+	CompanyID int64
 }
 
 // UpsertIP idempotently inserts or merges an IP asset.
@@ -348,7 +363,7 @@ func (s *AssetStore) UpsertIP(req UpsertIPReq) (int64, error) {
 		})
 	}
 	cseg := calcCSegment(req.IP)
-	companyID, err := s.resolveCompanyWithICP("", req.IP, "")
+	companyID, err := s.upsertCompanyID(req.CompanyID, "", req.IP, "")
 	if err != nil {
 		return 0, err
 	}
@@ -446,6 +461,9 @@ type UpsertSubdomainReq struct {
 	RecordValue []string
 	ICP         string
 	TaskID      int64
+	// CompanyID > 0 强制归属该企业(跳过范围/ICP 自动认领,连带根域名/IP
+	// side effect);零值=旧行为。
+	CompanyID int64
 }
 
 // UpsertSubdomain idempotently inserts or merges a subdomain asset and triggers
@@ -466,16 +484,18 @@ func (s *AssetStore) UpsertSubdomain(req UpsertSubdomainReq) (id int64, err erro
 		rootDomain = domain
 	}
 
-	// Resolve by root domain first, then the asset's exact normalized ICP.
-	companyID, err := s.resolveCompanyWithICP(rootDomain, "", req.ICP)
+	// 强制归属(导入指定 company_id)直接生效;否则按根域优先、再按资产归一化
+	// ICP 的既有顺序做范围认领。
+	companyID, err := s.upsertCompanyID(req.CompanyID, rootDomain, "", req.ICP)
 	if err != nil {
 		return 0, err
 	}
 
 	// side effect 1: ensure root domain exists
 	_, _ = s.UpsertRootDomain(UpsertRootDomainReq{
-		Domain: rootDomain,
-		TaskID: req.TaskID,
+		Domain:    rootDomain,
+		TaskID:    req.TaskID,
+		CompanyID: req.CompanyID,
 	})
 
 	// side effect 2: if A/AAAA record, upsert each IP + bind domain.
@@ -495,12 +515,14 @@ func (s *AssetStore) UpsertSubdomain(req UpsertSubdomainReq) (id int64, err erro
 					IP:           candidate,
 					BoundDomains: []string{domain},
 					TaskID:       req.TaskID,
+					CompanyID:    req.CompanyID,
 				})
 			}
 		}
 	}
 
 	cseg := calcCSegment(ipStr)
+	// 强制归属时 companyID 非 nil,这里的兜底解析天然不会触发。
 	if companyID == nil && ipStr != "" {
 		companyID, _ = s.resolveCompanyWithICP("", ipStr, "")
 	}
@@ -676,6 +698,9 @@ type UpsertHTTPServiceReq struct {
 	Auth          []map[string]any
 	IP            string // optional, from async DNS
 	TaskID        int64
+	// CompanyID > 0 强制归属该企业(跳过范围/ICP 自动认领,连带根域名/子域名/IP
+	// side effect);零值=旧行为。
+	CompanyID int64
 }
 
 // UpsertHTTPService inserts or merges an HTTP service asset. Domain, port,
@@ -700,7 +725,7 @@ func (s *AssetStore) UpsertHTTPService(req UpsertHTTPServiceReq) (int64, error) 
 	}
 
 	cseg := calcCSegment(req.IP)
-	companyID, err := s.resolveCompanyWithICP(rootDomain, req.IP, "")
+	companyID, err := s.upsertCompanyID(req.CompanyID, rootDomain, req.IP, "")
 	if err != nil {
 		return 0, err
 	}
@@ -782,7 +807,7 @@ RETURNING id`,
 	}
 
 	// side effects: register root_domain + subdomain as their own assets too
-	s.linkHostAssets(domain, rootDomain, req.TaskID)
+	s.linkHostAssets(domain, rootDomain, req.TaskID, req.CompanyID)
 	if req.IP != "" {
 		var boundDomains []string
 		if domain != "" {
@@ -797,6 +822,7 @@ RETURNING id`,
 			BoundDomains: boundDomains,
 			OpenPorts:    openPorts,
 			TaskID:       req.TaskID,
+			CompanyID:    req.CompanyID,
 		})
 	}
 	return id, nil
@@ -814,6 +840,9 @@ type UpsertOtherServiceReq struct {
 	ServiceName string
 	Auth        []map[string]any
 	TaskID      int64
+	// CompanyID > 0 强制归属该企业(跳过范围/ICP 自动认领,连带根域名/子域名/IP
+	// side effect);零值=旧行为。
+	CompanyID int64
 }
 
 // UpsertOtherService inserts or merges a non-HTTP service asset.
@@ -849,7 +878,7 @@ func (s *AssetStore) UpsertOtherService(req UpsertOtherServiceReq) (int64, error
 	}
 
 	cseg := calcCSegment(req.IP)
-	companyID, err := s.resolveCompanyWithICP(rootDomain, req.IP, "")
+	companyID, err := s.upsertCompanyID(req.CompanyID, rootDomain, req.IP, "")
 	if err != nil {
 		return 0, err
 	}
@@ -927,21 +956,23 @@ RETURNING id`,
 			BoundDomains: boundDomains,
 			OpenPorts:    []PortService{{Port: req.Port, Service: serviceName}},
 			TaskID:       req.TaskID,
+			CompanyID:    req.CompanyID,
 		})
 	}
-	s.linkHostAssets(domain, rootDomain, req.TaskID)
+	s.linkHostAssets(domain, rootDomain, req.TaskID, req.CompanyID)
 	return id, nil
 }
 
 // linkHostAssets ensures a service/endpoint's host is also registered as its own
 // root_domain and (when it's a real subdomain, not the apex or an IP) subdomain
 // asset — so those asset types stay populated and can anchor task scope. Best-effort.
-func (s *AssetStore) linkHostAssets(domain, rootDomain string, taskID int64) {
+// companyID>0 时连带注册的 host 资产一并强制归属(文件导入场景);零值=自动认领。
+func (s *AssetStore) linkHostAssets(domain, rootDomain string, taskID, companyID int64) {
 	if rootDomain != "" {
-		_, _ = s.UpsertRootDomain(UpsertRootDomainReq{Domain: rootDomain, TaskID: taskID})
+		_, _ = s.UpsertRootDomain(UpsertRootDomainReq{Domain: rootDomain, TaskID: taskID, CompanyID: companyID})
 	}
 	if domain != "" && domain != rootDomain && net.ParseIP(domain) == nil {
-		_, _ = s.UpsertSubdomain(UpsertSubdomainReq{Domain: domain, TaskID: taskID})
+		_, _ = s.UpsertSubdomain(UpsertSubdomainReq{Domain: domain, TaskID: taskID, CompanyID: companyID})
 	}
 }
 
@@ -1052,7 +1083,7 @@ RETURNING id`,
 	}
 	// side effects: endpoint previously registered none — register its host as
 	// root_domain + subdomain(+IP) so those asset types get populated too.
-	s.linkHostAssets(domain, rootDomain, req.TaskID)
+	s.linkHostAssets(domain, rootDomain, req.TaskID, 0)
 	if req.IP != "" {
 		_, _ = s.UpsertIP(UpsertIPReq{IP: req.IP, TaskID: req.TaskID})
 	}

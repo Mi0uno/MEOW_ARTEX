@@ -327,6 +327,74 @@ func (d *DB) DeleteLLMRecords(task string) (int64, error) {
 	return res.RowsAffected()
 }
 
+// DeleteLLMRecordsByIDs removes LLM records by explicit ids — the batch/single
+// delete path (the frontend passes one id for single delete, body 优先于 ?task=).
+// Returns rows deleted.
+func (d *DB) DeleteLLMRecordsByIDs(ids []int64) (int64, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	res, err := d.Exec(`DELETE FROM llm_records WHERE id = ANY($1::bigint[])`, ids)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// DeleteCommands removes tool-execution records (activity tool_use rows) by id.
+// Each tool_use's paired tool_result rows (joined by tool_use_id — the same
+// pairing ListCommands displays) are removed in the same transaction; leaving
+// them would strand orphan results in the activity table forever. Returns the
+// number of tool_use rows removed.
+func (d *DB) DeleteCommands(ids []int64) (int64, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	tx, err := d.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	// Collect the tool_use_id of the rows being removed so their paired
+	// tool_result rows can be removed in the same transaction.
+	rows, err := tx.Query(`
+SELECT COALESCE(tool_use_id,'') FROM activity
+WHERE kind = 'tool_use' AND id = ANY($1::bigint[]) AND COALESCE(tool_use_id,'') <> ''`, ids)
+	if err != nil {
+		return 0, err
+	}
+	var toolUseIDs []string
+	for rows.Next() {
+		var tid string
+		if err := rows.Scan(&tid); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		toolUseIDs = append(toolUseIDs, tid)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return 0, err
+	}
+
+	res, err := tx.Exec(`DELETE FROM activity WHERE kind = 'tool_use' AND id = ANY($1::bigint[])`, ids)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if len(toolUseIDs) > 0 {
+		if _, err := tx.Exec(`DELETE FROM activity WHERE kind = 'tool_result' AND tool_use_id = ANY($1::text[])`, toolUseIDs); err != nil {
+			return 0, err
+		}
+	}
+	return n, tx.Commit()
+}
+
 // GetLLMRecord returns a single LLM record with full request/response bodies.
 func (d *DB) GetLLMRecord(id int64) (*LLMRecord, error) {
 	var r LLMRecord

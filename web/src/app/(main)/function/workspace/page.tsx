@@ -14,8 +14,19 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -75,10 +86,15 @@ export default function WorkspacePage() {
   const [mkdirOpen, setMkdirOpen] = React.useState(false);
   const [mkdirName, setMkdirName] = React.useState("");
   const uploadRef = React.useRef<HTMLInputElement>(null);
+  // 行多选:工作区行的键是 path(string);切换目录/刷新即清空选择,避免误删别的目录里攒的勾选。
+  const [checkedPaths, setCheckedPaths] = React.useState<Set<string>>(new Set());
+  const [batchDeleteOpen, setBatchDeleteOpen] = React.useState(false);
+  const [batchDeleting, setBatchDeleting] = React.useState(false);
 
   const load = React.useCallback(
     (p: string) => {
       setLoading(true);
+      setCheckedPaths(new Set());
       api
         .workspaceList(p)
         .then((r) => {
@@ -140,6 +156,51 @@ export default function WorkspacePage() {
       .catch((err) => toast.error(`删除失败：${(err as Error).message}`));
   };
 
+  // 当前目录条目驱动三态全选(本页无分页,entries 即全部行)。
+  const pageIds = React.useMemo(() => entries.map((e) => e.path), [entries]);
+  const allChecked = pageIds.length > 0 && pageIds.every((p) => checkedPaths.has(p));
+  const someChecked = pageIds.some((p) => checkedPaths.has(p));
+
+  // 行首勾选:v 是显式 checked 语义(true 勾上 / false 取消)。
+  const toggleRow = (p: string, checked: boolean) => {
+    setCheckedPaths((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(p);
+      else next.delete(p);
+      return next;
+    });
+  };
+
+  // 表头全选:indeterminate 状态点击上报 true → 全选;已全选点击上报 false → 清空。
+  const toggleAllPage = (checked: boolean) => {
+    setCheckedPaths((prev) => {
+      const next = new Set(prev);
+      for (const p of pageIds) {
+        if (checked) next.add(p);
+        else next.delete(p);
+      }
+      return next;
+    });
+  };
+
+  // 批量删除:目录会连带其内容删除;循环单条接口,allSettled 保证一条失败不拖垮其余。
+  const confirmBatchDelete = async () => {
+    const paths = Array.from(checkedPaths);
+    setBatchDeleting(true);
+    try {
+      const results = await Promise.allSettled(paths.map((p) => api.workspaceDelete(p)));
+      const ok = results.filter((r) => r.status === "fulfilled").length;
+      const failed = results.length - ok;
+      if (failed === 0) toast.success(`已删除 ${ok} 项`);
+      else toast.warning(`成功 ${ok} 项，失败 ${failed} 项`);
+      setCheckedPaths(new Set());
+      load(path);
+    } finally {
+      setBatchDeleting(false);
+      setBatchDeleteOpen(false);
+    }
+  };
+
   const doUpload = (files: FileList | null) => {
     if (!files || files.length === 0) return;
     api
@@ -192,6 +253,12 @@ export default function WorkspacePage() {
           ))}
         </div>
         <div className="flex items-center gap-2">
+          {checkedPaths.size > 0 && (
+            <Button variant="destructive" size="sm" onClick={() => setBatchDeleteOpen(true)}>
+              <Trash2Icon className="size-4" />
+              删除已选 (<span className="tabular-nums">{checkedPaths.size}</span>)
+            </Button>
+          )}
           <Button variant="outline" size="sm" onClick={() => setMkdirOpen(true)}>
             <FolderPlusIcon /> 新建文件夹
           </Button>
@@ -216,6 +283,13 @@ export default function WorkspacePage() {
           <Table>
             <TableHeader>
               <TableRow>
+                <TableHead className="w-8">
+                  <Checkbox
+                    checked={allChecked ? true : someChecked ? "indeterminate" : false}
+                    onCheckedChange={(v) => toggleAllPage(v === true)}
+                    aria-label="全选当前目录条目"
+                  />
+                </TableHead>
                 <TableHead>名称</TableHead>
                 <TableHead className="w-28 text-right">大小</TableHead>
                 <TableHead className="w-40">修改时间</TableHead>
@@ -225,13 +299,20 @@ export default function WorkspacePage() {
             <TableBody>
               {entries.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={4} className="text-muted-foreground py-10 text-center text-sm">
+                  <TableCell colSpan={5} className="text-muted-foreground py-10 text-center text-sm">
                     {loading ? "加载中…" : "空目录"}
                   </TableCell>
                 </TableRow>
               )}
               {entries.map((e) => (
-                <TableRow key={e.path}>
+                <TableRow key={e.path} className={checkedPaths.has(e.path) ? "bg-muted/40" : undefined}>
+                  <TableCell className="w-8" onClick={(ev) => ev.stopPropagation()}>
+                    <Checkbox
+                      checked={checkedPaths.has(e.path)}
+                      onCheckedChange={(v) => toggleRow(e.path, v === true)}
+                      aria-label={`选择${e.dir ? "目录" : "文件"} ${e.name}`}
+                    />
+                  </TableCell>
                   <TableCell>
                     <button
                       type="button"
@@ -359,6 +440,32 @@ export default function WorkspacePage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* 批量删除确认:兄弟节点渲染,不进三元链。目录连带其内容删除写明。 */}
+      <AlertDialog open={batchDeleteOpen} onOpenChange={setBatchDeleteOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>确认批量删除</AlertDialogTitle>
+            <AlertDialogDescription>
+              将永久删除选中的 <span className="font-semibold tabular-nums">{checkedPaths.size}</span>{" "}
+              项，其中目录将连带其内容删除。此操作不可撤销。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={batchDeleting}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                e.preventDefault();
+                void confirmBatchDelete();
+              }}
+              disabled={batchDeleting}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {batchDeleting ? "删除中…" : "确认删除"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

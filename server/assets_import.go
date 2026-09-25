@@ -6,11 +6,14 @@ package server
 //   - 字段 file 必填,扩展名 .txt/.csv/.xlsx,≤10MB,≤20000 数据行;
 //   - 字段 task_id 可选(数字字符串),>0 时每条成功资产登记任务侧来源
 //     SetTaskAssetSource(taskID, id, "import", "文件导入 · <原文件名>", nil);
+//   - 字段 company_id 可选(数字字符串),>0 时本次导入的全部资产(含 db 层
+//     连带注册的根域名/子域名/IP side effect)强制归属该企业——跳过按范围的
+//     自动认领;企业不存在返回 400;<=0 或缺省行为完全不变(自动认领);
 //   - 成功 200 返回 {total,imported,failed,skipped,results,errors},其中
 //     total=imported+failed(进了 upsert 的行),skipped=空行/注释行以外
 //     无法识别的行;results/errors 数组各最多存 200 条,真实计数看统计字段;
-//   - 400(无文件/扩展名不支持/超 10MB/超行数)返回前必须排空请求体,
-//     否则 keep-alive 连接上浏览器会把响应当网络错误报 Failed to fetch;
+//   - 400(无文件/扩展名不支持/超 10MB/超行数/企业不存在)返回前必须排空
+//     请求体,否则 keep-alive 连接上浏览器会把响应当网络错误报 Failed to fetch;
 //   - 503:assetStore 为 nil。
 //
 // 落库映射与 recon_api.go 的 adoptStagedAsset 完全同语义:domain→UpsertSubdomain
@@ -138,6 +141,19 @@ func (s *Server) importAssets(w http.ResponseWriter, r *http.Request) {
 	if taskID < 0 {
 		taskID = 0
 	}
+	// company_id > 0 强制本次导入全部归属该企业(替代按范围自动认领);
+	// 解析失败/<=0 一律视为缺省,行为不变(与 task_id 同款宽松解析)。
+	companyID, _ := strconv.ParseInt(strings.TrimSpace(r.FormValue("company_id")), 10, 64)
+	if companyID < 0 {
+		companyID = 0
+	}
+	if companyID > 0 {
+		if err := validateImportCompany(s, companyID); err != nil {
+			drainRequestBody(r)
+			writeErr(w, err.status, err.msg)
+			return
+		}
+	}
 
 	lines, issues, perr := parseImportFile(ext, data)
 	if perr != nil {
@@ -159,7 +175,7 @@ func (s *Server) importAssets(w http.ResponseWriter, r *http.Request) {
 			}
 			continue
 		}
-		id, err := upsertImportedAsset(as, taskID, raw, pl.title)
+		id, err := upsertImportedAsset(as, taskID, companyID, raw, pl.title)
 		if err != nil {
 			failed++
 			if len(errs) < maxImportReports {
@@ -202,17 +218,18 @@ func drainRequestBody(r *http.Request) {
 // upsertImportedAsset 把一条语义分类结果映射进正式资产图,语义与 recon_api.go
 // 的 adoptStagedAsset 保持一致(domain 自动补根域名、按企业范围认领归属都由
 // store 内部完成,这里不做根域名判断)。title 是 csv/xlsx 表头模式标题列的值,
-// 仅用于 http service 的 PageTitle。
-func upsertImportedAsset(as *db.AssetStore, taskID int64, raw *recon.RawAsset, title string) (int64, error) {
+// 仅用于 http service 的 PageTitle。companyID>0 时强制归属该企业(契约一),
+// db 层连带注册的根域名/子域名/IP side effect 一并归属;零值=自动认领。
+func upsertImportedAsset(as *db.AssetStore, taskID, companyID int64, raw *recon.RawAsset, title string) (int64, error) {
 	switch raw.Type {
 	case recon.TypeDomain:
-		return as.UpsertSubdomain(db.UpsertSubdomainReq{Domain: raw.Value, TaskID: taskID})
+		return as.UpsertSubdomain(db.UpsertSubdomainReq{Domain: raw.Value, TaskID: taskID, CompanyID: companyID})
 	case recon.TypeIP:
 		var ports []db.PortService
 		if raw.Port > 0 {
 			ports = append(ports, db.PortService{Port: raw.Port})
 		}
-		return as.UpsertIP(db.UpsertIPReq{IP: raw.Value, OpenPorts: ports, TaskID: taskID})
+		return as.UpsertIP(db.UpsertIPReq{IP: raw.Value, OpenPorts: ports, TaskID: taskID, CompanyID: companyID})
 	case recon.TypeService:
 		extra := map[string]any{}
 		_ = json.Unmarshal(raw.Extra, &extra)
@@ -221,9 +238,9 @@ func upsertImportedAsset(as *db.AssetStore, taskID int64, raw *recon.RawAsset, t
 			if net.ParseIP(raw.Value) != nil {
 				ip = raw.Value
 			}
-			return as.UpsertHTTPService(db.UpsertHTTPServiceReq{URL: u, PageTitle: title, IP: ip, TaskID: taskID})
+			return as.UpsertHTTPService(db.UpsertHTTPServiceReq{URL: u, PageTitle: title, IP: ip, TaskID: taskID, CompanyID: companyID})
 		}
-		req := db.UpsertOtherServiceReq{Port: raw.Port, TaskID: taskID}
+		req := db.UpsertOtherServiceReq{Port: raw.Port, TaskID: taskID, CompanyID: companyID}
 		if net.ParseIP(raw.Value) != nil {
 			req.IP = raw.Value
 		} else {
@@ -232,6 +249,31 @@ func upsertImportedAsset(as *db.AssetStore, taskID int64, raw *recon.RawAsset, t
 		return as.UpsertOtherService(req)
 	}
 	return 0, fmt.Errorf("无法识别的类型 %q", raw.Type)
+}
+
+// importCompanyError 是 company_id 校验失败的响应载荷(状态码+文案)。
+type importCompanyError struct {
+	status int
+	msg    string
+}
+
+func (e *importCompanyError) Error() string { return e.msg }
+
+// validateImportCompany 校验导入指定的归属企业存在(契约一)。GetCompany 未命中
+// 返回 nil 值(而非 error),这里落成 400「企业不存在」。
+func validateImportCompany(s *Server, companyID int64) *importCompanyError {
+	cs := s.companyStore()
+	if cs == nil {
+		return &importCompanyError{status: 503, msg: "database unavailable"}
+	}
+	c, err := cs.GetCompany(companyID)
+	if err != nil {
+		return &importCompanyError{status: 500, msg: err.Error()}
+	}
+	if c == nil {
+		return &importCompanyError{status: 400, msg: "企业不存在"}
+	}
+	return nil
 }
 
 // =====================================================================

@@ -28,9 +28,20 @@ import {
 import { toast } from "sonner";
 
 import { CompanyPickerPage } from "@/components/company-picker-page";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -96,6 +107,24 @@ function ReportsCenterInner() {
   const [loading, setLoading] = React.useState(true);
   const [offset, setOffset] = React.useState(0);
   const [creating, setCreating] = React.useState(false);
+
+  // 行多选(选中集跨筛选/翻页保留):全选只作用于当前页;批量执行时已不存在的
+  // id 自然失败并计入失败数,无需专门收敛。
+  const [checkedIds, setCheckedIds] = React.useState<Set<number>>(new Set());
+  const [deleting, setDeleting] = React.useState(false);
+  const [confirmOpen, setConfirmOpen] = React.useState(false);
+
+  const toggleChecked = (id: number, checked: boolean) => {
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  };
+
+  const allSelected = reports.length > 0 && reports.every((r) => checkedIds.has(r.id));
+  const someSelected = !allSelected && reports.some((r) => checkedIds.has(r.id));
 
   // 资产主体:null=还没选(显示选择页);-1=未关联企业桶;0=全部;>0=该企业。
   const [unassigned, setUnassigned] = React.useState(0);
@@ -205,6 +234,26 @@ function ReportsCenterInner() {
     }
   };
 
+  // 批量删除已选报告:并行逐个调删除接口,统计成功/失败后清空选择并刷新列表
+  // (刷新走该页既有的 load / loadUnassigned,与单行删除一致)。
+  const batchDelete = async () => {
+    const ids = [...checkedIds];
+    setDeleting(true);
+    try {
+      const rs = await Promise.allSettled(ids.map((id) => api.deleteReport(id)));
+      const ok = rs.filter((r) => r.status === "fulfilled").length;
+      const fail = rs.length - ok;
+      if (fail === 0) toast.success(`已删除 ${ok} 项`);
+      else toast.warning(`成功 ${ok} 项，失败 ${fail} 项`);
+      setCheckedIds(new Set());
+      setConfirmOpen(false);
+      if (companyID === -1) loadUnassigned(query, kind, offset);
+      else load(query, kind, offset, companyID);
+    } finally {
+      setDeleting(false);
+    }
+  };
+
   const countOf = (k: string) => (k === "all" ? Object.values(counts).reduce((a, b) => a + b, 0) : (counts[k] ?? 0));
 
   // 选择资产主体页:作为进入页(未选资产主体时显示)。
@@ -263,6 +312,22 @@ function ReportsCenterInner() {
       <Table>
         <TableHeader>
           <TableRow className="hover:bg-transparent">
+            <TableHead className="w-8">
+              <Checkbox
+                checked={allSelected ? true : someSelected ? "indeterminate" : false}
+                onCheckedChange={(v) =>
+                  setCheckedIds((prev) => {
+                    const next = new Set(prev);
+                    for (const r of reports) {
+                      if (v === true) next.add(r.id);
+                      else next.delete(r.id);
+                    }
+                    return next;
+                  })
+                }
+                aria-label="全选本页"
+              />
+            </TableHead>
             <TableHead className="w-24">分类</TableHead>
             {/* 标题列不设宽度:table-fixed 下自动吃掉余量(设 w-full 会挤掉后面的列)。 */}
             <TableHead>标题</TableHead>
@@ -277,6 +342,13 @@ function ReportsCenterInner() {
             const meta = KIND_META[r.kind] ?? KIND_META.custom;
             return (
               <TableRow key={r.id}>
+                <TableCell className="w-8" onClick={(e) => e.stopPropagation()}>
+                  <Checkbox
+                    checked={checkedIds.has(r.id)}
+                    onCheckedChange={(v) => toggleChecked(r.id, v === true)}
+                    aria-label={`选择 ${r.title}`}
+                  />
+                </TableCell>
                 <TableCell>
                   <Badge variant="outline" className={meta.badgeClass}>
                     {meta.label}
@@ -399,6 +471,12 @@ function ReportsCenterInner() {
                 <TabsTrigger value="custom">自定义 {counts.custom ?? 0}</TabsTrigger>
               </TabsList>
             </Tabs>
+            {checkedIds.size > 0 && (
+              <Button variant="destructive" size="sm" disabled={deleting} onClick={() => setConfirmOpen(true)}>
+                <Trash2Icon className="size-4" />
+                删除已选 ({checkedIds.size})
+              </Button>
+            )}
             <span className="ml-auto text-muted-foreground text-xs tabular-nums">
               共 {total} 份{query ? `(命中 ${total})` : ""}
             </span>
@@ -431,6 +509,30 @@ function ReportsCenterInner() {
           </div>
         </CardContent>
       </Card>
+
+      {/* 批量删除确认:兄弟节点,不进上方三元链。 */}
+      <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>确认删除</AlertDialogTitle>
+            <AlertDialogDescription>
+              将删除已选的 {checkedIds.size} 份报告,该操作不可恢复。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleting}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={deleting}
+              onClick={(e) => {
+                e.preventDefault(); // 删除完成后再关弹层,期间确认按钮呈禁用态
+                void batchDelete();
+              }}
+            >
+              {deleting ? "删除中…" : "删除"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <CreateReportDialog
         open={creating}

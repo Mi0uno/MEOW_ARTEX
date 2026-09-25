@@ -20,10 +20,21 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { TablePagination } from "@/components/table-pagination";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -74,6 +85,24 @@ function VulnDBInner() {
   const [editing, setEditing] = React.useState<VulnEntry | null>(null);
   const [creating, setCreating] = React.useState(false);
   const [detailID, setDetailID] = React.useState<number | null>(null);
+
+  // 行多选(选中集跨筛选/翻页保留):全选只作用于当前页;批量执行时已不存在的
+  // id 自然失败并计入失败数,无需专门收敛。
+  const [checkedIds, setCheckedIds] = React.useState<Set<number>>(new Set());
+  const [deleting, setDeleting] = React.useState(false);
+  const [confirmOpen, setConfirmOpen] = React.useState(false);
+
+  const toggleChecked = (id: number, checked: boolean) => {
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  };
+
+  const allSelected = entries.length > 0 && entries.every((e) => checkedIds.has(e.id));
+  const someSelected = !allSelected && entries.some((e) => checkedIds.has(e.id));
 
   const load = React.useCallback(
     (
@@ -131,6 +160,25 @@ function VulnDBInner() {
       reload();
     } catch (err) {
       toast.error(`删除失败:${(err as Error).message}`);
+    }
+  };
+
+  // 批量删除已选条目:并行逐个调删除接口(连带删各自 PoC),统计成功/失败后
+  // 清空选择并用页面既有的 reload() 刷新。
+  const batchDelete = async () => {
+    const ids = [...checkedIds];
+    setDeleting(true);
+    try {
+      const rs = await Promise.allSettled(ids.map((id) => api.deleteVulnEntry(id)));
+      const ok = rs.filter((r) => r.status === "fulfilled").length;
+      const fail = rs.length - ok;
+      if (fail === 0) toast.success(`已删除 ${ok} 项`);
+      else toast.warning(`成功 ${ok} 项，失败 ${fail} 项`);
+      setCheckedIds(new Set());
+      setConfirmOpen(false);
+      reload();
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -274,6 +322,12 @@ function VulnDBInner() {
                 );
               })}
             </div>
+            {checkedIds.size > 0 && (
+              <Button variant="destructive" size="sm" disabled={deleting} onClick={() => setConfirmOpen(true)}>
+                <Trash2Icon className="size-4" />
+                删除已选 ({checkedIds.size})
+              </Button>
+            )}
             <span className="text-muted-foreground ml-auto text-xs tabular-nums">
               {query ? `命中 ${total} / ` : ""}共 {total} 条
             </span>
@@ -295,6 +349,22 @@ function VulnDBInner() {
               <Table className="table-fixed">
                 <TableHeader>
                   <TableRow className="hover:bg-transparent">
+                    <TableHead className="w-8">
+                      <Checkbox
+                        checked={allSelected ? true : someSelected ? "indeterminate" : false}
+                        onCheckedChange={(v) =>
+                          setCheckedIds((prev) => {
+                            const next = new Set(prev);
+                            for (const e of entries) {
+                              if (v === true) next.add(e.id);
+                              else next.delete(e.id);
+                            }
+                            return next;
+                          })
+                        }
+                        aria-label="全选本页"
+                      />
+                    </TableHead>
                     <TableHead className="w-20">分类</TableHead>
                     {/* 标题列不设宽度:table-fixed 下自动吃掉余量(设 w-full 会挤掉后面的列)。 */}
                     <TableHead>标题</TableHead>
@@ -313,6 +383,13 @@ function VulnDBInner() {
                 <TableBody>
                   {entries.map((e) => (
                     <TableRow key={e.id}>
+                      <TableCell className="w-8" onClick={(e2) => e2.stopPropagation()}>
+                        <Checkbox
+                          checked={checkedIds.has(e.id)}
+                          onCheckedChange={(v) => toggleChecked(e.id, v === true)}
+                          aria-label={`选择 ${e.title}`}
+                        />
+                      </TableCell>
                       <TableCell>
                         <Badge variant="outline" className={categoryBadgeClass(e.category)}>
                           {e.category === "0day" ? "0day" : "Nday"}
@@ -390,6 +467,30 @@ function VulnDBInner() {
           )}
         </CardContent>
       </Card>
+
+      {/* 批量删除确认:兄弟节点,不进上方三元链。 */}
+      <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>确认删除</AlertDialogTitle>
+            <AlertDialogDescription>
+              将删除已选的 {checkedIds.size} 条漏洞条目(含其 PoC),该操作不可恢复。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleting}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={deleting}
+              onClick={(e) => {
+                e.preventDefault(); // 删除完成后再关弹层,期间确认按钮呈禁用态
+                void batchDelete();
+              }}
+            >
+              {deleting ? "删除中…" : "删除"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <VulnEntryDialog
         entry={editing}

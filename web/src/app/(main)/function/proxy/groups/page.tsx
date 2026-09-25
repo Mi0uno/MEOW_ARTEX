@@ -24,9 +24,20 @@ import { toast } from "sonner";
 
 import { groupKindBadgeClass, groupKindLabel, ProxyGroupDialog, strategyLabel } from "@/components/proxy-dialogs";
 import { TablePagination } from "@/components/table-pagination";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -54,6 +65,14 @@ export default function ProxyGroupsPage() {
   const [loading, setLoading] = React.useState(true);
   const [editing, setEditing] = React.useState<ProxyGroup | null>(null);
   const [creating, setCreating] = React.useState(false);
+  // 行多选与批量删除:三态全选按当前页行计算。
+  const [checkedIds, setCheckedIds] = React.useState<Set<number>>(new Set());
+  const [batchConfirmOpen, setBatchConfirmOpen] = React.useState(false);
+  const [batchDeleting, setBatchDeleting] = React.useState(false);
+  // 当前页行(服务端分页,groups 即本页)驱动三态全选。
+  const pageIds = React.useMemo(() => groups.map((g) => g.id), [groups]);
+  const allChecked = pageIds.length > 0 && pageIds.every((id) => checkedIds.has(id));
+  const someChecked = pageIds.some((id) => checkedIds.has(id));
 
   const load = React.useCallback((q: string, k: string, srt: string, desc: boolean, p: number, size: number) => {
     setLoading(true);
@@ -97,6 +116,46 @@ export default function ProxyGroupsPage() {
     }
   };
 
+  // 行首勾选:v 是显式 checked 语义(true 勾上 / false 取消)。
+  const toggleRow = (id: number, checked: boolean) => {
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  };
+
+  // 表头全选:indeterminate 状态点击上报 true → 全选当前页;已全选点击上报 false → 清当前页。
+  const toggleAllPage = (checked: boolean) => {
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      for (const id of pageIds) {
+        if (checked) next.add(id);
+        else next.delete(id);
+      }
+      return next;
+    });
+  };
+
+  // 批量删除:逐条走单删接口,allSettled 保证一条失败不拖垮其余;级联后果在确认文案里写明。
+  const confirmBatchDelete = async () => {
+    const ids = Array.from(checkedIds);
+    setBatchDeleting(true);
+    try {
+      const results = await Promise.allSettled(ids.map((id) => api.deleteProxyGroup(id)));
+      const ok = results.filter((r) => r.status === "fulfilled").length;
+      const failed = results.length - ok;
+      if (failed === 0) toast.success(`已删除 ${ok} 项`);
+      else toast.warning(`成功 ${ok} 项，失败 ${failed} 项`);
+      setCheckedIds(new Set());
+      reload();
+    } finally {
+      setBatchDeleting(false);
+      setBatchConfirmOpen(false);
+    }
+  };
+
   const SortHead = ({ field, width, children }: { field: string; width?: string; children: React.ReactNode }) => (
     <TableHead className={width}>
       <button
@@ -132,10 +191,18 @@ export default function ProxyGroupsPage() {
             代理组是调度的单位:出网走代理池时按组内策略轮换使用。进入组可接入主流代理池 API、搜集全网在野代理并跑测活。
           </p>
         </div>
-        <Button size="sm" onClick={() => setCreating(true)}>
-          <PlusIcon className="size-4" />
-          新建代理组
-        </Button>
+        <div className="flex items-center gap-2">
+          {checkedIds.size > 0 && (
+            <Button variant="destructive" size="sm" onClick={() => setBatchConfirmOpen(true)}>
+              <Trash2Icon className="size-4" />
+              删除已选 (<span className="tabular-nums">{checkedIds.size}</span>)
+            </Button>
+          )}
+          <Button size="sm" onClick={() => setCreating(true)}>
+            <PlusIcon className="size-4" />
+            新建代理组
+          </Button>
+        </div>
       </div>
 
       <Card>
@@ -205,7 +272,16 @@ export default function ProxyGroupsPage() {
                     {/* 组名列不设宽度:table-fixed 下自动吃掉余量(设 w-full 会挤掉后面的列)。
                         其余列的固定宽度之和必须明显小于容器宽,否则组名会被压到看不见
                         (实测 992px 固定宽 + ~897px 容器 → 组名列归零、表还撑出横向滚动条)。
-                        故列宽按最小可读值给:「存活 / 失效」用 w-24 也放得下「87 / 4」。 */}
+                        故列宽按最小可读值给:「存活 / 失效」用 w-24 也放得下「87 / 4」。
+                        加行首勾选列后核对:固定列合计 800px(32+80+96+80+96+64+80+64+144+64),
+                        ~897px 容器下组名仍剩 ~97px、未触发横向滚动;再加列必须先瘦身其他列。 */}
+                    <TableHead className="w-8">
+                      <Checkbox
+                        checked={allChecked ? true : someChecked ? "indeterminate" : false}
+                        onCheckedChange={(v) => toggleAllPage(v === true)}
+                        aria-label="全选当前页代理组"
+                      />
+                    </TableHead>
                     <SortHead field="name">组名</SortHead>
                     <TableHead className="w-20">类型</TableHead>
                     <TableHead className="w-24">调度策略</TableHead>
@@ -224,7 +300,14 @@ export default function ProxyGroupsPage() {
                 </TableHeader>
                 <TableBody>
                   {(groups ?? []).map((g) => (
-                    <TableRow key={g.id}>
+                    <TableRow key={g.id} className={checkedIds.has(g.id) ? "bg-muted/40" : undefined}>
+                      <TableCell className="w-8" onClick={(e) => e.stopPropagation()}>
+                        <Checkbox
+                          checked={checkedIds.has(g.id)}
+                          onCheckedChange={(v) => toggleRow(g.id, v === true)}
+                          aria-label={`选择代理组 ${g.name}`}
+                        />
+                      </TableCell>
                       {/* 组名即入口:点击进入详情页,在那里管理代理、接入源与测活。 */}
                       <TableCell className="min-w-0">
                         <Link
@@ -323,6 +406,32 @@ export default function ProxyGroupsPage() {
           reload();
         }}
       />
+
+      {/* 批量删除确认:兄弟节点渲染,不进三元链。级联后果(组内代理与接入配置)写明。 */}
+      <AlertDialog open={batchConfirmOpen} onOpenChange={setBatchConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>确认批量删除代理组</AlertDialogTitle>
+            <AlertDialogDescription>
+              将永久删除选中的 <span className="font-semibold tabular-nums">{checkedIds.size}</span>{" "}
+              个代理组，组内代理与接入配置将一并删除。此操作不可撤销。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={batchDeleting}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                e.preventDefault();
+                void confirmBatchDelete();
+              }}
+              disabled={batchDeleting}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {batchDeleting ? "删除中…" : "确认删除"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

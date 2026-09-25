@@ -11,14 +11,25 @@ import * as React from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 
-import { ArrowRightIcon, PlusIcon, RocketIcon, SearchIcon, TargetIcon } from "lucide-react";
+import { ArrowRightIcon, PlusIcon, RocketIcon, SearchIcon, TargetIcon, Trash2Icon } from "lucide-react";
 import { toast } from "sonner";
 
 import { TablePagination } from "@/components/table-pagination";
 import { CreateSRCTaskDialog } from "@/components/src-create-task-dialog";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -51,6 +62,11 @@ export default function SRCTargetsPage() {
   // 行内「建任务」需要平台上下文;一个目标可能挂多平台,记下它所有挂链平台供对话框选择。
   const [taskTarget, setTaskTarget] = React.useState<SRCTarget | null>(null);
   const [taskPlatform, setTaskPlatform] = React.useState<SRCPlatform | null>(null);
+  // 行多选与删除:本页原先没有删除入口,行内删除与批量删除共用一个确认弹层(deleteIds 区分)。
+  const [checkedIds, setCheckedIds] = React.useState<Set<number>>(new Set());
+  const [deleteIds, setDeleteIds] = React.useState<number[]>([]);
+  const [deleteOpen, setDeleteOpen] = React.useState(false);
+  const [deleting, setDeleting] = React.useState(false);
 
   const load = React.useCallback((q: string, platformId: string, p: number, size: number) => {
     setLoading(true);
@@ -79,6 +95,50 @@ export default function SRCTargetsPage() {
   const search = () => {
     setPage(1);
     setApplied(query);
+  };
+
+  // 当前页行(服务端分页,targets 即本页)驱动三态全选。
+  const pageIds = React.useMemo(() => targets.map((t) => t.id), [targets]);
+  const allChecked = pageIds.length > 0 && pageIds.every((id) => checkedIds.has(id));
+  const someChecked = pageIds.some((id) => checkedIds.has(id));
+
+  // 行首勾选:v 是显式 checked 语义(true 勾上 / false 取消)。
+  const toggleRow = (id: number, checked: boolean) => {
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  };
+
+  // 表头全选:indeterminate 状态点击上报 true → 全选当前页;已全选点击上报 false → 清当前页。
+  const toggleAllPage = (checked: boolean) => {
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      for (const id of pageIds) {
+        if (checked) next.add(id);
+        else next.delete(id);
+      }
+      return next;
+    });
+  };
+
+  // 行内删除与批量删除共用:逐条走单删接口,allSettled 保证一条失败不拖垮其余。
+  const confirmDelete = async () => {
+    setDeleting(true);
+    try {
+      const results = await Promise.allSettled(deleteIds.map((id) => api.deleteSRCTarget(id)));
+      const ok = results.filter((r) => r.status === "fulfilled").length;
+      const failed = results.length - ok;
+      if (failed === 0) toast.success(`已删除 ${ok} 项`);
+      else toast.warning(`成功 ${ok} 项，失败 ${failed} 项`);
+      setCheckedIds(new Set());
+      load(applied, platformFilter, page, pageSize);
+    } finally {
+      setDeleting(false);
+      setDeleteOpen(false);
+    }
   };
 
   // 行内建任务:目标只挂一个平台时直接锁定该平台开对话框;多平台时先让用户选平台。
@@ -117,12 +177,27 @@ export default function SRCTargetsPage() {
             被测试的对象(厂商/学校/单位)。授权范围与资产挂在「平台×目标」上,同一目标在不同平台下的边界互相独立。
           </p>
         </div>
-        <Button size="sm" asChild>
-          <Link href="/function/src/platforms">
-            <PlusIcon className="size-4" />
-            去平台下添加目标
-          </Link>
-        </Button>
+        <div className="flex items-center gap-2">
+          {checkedIds.size > 0 && (
+            <Button
+              variant="destructive"
+              size="sm"
+              onClick={() => {
+                setDeleteIds(Array.from(checkedIds));
+                setDeleteOpen(true);
+              }}
+            >
+              <Trash2Icon className="size-4" />
+              删除已选 (<span className="tabular-nums">{checkedIds.size}</span>)
+            </Button>
+          )}
+          <Button size="sm" asChild>
+            <Link href="/function/src/platforms">
+              <PlusIcon className="size-4" />
+              去平台下添加目标
+            </Link>
+          </Button>
+        </div>
       </div>
 
       <Card>
@@ -185,7 +260,14 @@ export default function SRCTargetsPage() {
               <Table className="table-fixed">
                 <TableHeader>
                   <TableRow className="hover:bg-transparent">
-                    {/* 目标名列不设宽度吃余量;固定列合计 616px,小于 ~897px 容器 */}
+                    {/* 目标名列不设宽度吃余量;固定列合计 648px(32+160+80+80+80+96+144,含行首勾选列 w-8),小于 ~897px 容器 */}
+                    <TableHead className="w-8">
+                      <Checkbox
+                        checked={allChecked ? true : someChecked ? "indeterminate" : false}
+                        onCheckedChange={(v) => toggleAllPage(v === true)}
+                        aria-label="全选当前页目标"
+                      />
+                    </TableHead>
                     <TableHead>目标名称</TableHead>
                     <TableHead className="w-40">关联企业</TableHead>
                     <TableHead className="w-20">平台数</TableHead>
@@ -198,7 +280,14 @@ export default function SRCTargetsPage() {
                 </TableHeader>
                 <TableBody>
                   {targets.map((t) => (
-                    <TableRow key={t.id}>
+                    <TableRow key={t.id} className={checkedIds.has(t.id) ? "bg-muted/40" : undefined}>
+                      <TableCell className="w-8" onClick={(e) => e.stopPropagation()}>
+                        <Checkbox
+                          checked={checkedIds.has(t.id)}
+                          onCheckedChange={(v) => toggleRow(t.id, v === true)}
+                          aria-label={`选择目标 ${t.name}`}
+                        />
+                      </TableCell>
                       <TableCell className="min-w-0">
                         <Link
                           href={`/function/src/targets/detail?id=${t.id}`}
@@ -238,6 +327,17 @@ export default function SRCTargetsPage() {
                         <div className="flex items-center gap-0.5">
                           <Button variant="ghost" size="icon-xs" onClick={() => startTask(t)} title="对该目标建 SRC 任务">
                             <RocketIcon className="size-3.5" />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="icon-xs"
+                            onClick={() => {
+                              setDeleteIds([t.id]);
+                              setDeleteOpen(true);
+                            }}
+                            title="删除目标(含挂链与资产关联)"
+                          >
+                            <Trash2Icon className="text-muted-foreground size-3.5" />
                           </Button>
                           <Button variant="ghost" size="icon-xs" asChild title="进入目标">
                             <Link href={`/function/src/targets/detail?id=${t.id}`} aria-label="进入目标">
@@ -286,6 +386,32 @@ export default function SRCTargetsPage() {
           target={taskTarget}
         />
       )}
+
+      {/* 行内/批量删除共用确认:兄弟节点渲染,不进三元链。级联后果(挂链与资产关联)写明。 */}
+      <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>确认删除目标</AlertDialogTitle>
+            <AlertDialogDescription>
+              将永久删除选中的 <span className="font-semibold tabular-nums">{deleteIds.length}</span>{" "}
+              个目标，其平台挂链与资产关联将一并清理。此操作不可撤销。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleting}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                e.preventDefault();
+                void confirmDelete();
+              }}
+              disabled={deleting}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {deleting ? "删除中…" : "确认删除"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

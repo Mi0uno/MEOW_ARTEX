@@ -2,11 +2,31 @@
 
 import * as React from "react";
 
-import { BarChart3Icon, ChevronLeftIcon, ChevronRightIcon, Loader2Icon, SearchIcon, TerminalIcon } from "lucide-react";
+import {
+  BarChart3Icon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  Loader2Icon,
+  SearchIcon,
+  TerminalIcon,
+  Trash2Icon,
+} from "lucide-react";
+import { toast } from "sonner";
 
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -68,6 +88,54 @@ export default function CommandsPage() {
   // Selected execution is rendered in a right-side detail sheet.
   const [selected, setSelected] = React.useState<CommandRecord | null>(null);
 
+  // 行级勾选批量删除:checkedIds 命名避开详情 Sheet 的 selected;reloadTick 触发既有加载 effect 重拉。
+  const [checkedIds, setCheckedIds] = React.useState<Set<number>>(() => new Set());
+  const [bulkDeleteOpen, setBulkDeleteOpen] = React.useState(false);
+  const [bulkDeleting, setBulkDeleting] = React.useState(false);
+  const [reloadTick, setReloadTick] = React.useState(0);
+
+  const toggleChecked = (id: number, checked: boolean) => {
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  };
+
+  const toggleCheckedPage = (ids: number[], checked: boolean) => {
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      for (const id of ids) {
+        if (checked) next.add(id);
+        else next.delete(id);
+      }
+      return next;
+    });
+  };
+
+  // 批量删除勾选的执行记录:后端按 id 集合一次删除,返回实际删除数;部分失败按返回数汇报。
+  const confirmBulkDelete = () => {
+    const ids = [...checkedIds];
+    if (ids.length === 0) return;
+    setBulkDeleting(true);
+    api
+      .deleteCommands(ids)
+      .then((r) => {
+        const deleted = r?.deleted ?? ids.length;
+        const failed = ids.length - deleted;
+        if (failed > 0) toast.warning(`成功 ${deleted} 失败 ${failed}`);
+        else toast.success(`已删除 ${deleted} 项`);
+        setCheckedIds(new Set());
+        setBulkDeleteOpen(false);
+        // 详情 Sheet 若正停在已删除的记录上,顺手关掉。
+        setSelected((cur) => (cur && ids.includes(cur.id) ? null : cur));
+        setReloadTick((t) => t + 1);
+      })
+      .catch((e) => toast.error(`删除失败：${(e as Error).message}`))
+      .finally(() => setBulkDeleting(false));
+  };
+
   // Debounce search input.
   React.useEffect(() => {
     const t = setTimeout(() => setQueryQ(query.trim()), 300);
@@ -100,7 +168,7 @@ export default function CommandsPage() {
     return () => {
       alive = false;
     };
-  }, [page, size, queryQ, taskFilter]);
+  }, [page, size, queryQ, taskFilter, reloadTick]);
 
   // 统计跟随筛选条件走，和表格描述的是同一批记录（但不分页）。
   React.useEffect(() => {
@@ -123,6 +191,16 @@ export default function CommandsPage() {
   const totalPages = Math.max(1, Math.ceil(total / size));
   const rangeStart = total === 0 ? 0 : page * size + 1;
   const rangeEnd = page * size + commands.length;
+
+  // 表头全选的范围 = 当前页行;三态:全选 / 部分选中(indeterminate) / 未选。
+  const pageIds = commands.map((cmd) => cmd.id);
+  const checkedOnPage = pageIds.filter((id) => checkedIds.has(id)).length;
+  let pageHeaderChecked: boolean | "indeterminate" = false;
+  if (pageIds.length > 0 && checkedOnPage === pageIds.length) {
+    pageHeaderChecked = true;
+  } else if (checkedOnPage > 0) {
+    pageHeaderChecked = "indeterminate";
+  }
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-4">
@@ -170,6 +248,19 @@ export default function CommandsPage() {
           统计
         </Button>
 
+        {checkedIds.size > 0 && (
+          <Button
+            variant="destructive"
+            size="sm"
+            className="h-8"
+            disabled={bulkDeleting}
+            onClick={() => setBulkDeleteOpen(true)}
+          >
+            <Trash2Icon className="size-4" />
+            删除已选 (<span className="tabular-nums">{checkedIds.size}</span>)
+          </Button>
+        )}
+
         <div className="ml-auto flex items-center gap-2 text-xs text-muted-foreground">
           <span className="tabular-nums">
             {rangeStart}–{rangeEnd} / {total}
@@ -205,6 +296,13 @@ export default function CommandsPage() {
             <Table>
               <TableHeader className="sticky top-0 z-10 bg-card">
                 <TableRow>
+                  <TableHead className="w-8">
+                    <Checkbox
+                      checked={pageHeaderChecked}
+                      onCheckedChange={(v) => toggleCheckedPage(pageIds, v === true)}
+                      aria-label="选择当前页全部"
+                    />
+                  </TableHead>
                   <TableHead className="w-[130px]">时间</TableHead>
                   <TableHead className="w-[60px]">任务</TableHead>
                   <TableHead className="w-[90px]">Worker</TableHead>
@@ -216,13 +314,13 @@ export default function CommandsPage() {
               <TableBody>
                 {loading && commands.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={6} className="py-12 text-center">
+                    <TableCell colSpan={7} className="py-12 text-center">
                       <Loader2Icon className="mx-auto h-5 w-5 animate-spin text-muted-foreground" />
                     </TableCell>
                   </TableRow>
                 ) : commands.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={6} className="py-12 text-center text-sm text-muted-foreground">
+                    <TableCell colSpan={7} className="py-12 text-center text-sm text-muted-foreground">
                       暂无工具执行记录
                     </TableCell>
                   </TableRow>
@@ -233,6 +331,13 @@ export default function CommandsPage() {
                       className={cn("cursor-pointer", selected?.id === cmd.id && "bg-accent hover:bg-accent")}
                       onClick={() => setSelected(cmd)}
                     >
+                      <TableCell onClick={(e) => e.stopPropagation()}>
+                        <Checkbox
+                          checked={checkedIds.has(cmd.id)}
+                          onCheckedChange={(v) => toggleChecked(cmd.id, v === true)}
+                          aria-label="选择该记录"
+                        />
+                      </TableCell>
                       <TableCell className="text-xs text-muted-foreground tabular-nums">
                         {fmtTime(cmd.created_at)}
                       </TableCell>
@@ -387,6 +492,35 @@ export default function CommandsPage() {
           )}
         </SheetContent>
       </Sheet>
+
+      <AlertDialog
+        open={bulkDeleteOpen}
+        onOpenChange={(open) => {
+          if (!bulkDeleting) setBulkDeleteOpen(open);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>删除已选中的 {checkedIds.size} 条执行记录？</AlertDialogTitle>
+            <AlertDialogDescription className="break-words">
+              将永久删除选中的 {checkedIds.size} 条工具执行记录（含输入与输出原文），清除执行记录不可恢复，此操作不可撤销。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={bulkDeleting}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                e.preventDefault();
+                confirmBulkDelete();
+              }}
+              disabled={bulkDeleting}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {bulkDeleting ? "删除中…" : "确认删除"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

@@ -20,6 +20,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -112,6 +113,10 @@ export default function WordbooksPage() {
     } catch (e) { toast.error(`预览失败：${(e as Error).message}`); }
   };
   const [deleting, setDeleting] = React.useState<number | null>(null);
+  // 行多选 + 批量删除:范围是当前页(paged);字典量不大,批量直接循环单条接口。
+  const [checkedIds, setCheckedIds] = React.useState<Set<number>>(new Set());
+  const [batchDeleteOpen, setBatchDeleteOpen] = React.useState(false);
+  const [batchDeleting, setBatchDeleting] = React.useState(false);
   // 列表页标准能力:搜索 / 类型筛选 / 排序 / 分页(字典数量不大,客户端处理即可)。
   const [query, setQuery] = React.useState("");
   const [kindFilter, setKindFilter] = React.useState("all");
@@ -159,6 +164,51 @@ export default function WordbooksPage() {
     finally { setDeleting(null); }
   };
 
+  // 当前页行(客户端分页,paged 即本页)驱动三态全选。
+  const pageIds = React.useMemo(() => paged.map((wb) => wb.id), [paged]);
+  const allChecked = pageIds.length > 0 && pageIds.every((id) => checkedIds.has(id));
+  const someChecked = pageIds.some((id) => checkedIds.has(id));
+
+  // 行首勾选:v 是显式 checked 语义(true 勾上 / false 取消)。
+  const toggleRow = (id: number, checked: boolean) => {
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  };
+
+  // 表头全选:indeterminate 状态点击上报 true → 全选当前页;已全选点击上报 false → 清当前页。
+  const toggleAllPage = (checked: boolean) => {
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      for (const id of pageIds) {
+        if (checked) next.add(id);
+        else next.delete(id);
+      }
+      return next;
+    });
+  };
+
+  // 批量删除:循环单条接口,allSettled 保证一条失败不拖垮其余。
+  const confirmBatchDelete = async () => {
+    const ids = Array.from(checkedIds);
+    setBatchDeleting(true);
+    try {
+      const results = await Promise.allSettled(ids.map((id) => api.deleteWordbook(id)));
+      const ok = results.filter((r) => r.status === "fulfilled").length;
+      const failed = results.length - ok;
+      if (failed === 0) toast.success(`已删除 ${ok} 项`);
+      else toast.warning(`成功 ${ok} 项，失败 ${failed} 项`);
+      setCheckedIds(new Set());
+      load();
+    } finally {
+      setBatchDeleting(false);
+      setBatchDeleteOpen(false);
+    }
+  };
+
   const doUpload = async () => {
     if (!uploadFile) { toast.error("请选择文件"); return; }
     setUploading(true);
@@ -197,6 +247,12 @@ export default function WordbooksPage() {
           <p className="text-muted-foreground text-sm">上传子域字典/路径字典等枚举弹药;.txt 每行一条,# 注释</p>
         </div>
         <div className="flex items-center gap-2">
+          {checkedIds.size > 0 && (
+            <Button variant="destructive" size="sm" onClick={() => setBatchDeleteOpen(true)}>
+              <Trash2Icon className="size-4" />
+              删除已选 (<span className="tabular-nums">{checkedIds.size}</span>)
+            </Button>
+          )}
           <Button variant="outline" size="sm" onClick={() => void load()}><RefreshCwIcon className="size-4" />刷新</Button>
           <Button size="sm" onClick={() => setUploadOpen(true)}>
             <UploadIcon className="size-4" />
@@ -240,19 +296,33 @@ export default function WordbooksPage() {
         </div>
         <Table>
           <TableHeader><TableRow>
+            <TableHead className="w-8">
+              <Checkbox
+                checked={allChecked ? true : someChecked ? "indeterminate" : false}
+                onCheckedChange={(v) => toggleAllPage(v === true)}
+                aria-label="全选当前页字典"
+              />
+            </TableHead>
             <TableHead>名称</TableHead><TableHead className="w-28">类型</TableHead>
             <TableHead className="w-20 text-right">条数</TableHead><TableHead className="w-20 text-right">大小</TableHead>
             <TableHead className="w-44">上传时间</TableHead><TableHead className="w-32 text-right">操作</TableHead>
           </TableRow></TableHeader>
           <TableBody>
             {loading ? (
-              <TableRow><TableCell colSpan={6} className="text-muted-foreground py-8 text-center">加载中…</TableCell></TableRow>
+              <TableRow><TableCell colSpan={7} className="text-muted-foreground py-8 text-center">加载中…</TableCell></TableRow>
             ) : filtered.length === 0 ? (
-              <TableRow><TableCell colSpan={6} className="text-muted-foreground py-8 text-center">
+              <TableRow><TableCell colSpan={7} className="text-muted-foreground py-8 text-center">
                 {books.length === 0 ? "还没有字典,点「上传字典」开始" : "没有匹配的字典"}
               </TableCell></TableRow>
             ) : paged.map((wb) => (
-              <TableRow key={wb.id}>
+              <TableRow key={wb.id} className={checkedIds.has(wb.id) ? "bg-muted/40" : undefined}>
+                <TableCell className="w-8" onClick={(e) => e.stopPropagation()}>
+                  <Checkbox
+                    checked={checkedIds.has(wb.id)}
+                    onCheckedChange={(v) => toggleRow(wb.id, v === true)}
+                    aria-label={`选择字典 ${wb.name}`}
+                  />
+                </TableCell>
                 <TableCell className="font-medium">{wb.name}</TableCell>
                 <TableCell><Badge variant="secondary" className="text-xs">{WORDBOOK_KIND_LABEL[wb.kind] ?? wb.kind}</Badge></TableCell>
                 <TableCell className="text-right tabular-nums text-sm">{wb.line_count}</TableCell>
@@ -305,6 +375,32 @@ export default function WordbooksPage() {
           />
         )}
       </CardContent></Card>
+
+      {/* 批量删除确认:兄弟节点渲染,不进三元链。 */}
+      <AlertDialog open={batchDeleteOpen} onOpenChange={setBatchDeleteOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>确认批量删除字典</AlertDialogTitle>
+            <AlertDialogDescription>
+              将永久删除选中的 <span className="font-semibold tabular-nums">{checkedIds.size}</span>{" "}
+              个字典文件，引用它们的收集器任务需重新选择字典；此操作不可撤销。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={batchDeleting}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                e.preventDefault();
+                void confirmBatchDelete();
+              }}
+              disabled={batchDeleting}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {batchDeleting ? "删除中…" : "确认删除"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {/* 上传对话框 */}
       <Dialog open={uploadOpen} onOpenChange={setUploadOpen}>

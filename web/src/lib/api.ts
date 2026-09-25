@@ -645,10 +645,12 @@ export const api = {
     get<Record<string, number>>(`/assets/counts${taskId ? `?task_id=${encodeURIComponent(taskId)}` : ""}`),
   // 导入资产文件（txt/csv/xlsx，≤10MB）：后端解析入库并按各企业资产范围自动归属。
   // FormData 直接走 http()——helper 对 FormData 不会覆盖 multipart Content-Type（见其内部注释）。
-  // 本次不做任务关联，task_id 不传。
-  importAssets: (file: File) => {
+  // 传 companyId 时把本次导入的资产强制归属到该企业（企业详情页「导入资产」用），
+  // 不传则走后端范围自动认领；task_id 均不传（本次不做任务关联）。
+  importAssets: (file: File, companyId?: number) => {
     const fd = new FormData();
     fd.append("file", file);
+    if (companyId && companyId > 0) fd.append("company_id", String(companyId));
     return http<AssetImportResult>("/assets/import", { method: "POST", body: fd });
   },
   deleteAssets: (ids: number[]) =>
@@ -1739,6 +1741,8 @@ export const api = {
     sp.set("size", String(params?.size ?? 50));
     return get<{ commands: CommandRecord[]; total: number }>(`/commands?${sp}`);
   },
+  // 按记录 id 批量删除工具执行记录（勾选删除/批量清理用；传单个 id 即单删）。
+  deleteCommands: (ids: number[]) => del<{ deleted: number }>("/commands", { ids }),
   // 各工具调用次数；沿用列表的 task/q 筛选，统计的是整个结果集而非当前页。
   commandStats: (params?: { task?: string; q?: string }) => {
     const sp = new URLSearchParams();
@@ -1760,6 +1764,8 @@ export const api = {
   llmRecordDetail: (id: number) => get<LLMRecordDetail>(`/llm/records/${id}`),
   llmTasks: () => get<{ tasks: LLMTask[] }>(`/llm/records/tasks`),
   llmRecordsDeleteTask: (task: string) => del<{ deleted: number }>(`/llm/records?task=${encodeURIComponent(task)}`),
+  // 按记录 id 批量删除 LLM 调用记录（勾选删除/批量清理用；传单个 id 即单删）。
+  deleteLlmRecords: (ids: number[]) => del<{ deleted: number }>("/llm/records", { ids }),
   // 按模型聚合本任务的 token 用量（来自常开的 llm_usage 计量账本，逐次调用精确，
   // per-agent 绑定 / 轮询 / 中断消耗都覆盖）。
   tokensByModel: (task: string) =>

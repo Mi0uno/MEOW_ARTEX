@@ -19,6 +19,16 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -29,6 +39,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -111,6 +122,24 @@ export default function ReportTemplatesPage() {
   const [uploadOpen, setUploadOpen] = React.useState(false);
   const [editing, setEditing] = React.useState<ReportTemplate | null>(null);
 
+  // 行多选(选中集跨筛选/翻页保留):全选只作用于当前页;批量执行时已不存在的
+  // id 自然失败并计入失败数,无需专门收敛。
+  const [checkedIds, setCheckedIds] = React.useState<Set<number>>(new Set());
+  const [deleting, setDeleting] = React.useState(false);
+  const [confirmOpen, setConfirmOpen] = React.useState(false);
+
+  const toggleChecked = (id: number, checked: boolean) => {
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  };
+
+  const allSelected = templates.length > 0 && templates.every((t) => checkedIds.has(t.id));
+  const someSelected = !allSelected && templates.some((t) => checkedIds.has(t.id));
+
   const queryRef = React.useRef(query);
   queryRef.current = query;
   const categoryRef = React.useRef(category);
@@ -154,6 +183,25 @@ export default function ReportTemplatesPage() {
       load(category, queryRef.current, offset);
     } catch (e) {
       toast.error(`删除失败:${(e as Error).message}`);
+    }
+  };
+
+  // 批量删除已选模板:并行逐个调删除接口,统计成功/失败后清空选择并用页面
+  // 既有的 load() 刷新(识别中状态的 3s 轮询也走同一函数,互不干扰)。
+  const batchDelete = async () => {
+    const ids = [...checkedIds];
+    setDeleting(true);
+    try {
+      const rs = await Promise.allSettled(ids.map((id) => api.deleteReportTemplate(id)));
+      const ok = rs.filter((r) => r.status === "fulfilled").length;
+      const fail = rs.length - ok;
+      if (fail === 0) toast.success(`已删除 ${ok} 项`);
+      else toast.warning(`成功 ${ok} 项，失败 ${fail} 项`);
+      setCheckedIds(new Set());
+      setConfirmOpen(false);
+      load(category, queryRef.current, offset);
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -208,6 +256,12 @@ export default function ReportTemplatesPage() {
               </SelectGroup>
             </SelectContent>
           </Select>
+          {checkedIds.size > 0 && (
+            <Button variant="destructive" size="sm" disabled={deleting} onClick={() => setConfirmOpen(true)}>
+              <Trash2Icon className="size-4" />
+              删除已选 ({checkedIds.size})
+            </Button>
+          )}
           <span className="text-muted-foreground ml-auto text-xs tabular-nums">共 {total} 个</span>
         </div>
 
@@ -220,6 +274,22 @@ export default function ReportTemplatesPage() {
             <Table>
               <TableHeader>
                 <TableRow className="hover:bg-transparent">
+                  <TableHead className="w-8">
+                    <Checkbox
+                      checked={allSelected ? true : someSelected ? "indeterminate" : false}
+                      onCheckedChange={(v) =>
+                        setCheckedIds((prev) => {
+                          const next = new Set(prev);
+                          for (const t of templates) {
+                            if (v === true) next.add(t.id);
+                            else next.delete(t.id);
+                          }
+                          return next;
+                        })
+                      }
+                      aria-label="全选本页"
+                    />
+                  </TableHead>
                   <TableHead className="w-36">分类</TableHead>
                   <TableHead>名称</TableHead>
                   <TableHead className="w-20">格式</TableHead>
@@ -231,6 +301,13 @@ export default function ReportTemplatesPage() {
               <TableBody>
                 {templates.map((t) => (
                   <TableRow key={t.id}>
+                    <TableCell className="w-8" onClick={(e) => e.stopPropagation()}>
+                      <Checkbox
+                        checked={checkedIds.has(t.id)}
+                        onCheckedChange={(v) => toggleChecked(t.id, v === true)}
+                        aria-label={`选择 ${t.name}`}
+                      />
+                    </TableCell>
                     <TableCell>
                       {t.category ? (
                         <Badge variant="outline" className="text-xs">
@@ -296,6 +373,30 @@ export default function ReportTemplatesPage() {
           </>
         )}
       </div>
+
+      {/* 批量删除确认:兄弟节点,不进上方三元链。 */}
+      <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>确认删除</AlertDialogTitle>
+            <AlertDialogDescription>
+              将删除已选的 {checkedIds.size} 个模板,该操作不可恢复。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleting}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={deleting}
+              onClick={(e) => {
+                e.preventDefault(); // 删除完成后再关弹层,期间确认按钮呈禁用态
+                void batchDelete();
+              }}
+            >
+              {deleting ? "删除中…" : "删除"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <UploadDialog
         open={uploadOpen}

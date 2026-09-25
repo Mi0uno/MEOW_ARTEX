@@ -31,6 +31,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
@@ -85,6 +86,31 @@ export default function LLMRecordsPage() {
   const [deleteTarget, setDeleteTarget] = React.useState("");
   const [deleteOpen, setDeleteOpen] = React.useState(false);
   const [deleting, setDeleting] = React.useState(false);
+
+  // 行级勾选批量删除:按记录 id 记勾选,跨页保留;命名避开任务级删除的 delete* 一族。
+  const [checkedIds, setCheckedIds] = React.useState<Set<number>>(() => new Set());
+  const [bulkDeleteOpen, setBulkDeleteOpen] = React.useState(false);
+  const [bulkDeleting, setBulkDeleting] = React.useState(false);
+
+  const toggleChecked = (id: number, checked: boolean) => {
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  };
+
+  const toggleCheckedPage = (ids: number[], checked: boolean) => {
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      for (const id of ids) {
+        if (checked) next.add(id);
+        else next.delete(id);
+      }
+      return next;
+    });
+  };
 
   // Load recording toggle state on mount.
   React.useEffect(() => {
@@ -239,7 +265,37 @@ export default function LLMRecordsPage() {
     toast[ok ? "success" : "error"](ok ? `已复制${label}` : "复制失败，请手动选择文本复制");
   };
 
+  // 批量删除勾选的记录:后端按 id 集合一次删除,返回实际删除数;部分失败按返回数汇报。
+  const confirmBulkDelete = () => {
+    const ids = [...checkedIds];
+    if (ids.length === 0) return;
+    setBulkDeleting(true);
+    api
+      .deleteLlmRecords(ids)
+      .then((r) => {
+        const deleted = r?.deleted ?? ids.length;
+        const failed = ids.length - deleted;
+        if (failed > 0) toast.warning(`成功 ${deleted} 失败 ${failed}`);
+        else toast.success(`已删除 ${deleted} 项`);
+        setCheckedIds(new Set());
+        setBulkDeleteOpen(false);
+        setReloadTick((t) => t + 1);
+      })
+      .catch((e) => toast.error(`删除失败:${(e as Error).message}`))
+      .finally(() => setBulkDeleting(false));
+  };
+
   const deleteCount = tasks.find((t) => t.task_id === deleteTarget)?.count;
+
+  // 表头全选的范围 = 当前页可见行(shown):客户端筛选隐藏的行不进全选,避免删到看不见的记录。
+  const shownIds = shown.map((r) => r.id);
+  const checkedOnPage = shownIds.filter((id) => checkedIds.has(id)).length;
+  let pageHeaderChecked: boolean | "indeterminate" = false;
+  if (shownIds.length > 0 && checkedOnPage === shownIds.length) {
+    pageHeaderChecked = true;
+  } else if (checkedOnPage > 0) {
+    pageHeaderChecked = "indeterminate";
+  }
 
   // 列表三态在 JSX 外算好:嵌套三元既难读又触发 noNestedTernary,而且「确实没有记录」
   // 与「搜索无命中」必须给出不同出口(后者要提示放宽筛选),不能共用一个空态。
@@ -278,6 +334,13 @@ export default function LLMRecordsPage() {
         <Table className="table-fixed">
           <TableHeader>
             <TableRow className="hover:bg-transparent">
+              <TableHead className="w-8">
+                <Checkbox
+                  checked={pageHeaderChecked}
+                  onCheckedChange={(v) => toggleCheckedPage(shownIds, v === true)}
+                  aria-label="选择当前页全部"
+                />
+              </TableHead>
               <TableHead className="w-36">时间</TableHead>
               <TableHead className="w-40">模型</TableHead>
               <TableHead className="w-32">任务 / 会话</TableHead>
@@ -293,6 +356,13 @@ export default function LLMRecordsPage() {
               const copyLabel = rec.session_id ? "会话 ID" : "任务 ID";
               return (
                 <TableRow key={rec.id}>
+                  <TableCell onClick={(e) => e.stopPropagation()}>
+                    <Checkbox
+                      checked={checkedIds.has(rec.id)}
+                      onCheckedChange={(v) => toggleChecked(rec.id, v === true)}
+                      aria-label="选择该记录"
+                    />
+                  </TableCell>
                   <TableCell className="text-muted-foreground text-xs tabular-nums">{fmtTime(rec.ts)}</TableCell>
                   {/* 模型列即主入口:点进详情页看完整请求 / 响应 */}
                   <TableCell className="min-w-0">
@@ -496,6 +566,19 @@ export default function LLMRecordsPage() {
               删除任务对话
             </Button>
 
+            {/* 行级批量删除:只作用于勾选的记录,与上面的任务级整删互不影响。 */}
+            {checkedIds.size > 0 && (
+              <Button
+                variant="destructive"
+                size="sm"
+                disabled={bulkDeleting}
+                onClick={() => setBulkDeleteOpen(true)}
+              >
+                <Trash2Icon className="size-4" />
+                删除已选 (<span className="tabular-nums">{checkedIds.size}</span>)
+              </Button>
+            )}
+
             <span className="text-muted-foreground ml-auto text-xs tabular-nums">
               {clientFiltered
                 ? `本页 ${shown.length} / 共 ${total} 条`
@@ -528,6 +611,35 @@ export default function LLMRecordsPage() {
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
             >
               {deleting ? "删除中…" : "确认删除"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog
+        open={bulkDeleteOpen}
+        onOpenChange={(open) => {
+          if (!bulkDeleting) setBulkDeleteOpen(open);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>删除已选中的 {checkedIds.size} 条 LLM 记录？</AlertDialogTitle>
+            <AlertDialogDescription>
+              将永久删除选中的 {checkedIds.size} 条 LLM 调用记录（含请求 / 响应原文），此操作不可撤销。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={bulkDeleting}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                e.preventDefault();
+                confirmBulkDelete();
+              }}
+              disabled={bulkDeleting}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {bulkDeleting ? "删除中…" : "确认删除"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

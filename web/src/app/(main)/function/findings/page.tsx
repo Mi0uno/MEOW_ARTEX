@@ -13,10 +13,21 @@ import {
   InfoIcon,
   SearchIcon,
   ShieldAlertIcon,
+  Trash2Icon,
   TriangleAlertIcon,
 } from "lucide-react";
 import { toast } from "sonner";
 
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { FindingRetestDialog } from "@/components/finding-retest-dialog";
 import { StatusBadge } from "@/components/status-badge";
 import { TablePagination } from "@/components/table-pagination";
@@ -726,6 +737,65 @@ export default function FindingsPage() {
     [refreshAfterMutation, setFindings],
   );
 
+  // 批量删除:复用单行删除的 api.deleteFinding(逐条 allSettled,部分失败可计数),
+  // 成功的项照单行删除的语义从 selectedIds 移除,失败的保留勾选以便重试。
+  const [bulkDeleteOpen, setBulkDeleteOpen] = React.useState(false);
+  const [deletingSelected, setDeletingSelected] = React.useState(false);
+
+  // 批量删除后的刷新:一次可能跨多个任务/组,所以平铺/资产视图重拉当前页
+  // (资产视图还要重算树),分组视图刷组头并重载每个已展开的组。
+  const refreshAfterBulkDelete = React.useCallback(() => {
+    if (view === "flat") {
+      void loadFlat();
+      return;
+    }
+    if (view === "asset") {
+      void loadFlat();
+      void loadAssetTree();
+      return;
+    }
+    void refreshGroups();
+    for (const key of expandedGroupsRef.current) {
+      if (!visibleGroupKeysRef.current.has(key)) continue;
+      const state = groupFindingsRef.current[key];
+      if (state?.loaded && !state.loading) void loadGroup(key, state.page, state.pageSize);
+    }
+  }, [loadAssetTree, loadFlat, loadGroup, refreshGroups, view]);
+
+  const deleteSelected = React.useCallback(async () => {
+    const ids = [...selectedIds];
+    if (ids.length === 0) return;
+    setDeletingSelected(true);
+    try {
+      const results = await Promise.allSettled(ids.map((id) => api.deleteFinding(id)));
+      const deleted = ids.filter((_, i) => results[i]?.status === "fulfilled");
+      const failed = ids.length - deleted.length;
+      if (deleted.length > 0) {
+        setSelectedIds((current) => {
+          const next = new Set(current);
+          for (const id of deleted) next.delete(id);
+          return next;
+        });
+        // 展开中的行若被删除,顺手收起(行键形如 finding:<id>)。
+        setExpanded((cur) =>
+          cur?.startsWith("finding:") && deleted.includes(cur.slice("finding:".length)) ? null : cur,
+        );
+        api
+          .findingStats()
+          .then(setStats)
+          .catch(() => {
+            // The deletion remains valid even if the aggregate refresh fails.
+          });
+      }
+      setBulkDeleteOpen(false);
+      if (failed === 0) toast.success(`已删除 ${deleted.length} 项`);
+      else toast.warning(`成功 ${deleted.length} 失败 ${failed}`);
+      refreshAfterBulkDelete();
+    } finally {
+      setDeletingSelected(false);
+    }
+  }, [refreshAfterBulkDelete, selectedIds]);
+
   const openDeepen = React.useCallback((f: Finding) => {
     setDeepenFinding(f);
     setDeepenDescription("");
@@ -952,6 +1022,16 @@ export default function FindingsPage() {
           <div className="ml-auto flex items-center gap-3">
             {selectedIds.size > 0 && (
               <span className="text-xs text-muted-foreground tabular-nums">已选 {selectedIds.size} 条</span>
+            )}
+            {selectedIds.size > 0 && (
+              <Button
+                size="sm"
+                variant="destructive"
+                disabled={deletingSelected}
+                onClick={() => setBulkDeleteOpen(true)}
+              >
+                <Trash2Icon /> 删除已选 (<span className="tabular-nums">{selectedIds.size}</span>)
+              </Button>
             )}
             <Button size="sm" variant="outline" onClick={openExport}>
               <DownloadIcon /> 导出
@@ -1258,6 +1338,36 @@ export default function FindingsPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <AlertDialog
+        open={bulkDeleteOpen}
+        onOpenChange={(open) => {
+          if (!deletingSelected) setBulkDeleteOpen(open);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>删除已选中的 {selectedIds.size} 项发现？</AlertDialogTitle>
+            <AlertDialogDescription className="break-words">
+              将永久删除选中的 {selectedIds.size} 项发现，并级联删除对应的探索节点，同时从发现列表、任务发现 Tab
+              与探索图中移除，此操作不可撤销。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deletingSelected}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                e.preventDefault();
+                void deleteSelected();
+              }}
+              disabled={deletingSelected}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {deletingSelected ? "删除中…" : "确认删除"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

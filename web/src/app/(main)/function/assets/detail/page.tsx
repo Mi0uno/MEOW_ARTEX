@@ -25,6 +25,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import {
   Select,
@@ -39,6 +40,7 @@ import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { AssetImportDialog } from "@/components/asset-import-dialog";
 import { ReconGraph } from "@/components/recon-graph";
 import { assetsToTaskGraph } from "@/components/asset-graph";
 import { StatusBadge } from "@/components/status-badge";
@@ -169,8 +171,28 @@ function CompanyDetailInner({ companyId }: { companyId: number }) {
     });
   };
 
+  // 单行删除：走与批量删除相同的硬删除接口，成功后把该 id 从选中集合摘掉再刷新。
+  const deleteOne = async (id: number) => {
+    try {
+      await api.deleteAssets([id]);
+      toast.success("已删除 1 个资产");
+      setSelected((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+      load();
+    } catch (e) {
+      toast.error(`删除失败：${(e as Error).message}`);
+    }
+  };
+
   const typeCounts = new Map<string, number>();
   for (const a of assets) typeCounts.set(a.type, (typeCounts.get(a.type) ?? 0) + 1);
+
+  // 全选范围 = 当前筛选后的行集合（与资产主页按当前页全选的语义一致）。
+  const allFilteredSelected = filtered.length > 0 && filtered.every((a) => selected.has(a.id));
+  const someFilteredSelected = filtered.some((a) => selected.has(a.id));
 
   if (!company) {
     return (
@@ -272,7 +294,9 @@ function CompanyDetailInner({ companyId }: { companyId: number }) {
                 <span className="text-muted-foreground text-xs tabular-nums">
                   {filtered.length}/{assets.length} 条
                 </span>
-                <div className="ml-auto">
+                <div className="ml-auto flex items-center gap-2">
+                  {/* 给该企业上传文件添加资产：导入结果强制归属当前企业，关闭后刷新列表 */}
+                  <AssetImportDialog companyId={company.id} onImported={load} />
                   <AlertDialog>
                     <AlertDialogTrigger asChild>
                       <Button variant="outline" size="sm" disabled={selected.size === 0}>
@@ -307,25 +331,31 @@ function CompanyDetailInner({ companyId }: { companyId: number }) {
                     <TableHeader>
                       <TableRow>
                         <TableHead className="w-10">
-                          <input
-                            type="checkbox"
-                            checked={selected.size > 0 && selected.size === filtered.length}
-                            onChange={(e) =>
-                              setSelected(e.target.checked ? new Set(filtered.map((a) => a.id)) : new Set())
+                          {/* checkbox 自身就是按钮，点击不会带出行上其他语义（本页行无跳转） */}
+                          <Checkbox
+                            checked={allFilteredSelected ? true : someFilteredSelected ? "indeterminate" : false}
+                            onCheckedChange={(checked) =>
+                              setSelected(checked === true ? new Set(filtered.map((a) => a.id)) : new Set())
                             }
+                            aria-label="全选当前筛选结果"
                           />
                         </TableHead>
                         <TableHead className="w-24">类型</TableHead>
                         <TableHead>值</TableHead>
                         <TableHead className="w-40">说明</TableHead>
                         <TableHead className="w-40">最近活跃</TableHead>
+                        <TableHead className="w-10" />
                       </TableRow>
                     </TableHeader>
                     <TableBody>
                       {filtered.map((a) => (
                         <TableRow key={a.id}>
-                          <TableCell>
-                            <input type="checkbox" checked={selected.has(a.id)} onChange={() => toggle(a.id)} />
+                          <TableCell className="w-10 pr-0">
+                            <Checkbox
+                              checked={selected.has(a.id)}
+                              onCheckedChange={() => toggle(a.id)}
+                              aria-label={`选择资产 ${assetValue(a)}`}
+                            />
                           </TableCell>
                           <TableCell>
                             <Badge variant="secondary" className="text-xs">
@@ -337,6 +367,32 @@ function CompanyDetailInner({ companyId }: { companyId: number }) {
                             {a.page_title || a.service_name || a.service_type || a.icp || "—"}
                           </TableCell>
                           <TableCell className="text-muted-foreground text-xs">{fmtTime(a.last_seen)}</TableCell>
+                          <TableCell className="w-10 pl-0 text-right">
+                            <AlertDialog>
+                              <AlertDialogTrigger asChild>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="size-7 text-muted-foreground hover:text-destructive"
+                                  aria-label={`删除资产 ${assetValue(a)}`}
+                                >
+                                  <Trash2Icon className="size-3.5" />
+                                </Button>
+                              </AlertDialogTrigger>
+                              <AlertDialogContent>
+                                <AlertDialogHeader>
+                                  <AlertDialogTitle>删除该资产?</AlertDialogTitle>
+                                  <AlertDialogDescription>
+                                    从全局资产库硬删除 {assetValue(a)}，不可撤销；关联任务中的引用将失效。
+                                  </AlertDialogDescription>
+                                </AlertDialogHeader>
+                                <AlertDialogFooter>
+                                  <AlertDialogCancel>取消</AlertDialogCancel>
+                                  <AlertDialogAction onClick={() => void deleteOne(a.id)}>删除</AlertDialogAction>
+                                </AlertDialogFooter>
+                              </AlertDialogContent>
+                            </AlertDialog>
+                          </TableCell>
                         </TableRow>
                       ))}
                     </TableBody>

@@ -14,8 +14,19 @@ import { ArrowRightIcon, PencilIcon, PlusIcon, SearchIcon, ShieldAlertIcon, Tras
 import { toast } from "sonner";
 
 import { TablePagination } from "@/components/table-pagination";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -40,6 +51,14 @@ export default function SRCPlatformsPage() {
   const [loading, setLoading] = React.useState(true);
   const [editing, setEditing] = React.useState<SRCPlatform | null>(null);
   const [creating, setCreating] = React.useState(false);
+  // 行多选:只记当前页出现过的 id;三态全选按当前页行计算,翻页/筛选不清空(删除前可跨页攒选)。
+  const [checkedIds, setCheckedIds] = React.useState<Set<number>>(new Set());
+  const [batchConfirmOpen, setBatchConfirmOpen] = React.useState(false);
+  const [batchDeleting, setBatchDeleting] = React.useState(false);
+  // 当前页行(服务端分页,platforms 即本页)驱动三态全选。
+  const pageIds = React.useMemo(() => platforms.map((p) => p.id), [platforms]);
+  const allChecked = pageIds.length > 0 && pageIds.every((id) => checkedIds.has(id));
+  const someChecked = pageIds.some((id) => checkedIds.has(id));
 
   const load = React.useCallback((q: string, en: string, p: number, size: number) => {
     setLoading(true);
@@ -71,6 +90,46 @@ export default function SRCPlatformsPage() {
   };
   const reload = () => load(query, enabled, page, pageSize);
 
+  // 行首勾选:v 是显式 checked 语义(true 勾上 / false 取消)。
+  const toggleRow = (id: number, checked: boolean) => {
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  };
+
+  // 表头全选:indeterminate 状态点击上报 true → 全选当前页;已全选点击上报 false → 清当前页。
+  const toggleAllPage = (checked: boolean) => {
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      for (const id of pageIds) {
+        if (checked) next.add(id);
+        else next.delete(id);
+      }
+      return next;
+    });
+  };
+
+  // 批量删除:逐条走单删接口,allSettled 保证一条失败不拖垮其余;级联后果在确认文案里写明。
+  const confirmBatchDelete = async () => {
+    const ids = Array.from(checkedIds);
+    setBatchDeleting(true);
+    try {
+      const results = await Promise.allSettled(ids.map((id) => api.deleteSRCPlatform(id)));
+      const ok = results.filter((r) => r.status === "fulfilled").length;
+      const failed = results.length - ok;
+      if (failed === 0) toast.success(`已删除 ${ok} 项`);
+      else toast.warning(`成功 ${ok} 项，失败 ${failed} 项`);
+      setCheckedIds(new Set());
+      reload();
+    } finally {
+      setBatchDeleting(false);
+      setBatchConfirmOpen(false);
+    }
+  };
+
   const remove = async (p: SRCPlatform) => {
     if (
       !window.confirm(
@@ -97,10 +156,18 @@ export default function SRCPlatformsPage() {
             任务,防止 AI 越界。
           </p>
         </div>
-        <Button size="sm" onClick={() => setCreating(true)}>
-          <PlusIcon className="size-4" />
-          新建平台
-        </Button>
+        <div className="flex items-center gap-2">
+          {checkedIds.size > 0 && (
+            <Button variant="destructive" size="sm" onClick={() => setBatchConfirmOpen(true)}>
+              <Trash2Icon className="size-4" />
+              删除已选 (<span className="tabular-nums">{checkedIds.size}</span>)
+            </Button>
+          )}
+          <Button size="sm" onClick={() => setCreating(true)}>
+            <PlusIcon className="size-4" />
+            新建平台
+          </Button>
+        </div>
       </div>
 
       <Card>
@@ -161,8 +228,16 @@ export default function SRCPlatformsPage() {
                 <TableHeader>
                   <TableRow className="hover:bg-transparent">
                     {/* 平台名列不设宽度:table-fixed 下自动吃掉余量(设 w-full 会挤掉后面的列)。
-                        其余固定列之和 688px(80+80+96+80+96+144+112),容器约 897px(1280 视口),
-                        名字列留得下十几字;再多一列就要重新分配,否则名字会被压到看不见。 */}
+                        其余固定列之和 720px(32+80+80+96+80+96+144+112,含行首勾选列 w-8),
+                        容器约 897px(1280 视口),名字列仍剩 ~177px;再加列就要重新分配,
+                        否则名字会被压到看不见。 */}
+                    <TableHead className="w-8">
+                      <Checkbox
+                        checked={allChecked ? true : someChecked ? "indeterminate" : false}
+                        onCheckedChange={(v) => toggleAllPage(v === true)}
+                        aria-label="全选当前页平台"
+                      />
+                    </TableHead>
                     <TableHead>平台名称</TableHead>
                     <TableHead className="w-20">目标数</TableHead>
                     <TableHead className="w-20">资产数</TableHead>
@@ -175,7 +250,14 @@ export default function SRCPlatformsPage() {
                 </TableHeader>
                 <TableBody>
                   {platforms.map((p) => (
-                    <TableRow key={p.id}>
+                    <TableRow key={p.id} className={checkedIds.has(p.id) ? "bg-muted/40" : undefined}>
+                      <TableCell className="w-8" onClick={(e) => e.stopPropagation()}>
+                        <Checkbox
+                          checked={checkedIds.has(p.id)}
+                          onCheckedChange={(v) => toggleRow(p.id, v === true)}
+                          aria-label={`选择平台 ${p.name}`}
+                        />
+                      </TableCell>
                       {/* 平台名即入口:进入详情页挂目标、传规范附件、看成果。 */}
                       <TableCell className="min-w-0">
                         <Link
@@ -248,6 +330,32 @@ export default function SRCPlatformsPage() {
           reload();
         }}
       />
+
+      {/* 批量删除确认:兄弟节点渲染,不进三元链。级联后果(挂链与规范附件)写明。 */}
+      <AlertDialog open={batchConfirmOpen} onOpenChange={setBatchConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>确认批量删除平台</AlertDialogTitle>
+            <AlertDialogDescription>
+              将永久删除选中的 <span className="font-semibold tabular-nums">{checkedIds.size}</span>{" "}
+              个平台，平台下的目标挂链与规范附件将一并删除；目标本身与其他平台的关联不受影响。此操作不可撤销。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={batchDeleting}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                e.preventDefault();
+                void confirmBatchDelete();
+              }}
+              disabled={batchDeleting}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {batchDeleting ? "删除中…" : "确认删除"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

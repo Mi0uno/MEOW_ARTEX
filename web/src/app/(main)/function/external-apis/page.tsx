@@ -30,6 +30,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -75,6 +76,10 @@ export default function ExternalApisPage() {
   const [statusFilter, setStatusFilter] = React.useState("all");
   const [page, setPage] = React.useState(1);
   const [pageSize, setPageSize] = React.useState(20);
+  // 行多选 + 批量删除/启停:范围是当前页(paged);实体量小,批量直接循环单条接口。
+  const [checkedIds, setCheckedIds] = React.useState<Set<number>>(new Set());
+  const [batchDeleteOpen, setBatchDeleteOpen] = React.useState(false);
+  const [busyBatch, setBusyBatch] = React.useState(false);
 
   const filtered = React.useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -149,6 +154,67 @@ export default function ExternalApisPage() {
       .catch((e) => toast.error(`删除失败：${e.message}`));
   };
 
+  // 当前页行(客户端分页,paged 即本页)驱动三态全选。
+  const pageIds = React.useMemo(() => paged.map((a) => a.id), [paged]);
+  const allChecked = pageIds.length > 0 && pageIds.every((id) => checkedIds.has(id));
+  const someChecked = pageIds.some((id) => checkedIds.has(id));
+
+  // 行首勾选:v 是显式 checked 语义(true 勾上 / false 取消)。
+  const toggleRow = (id: number, checked: boolean) => {
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  };
+
+  // 表头全选:indeterminate 状态点击上报 true → 全选当前页;已全选点击上报 false → 清当前页。
+  const toggleAllPage = (checked: boolean) => {
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      for (const id of pageIds) {
+        if (checked) next.add(id);
+        else next.delete(id);
+      }
+      return next;
+    });
+  };
+
+  // 批量启停:循环 updateExternalApi,allSettled 保证一条失败不拖垮其余;完成后保留选择便于连续操作。
+  const setBatchEnabled = async (enabled: boolean) => {
+    const ids = Array.from(checkedIds);
+    setBusyBatch(true);
+    try {
+      const results = await Promise.allSettled(ids.map((id) => api.updateExternalApi(id, { enabled })));
+      const ok = results.filter((r) => r.status === "fulfilled").length;
+      const failed = results.length - ok;
+      if (failed === 0) toast.success(enabled ? `已启用 ${ok} 项` : `已停用 ${ok} 项`);
+      else toast.warning(`${enabled ? "启用" : "停用"}：成功 ${ok} 项，失败 ${failed} 项`);
+      load();
+    } finally {
+      setBusyBatch(false);
+    }
+  };
+
+  // 批量删除:同款循环;全成功/有失败分别 toast,然后清空选择并刷新。
+  const confirmBatchDelete = async () => {
+    const ids = Array.from(checkedIds);
+    setBusyBatch(true);
+    try {
+      const results = await Promise.allSettled(ids.map((id) => api.deleteExternalApi(id)));
+      const ok = results.filter((r) => r.status === "fulfilled").length;
+      const failed = results.length - ok;
+      if (failed === 0) toast.success(`已删除 ${ok} 项`);
+      else toast.warning(`成功 ${ok} 项，失败 ${failed} 项`);
+      setCheckedIds(new Set());
+      load();
+    } finally {
+      setBusyBatch(false);
+      setBatchDeleteOpen(false);
+    }
+  };
+
   return (
     <div className="p-4 md:p-6">
       <div className="mb-2 flex items-center gap-2">
@@ -162,6 +228,25 @@ export default function ExternalApisPage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
+          {checkedIds.size > 0 && (
+            <>
+              <Button variant="outline" size="sm" disabled={busyBatch} onClick={() => void setBatchEnabled(true)}>
+                批量启用
+              </Button>
+              <Button variant="outline" size="sm" disabled={busyBatch} onClick={() => void setBatchEnabled(false)}>
+                批量停用
+              </Button>
+              <Button
+                variant="destructive"
+                size="sm"
+                disabled={busyBatch}
+                onClick={() => setBatchDeleteOpen(true)}
+              >
+                <Trash2Icon className="size-4" />
+                删除已选 (<span className="tabular-nums">{checkedIds.size}</span>)
+              </Button>
+            </>
+          )}
           <Button variant="outline" size="sm" onClick={() => void load()}>
             <RefreshCwIcon className="size-4" />
             刷新
@@ -204,6 +289,13 @@ export default function ExternalApisPage() {
           <Table>
             <TableHeader>
               <TableRow>
+                <TableHead className="w-8">
+                  <Checkbox
+                    checked={allChecked ? true : someChecked ? "indeterminate" : false}
+                    onCheckedChange={(v) => toggleAllPage(v === true)}
+                    aria-label="全选当前页接口"
+                  />
+                </TableHead>
                 <TableHead className="w-32">Provider</TableHead>
                 <TableHead>名称</TableHead>
                 <TableHead>凭据(掩码)</TableHead>
@@ -215,19 +307,26 @@ export default function ExternalApisPage() {
             <TableBody>
               {loading ? (
                 <TableRow>
-                  <TableCell colSpan={6} className="text-muted-foreground py-8 text-center">
+                  <TableCell colSpan={7} className="text-muted-foreground py-8 text-center">
                     加载中…
                   </TableCell>
                 </TableRow>
               ) : filtered.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={6} className="text-muted-foreground py-8 text-center">
+                  <TableCell colSpan={7} className="text-muted-foreground py-8 text-center">
                     {apis.length === 0 ? "还没有配置,点右上角「新增接口」接入 FOFA / Hunter" : "没有匹配的接口"}
                   </TableCell>
                 </TableRow>
               ) : (
                 paged.map((a) => (
-                  <TableRow key={a.id}>
+                  <TableRow key={a.id} className={checkedIds.has(a.id) ? "bg-muted/40" : undefined}>
+                    <TableCell className="w-8" onClick={(e) => e.stopPropagation()}>
+                      <Checkbox
+                        checked={checkedIds.has(a.id)}
+                        onCheckedChange={(v) => toggleRow(a.id, v === true)}
+                        aria-label={`选择接口 ${a.name}`}
+                      />
+                    </TableCell>
                     <TableCell>
                       <Badge variant="secondary" className="text-xs">
                         {a.provider_title || a.provider}
@@ -337,6 +436,32 @@ export default function ExternalApisPage() {
           )}
         </CardContent>
       </Card>
+
+      {/* 批量删除确认:兄弟节点渲染,不进三元链。 */}
+      <AlertDialog open={batchDeleteOpen} onOpenChange={setBatchDeleteOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>确认批量删除外部接口</AlertDialogTitle>
+            <AlertDialogDescription>
+              将永久删除选中的 <span className="font-semibold tabular-nums">{checkedIds.size}</span>{" "}
+              个接口配置，引用它们的步骤任务重跑时会报“接口已删除”，需要重新选择；此操作不可撤销。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={busyBatch}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                e.preventDefault();
+                void confirmBatchDelete();
+              }}
+              disabled={busyBatch}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {busyBatch ? "删除中…" : "确认删除"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {creating || editing ? (
         <ExternalApiDialog

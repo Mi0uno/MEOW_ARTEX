@@ -23,10 +23,21 @@ import (
 // POST /api/assets/import 的 multipart 请求。
 func importMultipartRequest(t *testing.T, filename, content, taskID string) *http.Request {
 	t.Helper()
+	return importMultipartRequestExt(t, filename, content, taskID, "")
+}
+
+// importMultipartRequestExt 额外支持 company_id 表单字段(契约一强制归属)。
+func importMultipartRequestExt(t *testing.T, filename, content, taskID, companyID string) *http.Request {
+	t.Helper()
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 	if taskID != "" {
 		if err := mw.WriteField("task_id", taskID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if companyID != "" {
+		if err := mw.WriteField("company_id", companyID); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -345,5 +356,119 @@ func TestImportAssetsHandler(t *testing.T) {
 	}
 	if len(resp.Errors) != 1 || resp.Errors[0].Row != 6 || resp.Errors[0].Value != "!!" || resp.Errors[0].Error != "无法识别" {
 		t.Errorf("errors = %+v, want [{6 !! 无法识别}]", resp.Errors)
+	}
+}
+
+// TestImportAssetsHandlerCompanyID 契约一:multipart 带 company_id 时本次导入的
+// 全部资产(含根域名/子域名 side effect)强制归属该企业;不存在的企业 → 400;
+// 不带/为 0 → 走自动认领(无范围匹配即无归属)。DB 集成测试,postgres 不可用自动跳过。
+func TestImportAssetsHandlerCompanyID(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v)", err)
+	}
+	defer m.Close()
+	s := &Server{m: m}
+	pg := m.PG()
+	cs := pg.Companies()
+
+	compA, err := cs.UpsertByName("导入归属测试企业A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cs.DeleteCompany(compA)                                                                   //nolint:errcheck
+	defer pg.Exec(`DELETE FROM assets WHERE domain LIKE '%impcoatest.com' OR ip = '198.51.100.77'`) //nolint:errcheck
+
+	assetCompany := func(id int64) *int64 {
+		t.Helper()
+		var cid *int64
+		if err := pg.QueryRow(`SELECT company_id FROM assets WHERE id = $1`, id).Scan(&cid); err != nil {
+			t.Fatalf("query asset %d: %v", id, err)
+		}
+		return cid
+	}
+	wantCompany := func(where string, id int64) {
+		t.Helper()
+		if cid := assetCompany(id); cid == nil || *cid != compA {
+			t.Errorf("%s company_id = %v, want %d", where, cid, compA)
+		}
+	}
+
+	// 1) 带 company_id:三条直接落库资产 + 连带的根域名/子域名 side effect 全部归 A
+	txt := "# 注释\n" +
+		"impcoa-1.impcoatest.com\n" +
+		"198.51.100.77:22\n" +
+		"http://impcoa-2.impcoatest.com:8080/login\n"
+	rec := httptest.NewRecorder()
+	s.importAssets(rec, importMultipartRequestExt(t, "assets.txt", txt, "", strconv.FormatInt(compA, 10)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("forced import status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Total    int            `json:"total"`
+		Imported int            `json:"imported"`
+		Failed   int            `json:"failed"`
+		Results  []importResult `json:"results"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Total != 3 || resp.Imported != 3 || len(resp.Results) != 3 {
+		t.Fatalf("counts = %+v, want total=3 imported=3 results=3", resp)
+	}
+	wantCompany("results[0](subdomain)", resp.Results[0].ID)
+	wantCompany("results[1](ip)", resp.Results[1].ID)
+	wantCompany("results[2](service)", resp.Results[2].ID)
+
+	// side effect:根域名(由 UpsertSubdomain/UpsertHTTPService 连带注册)也归 A
+	var rootID int64
+	if err := pg.QueryRow(`SELECT id FROM assets WHERE type = 'root_domain' AND domain = 'impcoatest.com'`).Scan(&rootID); err != nil {
+		t.Fatalf("root_domain side effect missing: %v", err)
+	}
+	wantCompany("root_domain side effect", rootID)
+	// side effect:service 的 host 子域名同样归 A
+	var hostID int64
+	if err := pg.QueryRow(`SELECT id FROM assets WHERE type = 'subdomain' AND domain = 'impcoa-2.impcoatest.com'`).Scan(&hostID); err != nil {
+		t.Fatalf("subdomain side effect missing: %v", err)
+	}
+	wantCompany("subdomain side effect", hostID)
+
+	// 2) 不存在的 company_id → 400「企业不存在」
+	rec = httptest.NewRecorder()
+	s.importAssets(rec, importMultipartRequestExt(t, "assets.txt", "impcoa-9.impcoatest.com\n", "", "999999999"))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("nonexistent company status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "企业不存在") {
+		t.Errorf("nonexistent company body = %s, want 含「企业不存在」", rec.Body.String())
+	}
+	var orphan int
+	if err := pg.QueryRow(`SELECT COUNT(*) FROM assets WHERE domain LIKE 'impcoa-9.%'`).Scan(&orphan); err != nil {
+		t.Fatal(err)
+	}
+	if orphan != 0 {
+		t.Errorf("400 后不应有落库资产, got %d", orphan)
+	}
+
+	// 3) 不带 company_id(及 "0")→ 自动认领:无范围匹配时无归属,行为不变
+	for _, caseCompanyID := range []string{"", "0"} {
+		content := "impcob-1.impcobtest.com\n"
+		rec = httptest.NewRecorder()
+		s.importAssets(rec, importMultipartRequestExt(t, "assets.txt", content, "", caseCompanyID))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("auto import (company_id=%q) status = %d, body = %s", caseCompanyID, rec.Code, rec.Body.String())
+		}
+		var r struct {
+			Results []importResult `json:"results"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &r); err != nil {
+			t.Fatal(err)
+		}
+		if len(r.Results) != 1 {
+			t.Fatalf("auto import results = %+v, want 1 条", r.Results)
+		}
+		if cid := assetCompany(r.Results[0].ID); cid != nil {
+			t.Errorf("auto import (company_id=%q) company_id = %d, want nil(无范围匹配)", caseCompanyID, *cid)
+		}
 	}
 }

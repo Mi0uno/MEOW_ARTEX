@@ -1,6 +1,9 @@
 package server
 
 import (
+	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -129,9 +132,28 @@ func (s *Server) pgLLMTasks(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"tasks": tasks})
 }
 
-// pgDeleteLLMRecords removes all LLM records for one exact task_id (the same
-// match the task picker uses). Empty task → 400. Returns rows deleted.
+// pgDeleteLLMRecords removes LLM records. 请求带 JSON body {"ids":[...]} 时按 id
+// 批量删除(body 优先,前端传单个 id 即单删);无 body 或 ids 为空时保持 ?task=
+// 旧行为:删除一个精确 task_id 的全部记录(与任务选择器同一匹配)。空 task → 400。
+// 响应均为 {"deleted": N}。
 func (s *Server) pgDeleteLLMRecords(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		IDs []int64 `json:"ids"`
+	}
+	// 无 body(EOF)不算错——回落 ?task= 旧行为;坏 JSON 才 400。
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeErr(w, 400, "invalid JSON: "+err.Error())
+		return
+	}
+	if len(body.IDs) > 0 {
+		n, err := s.m.PG().DeleteLLMRecordsByIDs(body.IDs)
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]any{"deleted": n})
+		return
+	}
 	task := strings.TrimSpace(r.URL.Query().Get("task"))
 	if task == "" {
 		writeErr(w, 400, "missing task")
@@ -143,6 +165,28 @@ func (s *Server) pgDeleteLLMRecords(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"deleted": n})
+}
+
+// pgDeleteCommands removes tool-execution records by id (JSON body {"ids":[...]}).
+// ids 为空 → 400。Returns rows deleted.
+func (s *Server) pgDeleteCommands(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		IDs []int64 `json:"ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, 400, "invalid JSON: "+err.Error())
+		return
+	}
+	if len(body.IDs) == 0 {
+		writeErr(w, 400, "ids required")
+		return
+	}
+	deleted, err := s.m.PG().DeleteCommands(body.IDs)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"deleted": deleted})
 }
 
 // pgGetLLMRecord returns a single LLM record with full request/response bodies.
