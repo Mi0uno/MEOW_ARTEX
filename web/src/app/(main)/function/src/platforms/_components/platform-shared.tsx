@@ -8,6 +8,9 @@
 
 import * as React from "react";
 
+import { Loader2Icon, SparklesIcon, UploadIcon } from "lucide-react";
+
+import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
@@ -87,15 +90,64 @@ export function SpecTextarea({
   value,
   onChange,
   rows = 4,
+  onUploadFile,
+  uploading = false,
+  onPolish,
+  polishing = false,
 }: {
   field: (typeof SPEC_FIELDS)[number];
   value: string;
   onChange: (v: string) => void;
   rows?: number;
+  /** 上传识别:解析出的正文回填文本框(纯解析不存档);缺省 = 不显示该按钮 */
+  onUploadFile?: (file: File) => void;
+  uploading?: boolean;
+  /** AI 润色:把当前文本框内容交 LLM 润色后回填;缺省 = 不显示该按钮 */
+  onPolish?: () => void;
+  polishing?: boolean;
 }) {
+  // 每个文本域独享一个隐藏 input:四块共用一个 ref 会互相抢 file chooser。
+  const inputRef = React.useRef<HTMLInputElement>(null);
+  const hasValue = value.trim().length > 0;
   return (
     <Field label={field.label}>
       <Textarea value={value} onChange={(e) => onChange(e.target.value)} placeholder={field.placeholder} rows={rows} />
+      {/* 两个按钮紧贴各字段:上传识别=文件正文进本框;AI 润色=只改措辞不改事实。
+          润色要求框里有内容;上传按钮始终可用(空文件由后端拒绝)。 */}
+      <div className="flex flex-wrap items-center gap-2">
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          disabled={uploading || polishing}
+          onClick={() => inputRef.current?.click()}
+        >
+          <UploadIcon className="size-3.5" />
+          {uploading ? "识别中…" : "上传识别"}
+        </Button>
+        <input
+          ref={inputRef}
+          type="file"
+          hidden
+          accept=".md,.markdown,.txt,.docx,.xlsx,.pdf"
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            if (f) onUploadFile?.(f);
+            e.target.value = "";
+          }}
+        />
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          disabled={polishing || uploading || !hasValue}
+          title={hasValue ? "AI 润色当前内容(只改措辞不改事实)" : "请先填写内容或上传文件"}
+          onClick={() => onPolish?.()}
+        >
+          {polishing ? <Loader2Icon className="size-3.5 animate-spin" /> : <SparklesIcon className="size-3.5" />}
+          {polishing ? "润色中…" : "AI 润色"}
+        </Button>
+      </div>
       <p className="text-muted-foreground text-xs">{field.hint}</p>
     </Field>
   );

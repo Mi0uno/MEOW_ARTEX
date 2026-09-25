@@ -469,3 +469,78 @@ func (s *Server) updateSRCPlatformFile(w http.ResponseWriter, r *http.Request) {
 		platformID, platform.Name, fileID, row.Filename, kind)
 	writeJSON(w, 200, map[string]any{"file": row})
 }
+
+// parseSpecFile POST /api/src/platforms/spec/parse-file(multipart: file)
+//
+// 纯解析端点:上传 → 抽文本 → 返回 {text, parse_status, note},**不落盘存档、不建附件行**。
+// 服务「规范文本框旁的上传识别按钮」——用户把文件正文直接填进某个文本域,而不是存成附件;
+// 与统一上传(存档+注入)是两条互补路径:要存档走统一上传,只要文本走这里。
+//
+// 复用 uploadSRCPlatformFile 的同一套解析器与限制(32MB/扩展名判档/.doc 拒绝),
+// 保证「按块上传识别」与「统一上传存档」对同一文件解析出的正文一致。
+func (s *Server) parseSpecFile(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, srcPlatformFileMaxBytes+1<<20)
+	fail := func(code int, msg string) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		writeErr(w, code, msg)
+	}
+
+	if err := r.ParseMultipartForm(8 << 20); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			fail(413, fmt.Sprintf("文件超过 %dMB 上限", srcPlatformFileMaxBytes>>20))
+			return
+		}
+		fail(400, "multipart 解析失败: "+err.Error())
+		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+	file, hdr, err := r.FormFile("file")
+	if err != nil {
+		writeErr(w, 400, "缺少 file 字段")
+		return
+	}
+	defer file.Close()
+
+	filename := srcPlatformStoredName(hdr.Filename)
+	if filename == "" {
+		writeErr(w, 400, "文件名无效")
+		return
+	}
+	format := srcPlatformFormatOf(filename)
+	if format == srcFormatLegacy {
+		writeErr(w, 400, "老版 .doc 二进制格式暂不支持,请用 Word/WPS 另存为 .docx 后重新上传")
+		return
+	}
+	if format == srcFormatOther {
+		writeErr(w, 400, "该格式无法解析出文本,请上传 .md / .txt / .docx / .xlsx / .pdf")
+		return
+	}
+
+	// 落临时文件复用按路径解析的既有实现;defer 清理,不留临时残留。
+	tmp, err := os.CreateTemp("", "src-spec-parse-*"+filepath.Ext(filename))
+	if err != nil {
+		writeErr(w, 500, "创建临时文件失败:"+err.Error())
+		return
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if _, err := io.Copy(tmp, file); err != nil {
+		tmp.Close()
+		writeErr(w, 500, "读取上传内容失败:"+err.Error())
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		writeErr(w, 500, "保存上传内容失败:"+err.Error())
+		return
+	}
+
+	parsed := parseSRCPlatformFile(tmpPath, format)
+	writeJSON(w, 200, map[string]any{
+		"text":        parsed.ContentText,
+		"parse_status": parsed.Status,
+		"note":        parsed.Note,
+	})
+}

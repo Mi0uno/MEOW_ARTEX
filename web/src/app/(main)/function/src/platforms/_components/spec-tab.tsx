@@ -80,6 +80,9 @@ export function SpecTab({
   const [pickedIds, setPickedIds] = React.useState<Set<number>>(new Set());
   const [reassigningId, setReassigningId] = React.useState<number | null>(null);
   const uploadInputRef = React.useRef<HTMLInputElement>(null);
+  // 每个规范文本域的按钮忙态:key=字段,值=upload(上传识别)/polish(AI 润色)。
+  // 逐字段而非全局:四个按钮互不阻塞,用户可以一边润色守则一边上传奖励标准。
+  const [fieldBusy, setFieldBusy] = React.useState<Record<string, "upload" | "polish" | null>>({});
 
   const loadFiles = React.useCallback(() => {
     setFilesLoading(true);
@@ -204,6 +207,51 @@ export function SpecTab({
 
   const hasSkipped = files.some((f) => f.parse_status === "skipped");
 
+  // 上传识别:文件 → 后端纯解析 → 正文回填本字段文本框。不存附件行——
+  // 要存档走下方统一上传(两条路径对同一文件解析出的正文一致,不会不一致)。
+  const fieldLabel = (key: string) => SPEC_FIELDS.find((f) => f.key === key)?.label ?? key;
+  const uploadToField = async (key: string, file: File) => {
+    setFieldBusy((s) => ({ ...s, [key]: "upload" }));
+    try {
+      const r = await api.parseSpecFile(file);
+      if (r.parse_status === "failed") {
+        toast.error(`解析失败:${r.note || "无法从该文件提取文本"}`);
+        return;
+      }
+      if (!r.text.trim()) {
+        toast.warning("文件里没有解析出文本内容");
+        return;
+      }
+      // 回填进表单:key 是四个规范字段之一(与 SPEC_FIELDS 同源),不会是别的列
+      set({ [key]: r.text } as Partial<SRCPlatform>);
+      toast.success(`已识别填入「${fieldLabel(key)}」(共 ${r.text.length} 字),请检查后保存`);
+    } catch (e) {
+      toast.error(`识别失败:${(e as Error).message}`);
+    } finally {
+      setFieldBusy((s) => ({ ...s, [key]: null }));
+    }
+  };
+
+  // AI 润色:只改当前字段的措辞结构,事实(金额/分值/禁令)由后端提示词锁死不改。
+  // 润色结果同样只预填,落库仍走「保存全部规范文本」。
+  const polishField = async (key: keyof SRCPlatform & string) => {
+    const current = String(form[key] ?? "").trim();
+    if (!current) {
+      toast.error("请先填写内容或上传文件");
+      return;
+    }
+    setFieldBusy((s) => ({ ...s, [key]: "polish" }));
+    try {
+      const { polished } = await api.polishSpecField(key, current);
+      set({ [key]: polished } as Partial<SRCPlatform>);
+      toast.success("AI 润色完成，请检查后保存");
+    } catch (e) {
+      toast.error(`AI 润色失败:${(e as Error).message}`);
+    } finally {
+      setFieldBusy((s) => ({ ...s, [key]: null }));
+    }
+  };
+
   return (
     <div className="space-y-4">
       <Card>
@@ -218,7 +266,15 @@ export function SpecTab({
           {SPEC_FIELDS.map((f, i) => (
             <React.Fragment key={f.key}>
               {i > 0 && <Separator />}
-              <SpecTextarea field={f} value={form[f.key] ?? ""} onChange={(v) => set({ [f.key]: v })} />
+              <SpecTextarea
+                field={f}
+                value={form[f.key] ?? ""}
+                onChange={(v) => set({ [f.key]: v })}
+                uploading={fieldBusy[f.key] === "upload"}
+                polishing={fieldBusy[f.key] === "polish"}
+                onUploadFile={(file) => void uploadToField(f.key, file)}
+                onPolish={() => void polishField(f.key)}
+              />
             </React.Fragment>
           ))}
           <div className="flex items-center justify-end gap-3 border-t pt-4">

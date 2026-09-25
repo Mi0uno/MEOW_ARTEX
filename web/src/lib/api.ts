@@ -103,6 +103,8 @@ import type {
   StagedAssetCounts,
   StagedDecideResult,
   Stats,
+  SPECAIFillSuggestion,
+  SRCGuardOverview,
   SRCOverview,
   SRCPlatform,
   SRCPlatformFile,
@@ -1103,6 +1105,40 @@ export const api = {
   },
   deleteSRCPlatformFile: (platformId: number, fileId: number) =>
     del<{ deleted: boolean }>(`/src/platforms/${platformId}/files/${fileId}`),
+  // 附件类别改派(统一上传后 AI/手动归类)
+  updateSRCPlatformFileKind: (platformId: number, fileId: number, kind: string) =>
+    put<{ file: SRCPlatformFile }>(`/src/platforms/${platformId}/files/${fileId}`, { kind }),
+  // AI 识别填入:附件正文 → LLM 结构化为四类规范建议(不落库,前端预填人工确认)。
+  // fileIds 缺省 = 用该平台全部有正文的附件。
+  aiFillPlatformSpec: (platformId: number, fileIds?: number[]) =>
+    post<{ suggestion: SPECAIFillSuggestion }>(`/src/platforms/${platformId}/spec/ai-fill`, {
+      file_ids: fileIds,
+    }),
+  // SRC 监管聚合(监管&规则中心 · SRC 板块)
+  srcGuardOverview: () => get<SRCGuardOverview>("/src/guard/overview"),
+  // 规范文本框旁的「上传识别」:纯解析不存档,正文直接回填文本框
+  parseSpecFile: (file: File) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    const token = getToken();
+    return fetch(`/api/src/platforms/spec/parse-file`, {
+      method: "POST",
+      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      body: fd,
+      signal: AbortSignal.timeout(120_000),
+    }).then(async (r) => {
+      if (!r.ok) throw new Error(await r.text());
+      return r.json() as Promise<{ text: string; parse_status: string; note: string }>;
+    });
+  },
+  // 单段规范 AI 润色:只改措辞结构不改事实,返回润色后文本(前端预填人工确认)。
+  // LLM 润色可达 1-2 分钟,显式给 180s 信号覆盖 http() 默认 60s 超时。
+  polishSpecField: (field: string, text: string) =>
+    http<{ polished: string }>(`/src/platforms/spec/polish`, {
+      method: "POST",
+      body: JSON.stringify({ field, text }),
+      signal: AbortSignal.timeout(180_000),
+    }),
   // 附件下载走原生导航(带 token 的 fetch 拿不到浏览器下载语义)
   srcPlatformFileDownloadUrl: (platformId: number, fileId: number) =>
     `/api/src/platforms/${platformId}/files/${fileId}/download`,

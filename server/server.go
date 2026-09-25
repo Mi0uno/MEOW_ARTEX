@@ -803,6 +803,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/src/platforms/{id}/spec/ai-fill", s.specAIFill)
 	// SRC 监管聚合:src_mode 任务数/仅SRC规则数/SRC 任务最近拦截命中
 	mux.HandleFunc("GET /api/src/guard/overview", s.srcGuardOverview)
+	// 规范文本框旁的上传识别(纯解析不存档)与单段 AI 润色
+	mux.HandleFunc("POST /api/src/platforms/spec/parse-file", s.parseSpecFile)
+	mux.HandleFunc("POST /api/src/platforms/spec/polish", s.polishSpecField)
 	mux.HandleFunc("GET /api/src/targets", s.srcTargets)
 	mux.HandleFunc("POST /api/src/targets", s.createSRCTarget)
 	mux.HandleFunc("GET /api/src/targets/{id}", s.getSRCTarget)

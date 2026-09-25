@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/norma/llm"
@@ -26,6 +27,20 @@ const specAIFillMaxRunes = 24000
 
 // specAIFillBodyLimit 请求体上限(1MB):body 只有 id 数组,1MB 已远超任何合法请求。
 const specAIFillBodyLimit = 1 << 20
+
+// specPolishMaxRunes 单段规范润色的输入上限:四类文本域单段一般几千字,
+// 16k runes 已远超正常篇幅;超限让用户拆分而不是静默截断(截断会丢规则)。
+const specPolishMaxRunes = 16000
+
+// specPolishFieldLabel 四类规范字段的中文名与润色侧重要求。
+// 润色的红线:所有事实(金额、分值、禁令、流程)一个都不能变——这些文字会注入
+// AI 约束,润色改了事实等于改了边界。只优化结构与措辞。
+var specPolishFields = map[string]string{
+	"reward_standard":  "奖励标准:必须保留全部奖金/积分数值与区间",
+	"scoring_standard": "评分标准:必须保留全部等级划分与定级依据",
+	"code_of_conduct":  "守则:必须保留全部禁止项与行为红线,措辞保持强硬",
+	"rules":            "规范:必须保留全部流程要求与提交约束",
+}
 
 // specAIFillTimeout LLM 调用超时。整理数万字规范文档比普通分类任务慢得多,
 // 60s 会在长文档上白白失败,给足 120s。
@@ -211,4 +226,71 @@ func stripJSONEnvelope(s string) string {
 		}
 	}
 	return strings.TrimSpace(s)
+}
+
+// polishSpecField POST /api/src/platforms/spec/polish  body: {field, text}
+//
+// 对单段规范文本做 AI 润色:只优化结构与措辞,事实(金额/分值/禁令/流程)一个不改。
+// 返回 {polished},前端预填回文本框人工检查——与 ai-fill 同一哲学:AI 只建议不落库。
+//
+// 不需要平台 id:这是纯文本变换,与具体平台无关,便于在平台详情页任意一个
+// 规范文本框上使用(尚未保存的新平台也能用)。
+func (s *Server) polishSpecField(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, specAIFillBodyLimit)
+	var req struct {
+		Field string `json:"field"`
+		Text  string `json:"text"`
+	}
+	if err := decode(r, &req); err != nil {
+		writeErr(w, 400, "invalid JSON: "+err.Error())
+		return
+	}
+	label, ok := specPolishFields[req.Field]
+	if !ok {
+		writeErr(w, 400, "未知的规范字段:"+req.Field)
+		return
+	}
+	text := strings.TrimSpace(req.Text)
+	if text == "" {
+		writeErr(w, 400, "文本为空,无需润色")
+		return
+	}
+	if utf8.RuneCountInString(text) > specPolishMaxRunes {
+		writeErr(w, 400, fmt.Sprintf("文本过长(超过 %d 字),请分段润色", specPolishMaxRunes))
+		return
+	}
+
+	profileID := int64(0)
+	if p, err := s.m.pg.ActiveProfile(); err == nil && p != nil {
+		profileID = p.ID
+	}
+	if profileID == 0 {
+		writeErr(w, 503, "LLM 未配置:请到 系统 → LLM 配置 添加并激活一个配置")
+		return
+	}
+	prov, _, ok := s.providerForProfile(profileID)
+	if !ok {
+		writeErr(w, 503, "LLM 未配置:激活的 LLM 配置不可用,请检查 系统 → LLM 配置")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), specAIFillTimeout)
+	defer cancel()
+	system := "你是渗透测试平台的安全规范编辑。任务:对用户给出的这一段 SRC 平台「" + label +
+		"」文本做润色——优化结构、分条表述、修正错别字与语病,让它更清晰地约束 AI 行为。\n" +
+		"铁律:所有事实一个都不能改——金额、分值、等级、禁令、流程、数值范围必须原样保留;" +
+		"不许新增原文没有的规则,不许删除原文已有的规则;只输出润色后的文本本身,不要任何解释或围栏。"
+	out, err := analyzeCompletion(ctx, prov, system, text)
+	if err != nil {
+		writeErr(w, 502, "AI 润色失败:"+err.Error())
+		return
+	}
+	polished := strings.TrimSpace(out)
+	if polished == "" {
+		writeErr(w, 502, "AI 润色失败:模型返回为空")
+		return
+	}
+	log.Printf("[src-platform] 规范润色:字段 %s,输入 %d 字 → 输出 %d 字", req.Field,
+		utf8.RuneCountInString(text), utf8.RuneCountInString(polished))
+	writeJSON(w, 200, map[string]any{"polished": polished})
 }
