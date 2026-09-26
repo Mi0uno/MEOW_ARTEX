@@ -74,6 +74,8 @@ import type {
   MemoryFactInput,
   MemoryOverview,
   MemoryRun,
+  MonitorCollectorStat,
+  MonitorNewAsset,
   EvolveInsight,
   EvolveInsightInput,
   EvolveOverview,
@@ -130,6 +132,10 @@ import type {
   ReconCollectorDesc,
   ReconPlan,
   ReconPipeline,
+  ReconMonitorConfig,
+  ReconMonitorOverview,
+  ReconMonitorRun,
+  ReconMonitorTarget,
   ReportCompanyCount,
   ReportDetail,
   ReportEvent,
@@ -479,6 +485,28 @@ export const api = {
   // 收集器原始输出(证据 blob 文本)。isTruncated=预览截断标记由调用方自行处理。
   rawEvidence: (taskId: string, runId: number) =>
     httpText(`/tasks/${encodeURIComponent(taskId)}/collector-runs/${runId}/raw`),
+  // ---- 资产监控（24h 持续子域测绘，契约见 MONITOR_CONTRACTS.md） ----
+  reconMonitorOverview: () => get<ReconMonitorOverview>("/recon/monitor"),
+  saveReconMonitorConfig: (input: { enabled?: boolean; interval_hours?: number }) =>
+    put<ReconMonitorConfig>("/recon/monitor/config", input),
+  saveReconMonitorTarget: (companyId: number, input: { enabled?: boolean; interval_hours?: number | null }) =>
+    put<ReconMonitorTarget>(`/recon/monitor/targets/${companyId}`, input),
+  // 手动触发：带 companyId 只跑那一家（清水位，绕过全局开关）；不带跑所有到期企业。
+  // started=false 表示已有轮次在跑。
+  triggerReconMonitor: (companyId?: number) =>
+    post<{ started: boolean }>("/recon/monitor/trigger", companyId ? { company_id: companyId } : {}),
+  reconMonitorRuns: (params: { company_id?: number; status?: string; limit?: number; offset?: number }) => {
+    const q = new URLSearchParams();
+    if (params.company_id && params.company_id > 0) q.set("company_id", String(params.company_id));
+    if (params.status && params.status !== "all") q.set("status", params.status);
+    q.set("limit", String(params.limit ?? 20));
+    q.set("offset", String(params.offset ?? 0));
+    return get<{ total: number; runs: ReconMonitorRun[] }>(`/recon/monitor/runs?${q.toString()}`).then((r) => ({
+      total: r?.total ?? 0,
+      runs: arr(r?.runs),
+    }));
+  },
+  reconMonitorRun: (id: number) => get<ReconMonitorRun>(`/recon/monitor/runs/${id}`),
   // ---- 外部接口(FOFA/Hunter 配置) ----
   externalApis: () =>
     get<{ apis: ExternalAPIConfig[]; providers: ExternalAPIProviderDesc[] }>("/external-apis").then((r) => ({
@@ -745,6 +773,13 @@ export const api = {
   searchAssets: (dsl: string, type = "", limit = 50, offset = 0) =>
     get<{ count: number; total: number; assets: Asset[] }>(
       `/assets?dsl=${encodeURIComponent(dsl)}${type ? `&type=${encodeURIComponent(type)}` : ""}&limit=${limit}&offset=${offset}`,
+    ).then((r) => ({ assets: r?.assets ?? [], total: r?.total ?? r?.count ?? 0 })),
+  // 「新发现」筛选：近 N 天首次发现（created_at），可选企业维度。监控页 feed 与资产页筛选共用。
+  assetsNewer: (days: number, type = "", limit = 50, offset = 0, companyId?: number) =>
+    get<{ count: number; total: number; assets: Asset[] }>(
+      `/assets?newer_than_days=${days}${type ? `&type=${encodeURIComponent(type)}` : ""}${
+        companyId && companyId > 0 ? `&company_id=${companyId}` : ""
+      }&limit=${limit}&offset=${offset}`,
     ).then((r) => ({ assets: r?.assets ?? [], total: r?.total ?? r?.count ?? 0 })),
   assetCounts: (taskId = "") =>
     get<Record<string, number>>(`/assets/counts${taskId ? `?task_id=${encodeURIComponent(taskId)}` : ""}`),

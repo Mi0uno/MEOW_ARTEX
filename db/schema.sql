@@ -2546,3 +2546,47 @@ CREATE INDEX IF NOT EXISTS idx_evolve_playbooks_title_trgm ON evolve_playbooks U
 DROP TRIGGER IF EXISTS trg_evolve_playbooks_upd ON evolve_playbooks;
 CREATE TRIGGER trg_evolve_playbooks_upd BEFORE UPDATE ON evolve_playbooks
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ============================================================
+-- 资产监控(recon monitor)：对已加入企业(有 kind=domain 范围)的持续子域测绘。
+-- targets 存每企业的监控偏好(enabled=false=显式退出)与上次执行水位;
+--   没有 targets 行的企业 = 默认跟随全局开关(缺省即监控)。
+-- runs 存每轮摘要:收集器明细/产出总数/新增清单(审计轨迹在此,
+--   不走 staged_assets —— 其 task_id FK 到 tasks,监控轮没有任务行)。
+-- ============================================================
+CREATE TABLE IF NOT EXISTS recon_monitor_targets (
+    company_id     BIGINT PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
+    enabled        BOOLEAN NOT NULL DEFAULT true,
+    -- NULL=跟随全局间隔;>0 为企业覆盖(小时)
+    interval_hours INTEGER CHECK (interval_hours IS NULL OR interval_hours > 0),
+    last_run_at    TIMESTAMPTZ,
+    last_run_id    BIGINT,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+DROP TRIGGER IF EXISTS trg_recon_monitor_targets_upd ON recon_monitor_targets;
+CREATE TRIGGER trg_recon_monitor_targets_upd BEFORE UPDATE ON recon_monitor_targets
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE TABLE IF NOT EXISTS recon_monitor_runs (
+    id            BIGSERIAL PRIMARY KEY,
+    company_id    BIGINT REFERENCES companies(id) ON DELETE SET NULL,
+    company_name  TEXT NOT NULL DEFAULT '',
+    trigger       TEXT NOT NULL DEFAULT 'schedule' CHECK (trigger IN ('schedule','manual')),
+    status        TEXT NOT NULL DEFAULT 'running' CHECK (status IN ('running','done','failed')),
+    collectors    JSONB NOT NULL DEFAULT '[]',
+    total_found   INTEGER NOT NULL DEFAULT 0,
+    new_count     INTEGER NOT NULL DEFAULT 0,
+    new_domains   JSONB NOT NULL DEFAULT '[]',
+    new_truncated BOOLEAN NOT NULL DEFAULT false,
+    probe_ok      INTEGER NOT NULL DEFAULT 0,
+    probe_failed  INTEGER NOT NULL DEFAULT 0,
+    error         TEXT NOT NULL DEFAULT '',
+    started_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at   TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_monitor_runs_company ON recon_monitor_runs(company_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_monitor_runs_status ON recon_monitor_runs(status, id DESC);
+
+-- 「新发现」筛选走 created_at;给 type+created_at 复合索引喂 feed 查询。
+CREATE INDEX IF NOT EXISTS idx_av2_type_created ON assets(type, created_at DESC);

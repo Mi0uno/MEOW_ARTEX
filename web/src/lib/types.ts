@@ -147,6 +147,64 @@ export interface StagedDecideResult {
   remaining_pending: number;
 }
 
+// ---- 资产监控（24h 持续子域测绘，契约见 MONITOR_CONTRACTS.md） ----
+
+export interface MonitorCollectorStat {
+  key: string;
+  status: string;
+  found: number;
+  error?: string;
+}
+
+export interface MonitorNewAsset {
+  type: string;
+  value: string;
+}
+
+export interface ReconMonitorConfig {
+  enabled: boolean;
+  interval_hours: number;
+  running: boolean;
+  last_round_at?: string | null;
+}
+
+export interface ReconMonitorTarget {
+  company_id: number;
+  company_name: string;
+  domain_count: number;
+  domains: string[];
+  watched: boolean;
+  enabled: boolean;
+  interval_hours: number | null;
+  last_run_at?: string | null;
+  next_run_at?: string | null;
+  last_run_id?: number | null;
+  last_run?: { status: string; new_count: number; finished_at?: string | null } | null;
+}
+
+export interface ReconMonitorOverview {
+  config: ReconMonitorConfig;
+  targets: ReconMonitorTarget[];
+}
+
+export interface ReconMonitorRun {
+  id: number;
+  company_id?: number | null;
+  company_name: string;
+  trigger: string;
+  status: string;
+  collectors: MonitorCollectorStat[];
+  total_found: number;
+  new_count: number;
+  new_domains?: MonitorNewAsset[];
+  new_truncated?: boolean;
+  probe_ok: number;
+  probe_failed: number;
+  error: string;
+  started_at: string;
+  finished_at?: string | null;
+}
+
 // ---- 漏洞库(0day / nday / CVE + PoC 管理) ----
 
 export type VulnCategory = "0day" | "nday" | "cve";
@@ -729,6 +787,7 @@ export interface Asset {
   params?: Record<string, unknown>[];
   extra?: Record<string, unknown>;
   last_seen: string;
+  created_at?: string;
   task_source?: string;
   task_source_summary?: string;
   task_source_node_id?: number;

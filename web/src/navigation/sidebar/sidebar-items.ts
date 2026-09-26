@@ -9,6 +9,7 @@ import {
   Crosshair,
   Database,
   DoorOpen,
+  Eye,
   FileText,
   FolderOpen,
   FolderSync,
@@ -186,6 +187,8 @@ export const sidebarItems: NavGroup[] = [
           { id: "external-apis", title: "外部接口", url: "/function/external-apis", icon: Plug },
           { id: "assets", title: "资产", url: "/function/assets", icon: Network },
           { id: "sync", title: "资产同步", url: "/function/sync", icon: FolderSync },
+          // 资产监控：对已加入企业的 24h 持续子域测绘（定时器 + 新发现自动入库）。
+          { id: "recon-monitor", title: "资产监控", url: "/function/recon/monitor", icon: Eye },
           // 漏洞库(0day/Nday 人工沉淀)与 CVE&CNVD 情报(定时搜集)分为两页:
           // 前者重编辑与利用指引,后者是机器持续灌入的大批量情报,重检索与同步状态。
           { id: "vulndb", title: "漏洞库", url: "/function/vulndb", icon: Database },
