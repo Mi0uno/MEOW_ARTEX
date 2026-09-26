@@ -2492,6 +2492,16 @@ export interface C2ListenerInput {
   host_kind?: "local" | "vps";
   vps_machine_id?: number;
   remote_port?: number;
+  /** 三期:传输协议(缺省 http)。 */
+  proto?: C2Proto;
+  /** 三期:oss 等传输配置(AK/SK 服务端 secretbox 密封,永不回显;编辑时非空字段覆盖、空字段保留原值)。 */
+  transport_config?: {
+    endpoint?: string;
+    bucket?: string;
+    access_key?: string;
+    secret_key?: string;
+    prefix?: string;
+  };
 }
 
 /** 上线主机。sid 是 beacon 令牌;listener_id+beacon_uid 幂等复活。 */

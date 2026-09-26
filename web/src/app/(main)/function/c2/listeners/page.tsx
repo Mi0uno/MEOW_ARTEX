@@ -1,14 +1,15 @@
 "use client";
 
-// C2 中心 · 监听器 —— beacon HTTP 回连入口的列表页。
+// C2 中心 · 监听器 —— beacon 回连入口的列表页。
 //
-// 监听器 = 独立端口的 HTTP server:启动后等待 beacon 注册,载荷经
-// <callback>/<url_path>/p/<token> 投递。本页负责监听器的增删改查与启停;
-// 会话与任务在「会话」页,载荷生成在「载荷」页。
+// 监听器 = 独立端口的信令 server(三期支持 http/ws/tcp/kcp/oss 五种传输协议):
+// 启动后等待 beacon 注册,载荷经 <callback>/<url_path>/p/<token> 投递。本页负责
+// 监听器的增删改查与启停;会话与任务在「会话」页,载荷生成在「载荷」页。
 //
 // 载体(二期):本机直听,或选一台 VPS 机器经 SSH 远程端口转发把机器公网口
-// 的流量转回本机监听器(契约 §12)。启停失败(端口占用 / SSH 不通最常见)
-// 把后端错误原文报出来。
+// 的流量转回本机监听器(契约 §12)。oss 协议(三期)直连云端对象存储,没有
+// bind_host/载体概念,改为填写 endpoint/bucket/AK/SK/prefix(契约 §18)。
+// 启停失败(端口占用 / SSH 不通最常见)把后端错误原文报出来。
 //
 // 接口(c2Listeners)没有服务端筛选/分页参数,四件套(搜索/筛选/排序/分页)
 // 全部在客户端对全量列表做。
@@ -33,7 +34,17 @@ import {
 import { toast } from "sonner";
 
 import { TablePagination } from "@/components/table-pagination";
-import { c2VpsStatusLabel, fmtTime, listenerChannelURL, num, randomURLPath } from "@/components/c2-shared";
+import {
+  c2ProtoMeta,
+  c2VpsStatusLabel,
+  C2_PAYLOAD_FORMATS,
+  C2_PROTOS,
+  C2_PROTO_FORMAT_SUPPORT,
+  fmtTime,
+  listenerChannelURL,
+  num,
+  randomURLPath,
+} from "@/components/c2-shared";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -61,7 +72,7 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectVa
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
-import type { C2Listener, VpsMachine } from "@/lib/types";
+import type { C2Listener, C2Proto, VpsMachine } from "@/lib/types";
 import { cn, copyText } from "@/lib/utils";
 
 const PAGE_SIZE = 50;
@@ -236,8 +247,8 @@ function C2ListenersInner() {
         <div>
           <h1 className="font-semibold text-xl">C2 中心 · 监听器</h1>
           <p className="text-muted-foreground text-sm">
-            beacon 的 HTTP 回连入口:启动后监听 <code className="font-mono text-xs">POST /&lt;信道路径&gt;/e</code>
-            ,载荷经投递 URL 下发。生成载荷前必须先把回调地址填好。
+            beacon 的回连入口:http / ws / tcp / kcp / oss 五种传输协议,启动后等待 beacon 注册,载荷经投递 URL
+            下发。生成载荷前必须先把回调地址填好。
           </p>
         </div>
         <Button
@@ -313,15 +324,16 @@ function C2ListenersInner() {
                 <TableHeader>
                   <TableRow className="hover:bg-transparent">
                     {/* 名称列不设宽度:table-fixed 下自动吃掉余量。
-                        固定列合计 672px(144+96+48+80+80+112+112),常规容器下余量充足;
+                        固定列合计 688px(64+112+96+48+80+64+112+112),常规容器下余量充足;
                         再加列必须先瘦身其他列,否则名称列会被压到看不见。 */}
                     <SortHead field="name">名称</SortHead>
-                    <TableHead className="w-36">回调地址</TableHead>
+                    <TableHead className="w-16">协议</TableHead>
+                    <TableHead className="w-28">回调地址</TableHead>
                     <TableHead className="w-24">载体</TableHead>
                     <TableHead className="w-12">会话</TableHead>
                     <TableHead className="w-20">启用状态</TableHead>
-                    <TableHead className="w-20">备注</TableHead>
-                    <SortHead field="created" width="w-32">
+                    <TableHead className="w-16">备注</TableHead>
+                    <SortHead field="created" width="w-28">
                       创建时间
                     </SortHead>
                     <TableHead className="w-28">操作</TableHead>
@@ -330,6 +342,7 @@ function C2ListenersInner() {
                 <TableBody>
                   {pageItems.map((l) => {
                     const running = !!l.runtime_addr;
+                    const pm = c2ProtoMeta(String(l.proto ?? "http"));
                     return (
                       <TableRow key={l.id}>
                         <TableCell className="min-w-0">
@@ -339,6 +352,16 @@ function C2ListenersInner() {
                           <span className="text-muted-foreground block truncate font-mono text-xs" title={`${l.bind_host}:${l.port}`}>
                             {l.bind_host}:{l.port > 0 ? l.port : "自动"}
                           </span>
+                        </TableCell>
+                        <TableCell>
+                          <Badge
+                            variant="outline"
+                            className={pm.badge}
+                            title={`${pm.label}${pm.desc ? ` · ${pm.desc}` : ""}`}
+                          >
+                            <pm.Icon className="size-2.5" />
+                            {pm.label}
+                          </Badge>
                         </TableCell>
                         <TableCell className="min-w-0">
                           {l.callback ? (
@@ -516,6 +539,11 @@ function C2ListenersInner() {
 }
 
 // C2ListenerDialog 新建 / 编辑监听器。
+// 三期(契约 §22):先选传输协议(http/ws/tcp/kcp/oss 五张协议卡)——
+//   kcp:提示「载荷仅支持 py/gosrc」;kcp 走 UDP,与 VPS 载体(SSH TCP 转发)不兼容,给警示;
+//   oss:直连云端对象存储,无 bind_host/端口/信道路径/载体概念,改为填
+//        endpoint/bucket/AK/SK/prefix——凭据密封存储永不回显,编辑已配置的监听器时
+//        显示「已配置」占位,留空 = 不修改。
 // port 留空 = 0(启动时自动分配);url_path 新建时自动生成、可改;
 // callback 是写进载荷的回调地址,local 载体必填;vps 载体(二期)可选机器 + 公网侧
 // 转发端口,回调地址按机器 host:端口预填、可改,留空时后端按机器信息放宽校验。
@@ -531,6 +559,8 @@ function C2ListenerDialog({
   onSaved: () => void;
 }) {
   const [name, setName] = React.useState("");
+  // 三期:传输协议(默认 http,与一期行为一致)。
+  const [proto, setProto] = React.useState<C2Proto>("http");
   const [bindHost, setBindHost] = React.useState("0.0.0.0");
   const [portText, setPortText] = React.useState("");
   const [callback, setCallback] = React.useState("");
@@ -541,14 +571,27 @@ function C2ListenerDialog({
   const [machines, setMachines] = React.useState<VpsMachine[]>([]);
   const [machineId, setMachineId] = React.useState("");
   const [remotePortText, setRemotePortText] = React.useState("");
+  // 三期 oss 传输配置:密封存储永不回显;编辑已配置监听器时留空 = 不修改。
+  const [ossEndpoint, setOssEndpoint] = React.useState("");
+  const [ossBucket, setOssBucket] = React.useState("");
+  const [ossPrefix, setOssPrefix] = React.useState("");
+  const [ossAK, setOssAK] = React.useState("");
+  const [ossSK, setOssSK] = React.useState("");
   // 用户手改过回调地址后不再自动预填。
   const [callbackTouched, setCallbackTouched] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
+
+  const isOss = proto === "oss";
+  // 编辑的监听器是否已配置过 oss 凭据(接口只回布尔,凭据本体永不回显)。
+  const ossConfigured = !!listener?.transport_configured;
 
   React.useEffect(() => {
     if (!open) return;
     if (listener) {
       setName(listener.name);
+      // 老数据 proto 缺省 http;非法值兜底回 http。
+      const lp = listener.proto as C2Proto;
+      setProto(C2_PROTOS.includes(lp) ? lp : "http");
       setBindHost(listener.bind_host || "0.0.0.0");
       setPortText(listener.port > 0 ? String(listener.port) : "");
       setCallback(listener.callback);
@@ -559,6 +602,7 @@ function C2ListenerDialog({
       setRemotePortText(listener.remote_port > 0 ? String(listener.remote_port) : "");
     } else {
       setName("");
+      setProto("http");
       setBindHost("0.0.0.0");
       setPortText("");
       setCallback("");
@@ -568,6 +612,11 @@ function C2ListenerDialog({
       setMachineId("");
       setRemotePortText("");
     }
+    setOssEndpoint("");
+    setOssBucket("");
+    setOssPrefix("");
+    setOssAK("");
+    setOssSK("");
     setCallbackTouched(false);
   }, [open, listener]);
 
@@ -604,6 +653,65 @@ function C2ListenerDialog({
       toast.error("请填写名称");
       return;
     }
+    // ---- oss:直连云端,收集 endpoint/bucket/AK/SK/prefix;其余字段不参与 ----
+    if (isOss) {
+      const endpoint = ossEndpoint.trim();
+      const bucket = ossBucket.trim();
+      const ak = ossAK.trim();
+      const sk = ossSK.trim();
+      if (!(ossConfigured && listener)) {
+        // 新建(或编辑但从未配置过)时四项必填;已配置过则留空 = 不修改。
+        if (!endpoint) {
+          toast.error("请填写 OSS endpoint(如 https://oss-cn-hangzhou.aliyuncs.com)");
+          return;
+        }
+        if (!bucket) {
+          toast.error("请填写 OSS bucket 名称");
+          return;
+        }
+        if (!ak || !sk) {
+          toast.error("请填写 AccessKey 与 SecretKey");
+          return;
+        }
+      }
+      if (endpoint && !/^https?:\/\//i.test(endpoint)) {
+        toast.error("endpoint 需带协议,如 https://oss-cn-hangzhou.aliyuncs.com");
+        return;
+      }
+      setBusy(true);
+      try {
+        // transport_config 只带非空字段:编辑已配置监听器时留空项由后端保留原值。
+        const tc: Record<string, string> = {};
+        if (endpoint) tc.endpoint = endpoint;
+        if (bucket) tc.bucket = bucket;
+        if (ak) tc.access_key = ak;
+        if (sk) tc.secret_key = sk;
+        const prefix = ossPrefix.trim();
+        if (prefix) tc.prefix = prefix;
+        // oss 的 callback 语义 = beacon 直连的 OSS endpoint(契约 §18)。
+        // 宽对象绕过冻结的 C2ListenerInput(v3 字段由后端按契约接收)。
+        const input = {
+          name: n,
+          callback: endpoint || undefined,
+          notes: notes.trim(),
+          proto,
+          host_kind: "local" as const,
+          vps_machine_id: 0,
+          remote_port: 0,
+          ...(Object.keys(tc).length > 0 ? { transport_config: tc } : {}),
+        };
+        if (listener) await api.c2UpdateListener(listener.id, input);
+        else await api.c2CreateListener(input);
+        toast.success(listener ? "已保存" : "已创建 oss 监听器(平台侧按 sleep 节奏轮询对象存储)");
+        onSaved();
+      } catch (e) {
+        toast.error(`保存失败:${(e as Error).message}`);
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
+    // ---- http/ws/tcp/kcp:既有载体与回调校验 ----
     const isVps = hostKind === "vps";
     const machineNum = Number(machineId);
     if (isVps && (!Number.isInteger(machineNum) || machineNum <= 0)) {
@@ -652,6 +760,8 @@ function C2ListenerDialog({
         host_kind: hostKind,
         vps_machine_id: isVps ? machineNum : 0,
         remote_port: isVps ? remotePort : 0,
+        // 三期 v3 扩展(冻结的 C2ListenerInput 尚未声明 proto,后端按契约 §18 接收)。
+        proto,
       };
       if (listener) await api.c2UpdateListener(listener.id, input);
       else await api.c2CreateListener(input);
@@ -670,12 +780,51 @@ function C2ListenerDialog({
         <DialogHeader>
           <DialogTitle>{listener ? "编辑监听器" : "新建监听器"}</DialogTitle>
           <DialogDescription>
-            监听器是 beacon 的 HTTP 回连入口。目标机执行载荷后会连到回调地址上的信道路径,受控会话随即上线。
+            监听器是 beacon 的回连入口(http / ws / tcp / kcp / oss)。目标机执行载荷后按所选协议连回信道路径,受控会话随即上线。
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-3">
+          {/* ── 传输协议(三期):五张协议卡,选中态高亮 ── */}
+          <div className="grid gap-1.5">
+            <Label>传输协议</Label>
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+              {C2_PROTOS.map((p) => {
+                const m = c2ProtoMeta(p);
+                const active = proto === p;
+                return (
+                  <button
+                    key={p}
+                    type="button"
+                    onClick={() => setProto(p)}
+                    title={m.desc}
+                    className={cn(
+                      "rounded-md border p-2 text-left transition-colors",
+                      active
+                        ? "border-primary bg-primary/5 ring-primary/30 ring-1"
+                        : "hover:border-primary/40 hover:bg-muted/40",
+                    )}
+                  >
+                    <span className="flex items-center gap-1.5">
+                      <m.Icon className={cn("size-3.5", active ? "text-primary" : "text-muted-foreground")} />
+                      <span className="text-xs font-medium">{m.label}</span>
+                    </span>
+                    <span className="text-muted-foreground mt-1 block text-[10px] leading-snug">{m.desc}</span>
+                  </button>
+                );
+              })}
+            </div>
+            {proto === "kcp" ? (
+              <p className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-700 dark:text-amber-400">
+                kcp 传输的载荷仅支持 {C2_PROTO_FORMAT_SUPPORT.kcp.join(" / ")}
+                :生成载荷时格式会自动收窄,
+                {C2_PAYLOAD_FORMATS.filter((f) => !C2_PROTO_FORMAT_SUPPORT.kcp.includes(f)).join(" / ")} 不可用;
+                kcp 走 UDP,与 VPS 载体(SSH TCP 转发)不兼容。
+              </p>
+            ) : null}
+          </div>
+
           <div className="grid grid-cols-3 gap-3">
-            <div className="col-span-2 grid gap-1.5">
+            <div className={cn("grid gap-1.5", isOss && "col-span-3")}>
               <Label htmlFor="c2-listener-name">名称</Label>
               <Input
                 id="c2-listener-name"
@@ -684,165 +833,247 @@ function C2ListenerDialog({
                 placeholder="例如:边界机-8443"
               />
             </div>
-            <div className="grid gap-1.5">
-              <Label htmlFor="c2-listener-port">端口</Label>
-              <Input
-                id="c2-listener-port"
-                type="number"
-                min={0}
-                max={65535}
-                value={portText}
-                onChange={(e) => setPortText(e.target.value)}
-                placeholder="自动"
-                className="font-mono"
-              />
-              <p className="text-muted-foreground text-[10px]">留空 = 自动分配</p>
-            </div>
-          </div>
-
-          {/* 载体(二期):本机直听 / VPS 机器经 SSH 远程转发做公网出入口。 */}
-          <div className="grid grid-cols-3 gap-3">
-            <div className="grid gap-1.5">
-              <Label>载体</Label>
-              <Select value={hostKind} onValueChange={(v) => setHostKind(v === "vps" ? "vps" : "local")}>
-                <SelectTrigger className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectGroup>
-                    <SelectItem value="local">本机</SelectItem>
-                    <SelectItem value="vps">VPS 机器</SelectItem>
-                  </SelectGroup>
-                </SelectContent>
-              </Select>
-              <p className="text-muted-foreground text-[10px]">VPS = 机器公网口经 SSH 转发回本机监听</p>
-            </div>
-            {hostKind === "vps" ? (
-              <div className="col-span-2 grid gap-1.5">
-                <Label htmlFor="c2-listener-machine">VPS 机器</Label>
-                <Select
-                  value={machineId}
-                  onValueChange={(v) => {
-                    setMachineId(v);
-                    setCallbackTouched(false);
-                  }}
-                >
-                  <SelectTrigger className="w-full">
-                    <SelectValue placeholder="选择机器" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectGroup>
-                      {machines.length === 0 ? (
-                        <SelectItem value="__none__" disabled>
-                          没有可选机器,请先到「VPS 中心」录入
-                        </SelectItem>
-                      ) : (
-                        machines.map((m) => (
-                          <SelectItem key={m.id} value={String(m.id)}>
-                            {m.name}({m.host}) · {c2VpsStatusLabel(String(m.status))}
-                          </SelectItem>
-                        ))
-                      )}
-                    </SelectGroup>
-                  </SelectContent>
-                </Select>
-                <p className="text-muted-foreground text-[10px]">标注在线状态;离线机器也可选,启动时 SSH 连不上会报错</p>
-              </div>
-            ) : (
-              <div className="col-span-2 grid gap-1.5">
-                <Label htmlFor="c2-listener-bind">绑定地址</Label>
-                <Input
-                  id="c2-listener-bind"
-                  value={bindHost}
-                  onChange={(e) => setBindHost(e.target.value)}
-                  placeholder="0.0.0.0"
-                  className="font-mono"
-                />
-                <p className="text-muted-foreground text-[10px]">0.0.0.0 = 所有网卡</p>
-              </div>
-            )}
-          </div>
-
-          {hostKind === "vps" ? (
-            <div className="grid grid-cols-3 gap-3">
+            {!isOss ? (
               <div className="grid gap-1.5">
-                <Label htmlFor="c2-listener-remote-port">转发端口</Label>
+                <Label htmlFor="c2-listener-port">端口</Label>
                 <Input
-                  id="c2-listener-remote-port"
+                  id="c2-listener-port"
                   type="number"
-                  min={1}
+                  min={0}
                   max={65535}
-                  value={remotePortText}
-                  onChange={(e) => {
-                    setRemotePortText(e.target.value);
-                    setCallbackTouched(false);
-                  }}
-                  placeholder="如 8443"
+                  value={portText}
+                  onChange={(e) => setPortText(e.target.value)}
+                  placeholder="自动"
                   className="font-mono"
                 />
-                <p className="text-muted-foreground text-[10px]">在机器公网侧监听,需放行防火墙</p>
+                <p className="text-muted-foreground text-[10px]">留空 = 自动分配</p>
               </div>
-              <div className="col-span-2 grid gap-1.5">
-                <Label htmlFor="c2-listener-callback">回调地址</Label>
-                <Input
-                  id="c2-listener-callback"
-                  value={callback}
-                  onChange={(e) => {
-                    setCallback(e.target.value);
-                    setCallbackTouched(true);
-                  }}
-                  placeholder="http://1.2.3.4:8443(按机器与端口预填,可改)"
-                  className="font-mono"
-                />
+            ) : null}
+          </div>
+
+          {isOss ? (
+            <>
+              {/* ── oss 传输配置(三期):无 bind_host/端口/载体/信道路径概念 ── */}
+              <p className="rounded-md border border-cyan-500/40 bg-cyan-500/10 px-2.5 py-1.5 text-[11px] text-cyan-700 dark:text-cyan-400">
+                OSS 直连云端:对象存储做双向队列,平台与 beacon 都直连 endpoint,没有
+                bind_host / 端口 / 载体 / 信道路径概念;平台按 sleep 节奏轮询对象存储取帧。
+              </p>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="grid gap-1.5">
+                  <Label htmlFor="c2-listener-oss-endpoint">Endpoint</Label>
+                  <Input
+                    id="c2-listener-oss-endpoint"
+                    value={ossEndpoint}
+                    onChange={(e) => setOssEndpoint(e.target.value)}
+                    placeholder={ossConfigured ? "已配置(留空 = 不修改)" : "https://oss-cn-hangzhou.aliyuncs.com"}
+                    className="font-mono"
+                    autoComplete="off"
+                  />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor="c2-listener-oss-bucket">Bucket</Label>
+                  <Input
+                    id="c2-listener-oss-bucket"
+                    value={ossBucket}
+                    onChange={(e) => setOssBucket(e.target.value)}
+                    placeholder={ossConfigured ? "已配置(留空 = 不修改)" : "my-c2-bucket"}
+                    className="font-mono"
+                    autoComplete="off"
+                  />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor="c2-listener-oss-ak">AccessKey</Label>
+                  <Input
+                    id="c2-listener-oss-ak"
+                    type="password"
+                    value={ossAK}
+                    onChange={(e) => setOssAK(e.target.value)}
+                    placeholder={ossConfigured ? "已配置(留空 = 不修改)" : ""}
+                    className="font-mono"
+                    autoComplete="new-password"
+                  />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor="c2-listener-oss-sk">SecretKey</Label>
+                  <Input
+                    id="c2-listener-oss-sk"
+                    type="password"
+                    value={ossSK}
+                    onChange={(e) => setOssSK(e.target.value)}
+                    placeholder={ossConfigured ? "已配置(留空 = 不修改)" : ""}
+                    className="font-mono"
+                    autoComplete="new-password"
+                  />
+                </div>
+                <div className="grid gap-1.5 sm:col-span-2">
+                  <Label htmlFor="c2-listener-oss-prefix">对象前缀 prefix(可选)</Label>
+                  <Input
+                    id="c2-listener-oss-prefix"
+                    value={ossPrefix}
+                    onChange={(e) => setOssPrefix(e.target.value)}
+                    placeholder={ossConfigured ? "已配置(留空 = 不修改)" : "如 artex/c2/(帧对象写到前缀之下)"}
+                    className="font-mono"
+                    autoComplete="off"
+                  />
+                </div>
+              </div>
+              <p className="text-muted-foreground text-[10px]">
+                AK / SK 与 endpoint 等配置密封存储,接口永不回显;beacon 用同一组凭据直连 OSS 交换帧,
+                请确保该凭据仅可访问此 bucket。
+              </p>
+            </>
+          ) : (
+            <>
+              {/* ── 载体(二期):本机直听 / VPS 机器经 SSH 远程转发做公网出入口 ── */}
+              <div className="grid grid-cols-3 gap-3">
+                <div className="grid gap-1.5">
+                  <Label>载体</Label>
+                  <Select value={hostKind} onValueChange={(v) => setHostKind(v === "vps" ? "vps" : "local")}>
+                    <SelectTrigger className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectGroup>
+                        <SelectItem value="local">本机</SelectItem>
+                        <SelectItem value="vps">VPS 机器</SelectItem>
+                      </SelectGroup>
+                    </SelectContent>
+                  </Select>
+                  <p className="text-muted-foreground text-[10px]">VPS = 机器公网口经 SSH 转发回本机监听</p>
+                </div>
+                {hostKind === "vps" ? (
+                  <div className="col-span-2 grid gap-1.5">
+                    <Label htmlFor="c2-listener-machine">VPS 机器</Label>
+                    <Select
+                      value={machineId}
+                      onValueChange={(v) => {
+                        setMachineId(v);
+                        setCallbackTouched(false);
+                      }}
+                    >
+                      <SelectTrigger className="w-full">
+                        <SelectValue placeholder="选择机器" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectGroup>
+                          {machines.length === 0 ? (
+                            <SelectItem value="__none__" disabled>
+                              没有可选机器,请先到「VPS 中心」录入
+                            </SelectItem>
+                          ) : (
+                            machines.map((m) => (
+                              <SelectItem key={m.id} value={String(m.id)}>
+                                {m.name}({m.host}) · {c2VpsStatusLabel(String(m.status))}
+                              </SelectItem>
+                            ))
+                          )}
+                        </SelectGroup>
+                      </SelectContent>
+                    </Select>
+                    <p className="text-muted-foreground text-[10px]">标注在线状态;离线机器也可选,启动时 SSH 连不上会报错</p>
+                  </div>
+                ) : (
+                  <div className="col-span-2 grid gap-1.5">
+                    <Label htmlFor="c2-listener-bind">绑定地址</Label>
+                    <Input
+                      id="c2-listener-bind"
+                      value={bindHost}
+                      onChange={(e) => setBindHost(e.target.value)}
+                      placeholder="0.0.0.0"
+                      className="font-mono"
+                    />
+                    <p className="text-muted-foreground text-[10px]">0.0.0.0 = 所有网卡</p>
+                  </div>
+                )}
+              </div>
+              {proto === "kcp" && hostKind === "vps" ? (
+                <p className="text-[11px] text-amber-600 dark:text-amber-400">
+                  注意:kcp 走 UDP,SSH 远程转发仅能转发 TCP——kcp 监听器建议使用本机载体。
+                </p>
+              ) : null}
+
+              {hostKind === "vps" ? (
+                <div className="grid grid-cols-3 gap-3">
+                  <div className="grid gap-1.5">
+                    <Label htmlFor="c2-listener-remote-port">转发端口</Label>
+                    <Input
+                      id="c2-listener-remote-port"
+                      type="number"
+                      min={1}
+                      max={65535}
+                      value={remotePortText}
+                      onChange={(e) => {
+                        setRemotePortText(e.target.value);
+                        setCallbackTouched(false);
+                      }}
+                      placeholder="如 8443"
+                      className="font-mono"
+                    />
+                    <p className="text-muted-foreground text-[10px]">在机器公网侧监听,需放行防火墙</p>
+                  </div>
+                  <div className="col-span-2 grid gap-1.5">
+                    <Label htmlFor="c2-listener-callback">回调地址</Label>
+                    <Input
+                      id="c2-listener-callback"
+                      value={callback}
+                      onChange={(e) => {
+                        setCallback(e.target.value);
+                        setCallbackTouched(true);
+                      }}
+                      placeholder="http://1.2.3.4:8443(按机器与端口预填,可改)"
+                      className="font-mono"
+                    />
+                    <p className="text-muted-foreground text-[10px]">
+                      预填 <code className="font-mono">http://&lt;机器 host&gt;:&lt;转发端口&gt;</code>
+                      ,可改;目标机必须能访问到
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <div className="grid gap-1.5">
+                  <Label htmlFor="c2-listener-callback">回调地址</Label>
+                  <Input
+                    id="c2-listener-callback"
+                    value={callback}
+                    onChange={(e) => {
+                      setCallback(e.target.value);
+                      setCallbackTouched(true);
+                    }}
+                    placeholder="http://1.2.3.4:8443"
+                    className="font-mono"
+                  />
+                  <p className="text-muted-foreground text-[10px]">
+                    写进载荷的回调地址,如 http://1.2.3.4:8443(目标机必须能访问到)
+                  </p>
+                </div>
+              )}
+
+              <div className="grid gap-1.5">
+                <Label htmlFor="c2-listener-path">信道路径</Label>
+                <div className="flex items-center gap-2">
+                  <Input
+                    id="c2-listener-path"
+                    value={urlPath}
+                    onChange={(e) => setUrlPath(e.target.value)}
+                    className="font-mono"
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setUrlPath(randomURLPath())}
+                    title="重新生成随机路径"
+                  >
+                    <RefreshCwIcon className="size-3.5" />
+                    重新生成
+                  </Button>
+                </div>
                 <p className="text-muted-foreground text-[10px]">
-                  预填 <code className="font-mono">http://&lt;机器 host&gt;:&lt;转发端口&gt;</code>
-                  ,可改;目标机必须能访问到
+                  载荷投递与回连都会带上这段随机路径,起到伪装作用;已上线会话不因修改而断开
                 </p>
               </div>
-            </div>
-          ) : (
-            <div className="grid gap-1.5">
-              <Label htmlFor="c2-listener-callback">回调地址</Label>
-              <Input
-                id="c2-listener-callback"
-                value={callback}
-                onChange={(e) => {
-                  setCallback(e.target.value);
-                  setCallbackTouched(true);
-                }}
-                placeholder="http://1.2.3.4:8443"
-                className="font-mono"
-              />
-              <p className="text-muted-foreground text-[10px]">
-                写进载荷的回调地址,如 http://1.2.3.4:8443(目标机必须能访问到)
-              </p>
-            </div>
+            </>
           )}
-
-          <div className="grid gap-1.5">
-            <Label htmlFor="c2-listener-path">信道路径</Label>
-            <div className="flex items-center gap-2">
-              <Input
-                id="c2-listener-path"
-                value={urlPath}
-                onChange={(e) => setUrlPath(e.target.value)}
-                className="font-mono"
-              />
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => setUrlPath(randomURLPath())}
-                title="重新生成随机路径"
-              >
-                <RefreshCwIcon className="size-3.5" />
-                重新生成
-              </Button>
-            </div>
-            <p className="text-muted-foreground text-[10px]">
-              载荷投递与回连都会带上这段随机路径,起到伪装作用;已上线会话不因修改而断开
-            </p>
-          </div>
 
           <div className="grid gap-1.5">
             <Label htmlFor="c2-listener-notes">备注</Label>

@@ -8,13 +8,31 @@
 // lib/api.ts、lib/types.ts,避免把 VPS 的对话框组件拖进依赖图。
 
 import { Badge } from "@/components/ui/badge";
+// 协议/产物徽标助手把图标组件存进 META 表当值用,这里必须按值导入;LucideIcon 是纯类型。
+import {
+  AntennaIcon,
+  BinaryIcon,
+  BoxesIcon,
+  CloudIcon,
+  FileCodeIcon,
+  GlobeIcon,
+  NetworkIcon,
+  PackageIcon,
+  WaypointsIcon,
+  ZapIcon,
+} from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import type {
+  C2Direction,
   C2EvasionTargetAV,
   C2JobKind,
   C2JobStatus,
   C2LootKind,
   C2Listener,
+  C2PayloadArtifact,
   C2PayloadFormat,
+  C2PayloadTarget,
+  C2Proto,
   C2SessionStatus,
   C2StaticReport,
   C2TaskKind,
@@ -95,13 +113,14 @@ export function c2TaskStatusMeta(status: string): { label: string; badge: string
   return TASK_STATUS_META[status as C2TaskStatus] ?? { label: status, badge: "bg-muted text-muted-foreground" };
 }
 
-const TASK_KIND_LABEL: Record<C2TaskKind, string> = {
+const TASK_KIND_LABEL: Record<C2TaskKind, string> & { plugin: string } = {
   shell: "命令",
   files_list: "文件浏览",
   upload: "上传",
   download: "下载",
   loot: "战利品",
   info: "信息采集",
+  plugin: "插件",
 };
 
 export function c2TaskKindLabel(kind: string): string {
@@ -372,4 +391,367 @@ export function C2StaticReportView({
       ) : null}
     </div>
   );
+}
+
+// ══ 三期(契约 §17-§22):传输协议 / 载荷矩阵 / 连接方向 ══
+// 本段由三期前端(Agent C)追加;后段函数命名保持 c2 前缀,与插件助手互不重叠。
+
+// ---- 传输协议(监听器 proto / 会话 transport 共用)----
+
+const C2_PROTO_META: Record<C2Proto, { label: string; badge: string; desc: string; Icon: LucideIcon }> = {
+  http: {
+    label: "HTTP",
+    badge: "bg-blue-500/15 text-blue-600 border-blue-500/30",
+    desc: "HTTP 轮询回连:兼容性最好,流量伪装成普通 Web 请求",
+    Icon: GlobeIcon,
+  },
+  ws: {
+    label: "WebSocket",
+    badge: "bg-indigo-500/15 text-indigo-600 border-indigo-500/30",
+    desc: "WebSocket 长连接:低延迟准实时下发,与 HTTP 同端口语义",
+    Icon: WaypointsIcon,
+  },
+  tcp: {
+    label: "TCP",
+    badge: "bg-emerald-500/15 text-emerald-600 border-emerald-500/30",
+    desc: "TCP 长度前缀帧:裸 socket 直连,支持正向 bind",
+    Icon: NetworkIcon,
+  },
+  kcp: {
+    label: "KCP",
+    badge: "bg-amber-500/15 text-amber-600 border-amber-500/30",
+    desc: "KCP 协议:抗丢包快速重传;载荷仅支持 py/gosrc,支持正向 bind",
+    Icon: ZapIcon,
+  },
+  oss: {
+    label: "OSS",
+    badge: "bg-cyan-500/15 text-cyan-600 border-cyan-500/30",
+    desc: "对象存储中转:无连接,bucket 双向队列交换帧,beacon 直连云端",
+    Icon: CloudIcon,
+  },
+};
+
+/** 五种传输协议的展示顺序(监听器协议选择/徽标共用)。 */
+export const C2_PROTOS: C2Proto[] = ["http", "ws", "tcp", "kcp", "oss"];
+
+export function c2ProtoMeta(proto: string): { label: string; badge: string; desc: string; Icon: LucideIcon } {
+  return (
+    C2_PROTO_META[proto as C2Proto] ?? {
+      label: proto,
+      badge: "bg-muted text-muted-foreground",
+      desc: "",
+      Icon: GlobeIcon,
+    }
+  );
+}
+
+// ---- 载荷矩阵(契约 §19 合法组合表 + §18 beacon 模板支持矩阵,freeze)----
+// 前后端同一份校验语义:后端组合校验失败 400 带原因,前端按本表禁选并给原因 tooltip。
+
+/** 一条载荷组合查询:c2ComboAllowed 的入参集合。proto/target 可省略(缺省不校验该轴)。 */
+export interface C2PayloadCombo {
+  format: C2PayloadFormat;
+  artifact: C2PayloadArtifact;
+  direction: C2Direction;
+  staged: boolean;
+  proto?: C2Proto;
+  target?: C2PayloadTarget;
+}
+
+interface C2MatrixRow {
+  /** 该产物允许的格式。 */
+  formats: C2PayloadFormat[];
+  /** 是否支持 staged(stager)形态。 */
+  staged: boolean;
+  /** 不支持 staged 时给解释(禁用 tooltip 文案)。 */
+  stagedReason: string;
+  /** 允许的连接方向;缺省 = reverse|bind 都可。 */
+  directions?: C2Direction[];
+  /** 允许的目标平台;缺省不限(ebpf 仅 linux)。 */
+  targets?: C2PayloadTarget[];
+  /** 产物一句话说明(选项旁文案)。 */
+  desc: string;
+}
+
+/** §19 合法组合表:产物 → 允许的格式 / staged 能力 / 方向 / 目标平台。 */
+export const C2_PAYLOAD_MATRIX: Record<C2PayloadArtifact, C2MatrixRow> = {
+  script: {
+    formats: ["ps1", "bash", "py"],
+    staged: false,
+    stagedReason: "script 不做 staged:脚本整段直出执行,无需 stager",
+    desc: "ps1 / bash / py 源码载荷,目标机拉取后就地执行",
+  },
+  exe: {
+    formats: ["gosrc"],
+    staged: true,
+    stagedReason: "",
+    desc: "gosrc 经 VPS go build 编译;staged = 小体积 stager 拉完整产物落盘执行(OPSEC 弱)",
+  },
+  dll: {
+    formats: ["gosrc"],
+    staged: false,
+    stagedReason: "dll 不支持 staged:导出 Run 入口按 stageless 交付(rundll32 或加载器调用)",
+    desc: "gosrc c-shared 编译的动态库,导出 Run 入口",
+  },
+  shellcode: {
+    formats: ["gosrc"],
+    staged: true,
+    stagedReason: "",
+    desc: "dll 产物经 sRDI 转换,加载即执行;staged = bootstrap 从信道拉 DLL stage 后反射加载",
+  },
+  ebpf: {
+    formats: ["gosrc"],
+    staged: false,
+    stagedReason: "eBPF 触发器不支持 staged:源码工程 + 配套 bind beacon 直出",
+    directions: ["bind"],
+    targets: ["linux"],
+    desc: "tc/XDP 魔法包触发器,仅 linux + bind;构建需 VPS 有 clang",
+  },
+};
+
+/** §18 beacon 模板支持矩阵:各传输协议支持的载荷格式(kcp 仅 py/gosrc,ps1/bash 不可用)。 */
+export const C2_PROTO_FORMAT_SUPPORT: Record<C2Proto, C2PayloadFormat[]> = {
+  http: ["ps1", "bash", "py", "gosrc"],
+  ws: ["ps1", "bash", "py", "gosrc"],
+  tcp: ["ps1", "bash", "py", "gosrc"],
+  kcp: ["py", "gosrc"],
+  oss: ["ps1", "bash", "py", "gosrc"],
+};
+
+export const C2_PAYLOAD_FORMATS: C2PayloadFormat[] = ["ps1", "bash", "py", "gosrc"];
+export const C2_PAYLOAD_ARTIFACTS: C2PayloadArtifact[] = ["script", "exe", "dll", "shellcode", "ebpf"];
+export const C2_DIRECTIONS: C2Direction[] = ["reverse", "bind"];
+
+// c2ComboAllowed §19 合法组合表的唯一前端实现,载荷页四级联动与监听器页 kcp
+// 提示共用;返回 allowed=false 时 reason 即禁选原因(tooltip / toast 文案)。
+export function c2ComboAllowed(
+  format: C2PayloadFormat,
+  artifact: C2PayloadArtifact,
+  direction: C2Direction,
+  staged: boolean,
+  proto?: C2Proto,
+  target?: C2PayloadTarget,
+): { allowed: boolean; reason: string } {
+  const row = C2_PAYLOAD_MATRIX[artifact];
+  const am = c2ArtifactMeta(artifact);
+  if (!row) return { allowed: false, reason: `未知产物形态:${artifact}` };
+  if (!row.formats.includes(format)) {
+    return {
+      allowed: false,
+      reason: `${am.label} 仅支持 ${row.formats.join(" / ")} 格式(${format} 不可用)`,
+    };
+  }
+  if (staged && !row.staged) return { allowed: false, reason: row.stagedReason };
+  const dirs = row.directions ?? C2_DIRECTIONS;
+  if (!dirs.includes(direction)) {
+    return {
+      allowed: false,
+      reason: `${am.label} 仅支持${dirs.map((d) => c2DirectionMeta(d).label).join(" / ")}(${c2DirectionMeta(direction).label} 不可用)`,
+    };
+  }
+  if (target && row.targets && !row.targets.includes(target)) {
+    return {
+      allowed: false,
+      reason: `${am.label} 仅支持 ${row.targets.map((t) => c2PayloadTargetLabel(t)).join(" / ")} 目标(${c2PayloadTargetLabel(target)} 不可用)`,
+    };
+  }
+  if (proto && !C2_PROTO_FORMAT_SUPPORT[proto].includes(format)) {
+    const ok = C2_PROTO_FORMAT_SUPPORT[proto];
+    return {
+      allowed: false,
+      reason: `${c2ProtoMeta(proto).label} 传输下 ${format} 不可用(该协议载荷仅支持 ${ok.join(" / ")})`,
+    };
+  }
+  return { allowed: true, reason: "" };
+}
+
+// ---- 产物形态徽标/说明 ----
+
+const C2_ARTIFACT_META: Record<C2PayloadArtifact, { label: string; badge: string; desc: string; Icon: LucideIcon }> = {
+  script: {
+    label: "脚本",
+    badge: "bg-blue-500/15 text-blue-600 border-blue-500/30",
+    desc: "ps1 / bash / py 源码,目标机拉取后就地执行",
+    Icon: FileCodeIcon,
+  },
+  exe: {
+    label: "EXE",
+    badge: "bg-emerald-500/15 text-emerald-600 border-emerald-500/30",
+    desc: "gosrc 经 VPS go build 编译的可执行文件",
+    Icon: BinaryIcon,
+  },
+  dll: {
+    label: "DLL",
+    badge: "bg-purple-500/15 text-purple-600 border-purple-500/30",
+    desc: "c-shared 编译动态库,导出 Run 入口(rundll32 或加载器调用)",
+    Icon: BoxesIcon,
+  },
+  shellcode: {
+    label: "Shellcode",
+    badge: "bg-amber-500/15 text-amber-600 border-amber-500/30",
+    desc: "经 sRDI 转换,加载即执行",
+    Icon: ZapIcon,
+  },
+  ebpf: {
+    label: "eBPF",
+    badge: "bg-cyan-500/15 text-cyan-600 border-cyan-500/30",
+    desc: "linux + bind 专属触发器;构建需 VPS 有 clang",
+    Icon: AntennaIcon,
+  },
+};
+
+export function c2ArtifactMeta(artifact: string): { label: string; badge: string; desc: string; Icon: LucideIcon } {
+  return (
+    C2_ARTIFACT_META[artifact as C2PayloadArtifact] ?? {
+      label: artifact,
+      badge: "bg-muted text-muted-foreground",
+      desc: "",
+      Icon: PackageIcon,
+    }
+  );
+}
+
+// ---- 连接方向(reverse / bind)----
+
+const C2_DIRECTION_META: Record<C2Direction, { label: string; badge: string; desc: string }> = {
+  reverse: {
+    label: "反向",
+    badge: "bg-emerald-500/15 text-emerald-600 border-emerald-500/30",
+    desc: "beacon 主动连回平台监听器",
+  },
+  bind: {
+    label: "正向",
+    badge: "bg-amber-500/15 text-amber-600 border-amber-500/30",
+    desc: "beacon 在目标机监听端口,平台主动连接(仅 tcp/kcp)",
+  },
+};
+
+export function c2DirectionMeta(direction: string): { label: string; badge: string; desc: string } {
+  return (
+    C2_DIRECTION_META[direction as C2Direction] ?? {
+      label: direction,
+      badge: "bg-muted text-muted-foreground",
+      desc: "",
+    }
+  );
+}
+
+// c2SessionDirection 从会话 meta 里读连接方向:三期 bind 会话由平台在注册时标注
+// meta.direction="bind"(契约 §18);一期/反向数据缺省 reverse。meta 可能是
+// null(后端 nil map 序列化),按 unknown 兜底。
+export function c2SessionDirection(meta: unknown): C2Direction {
+  if (meta && typeof meta === "object" && (meta as Record<string, unknown>).direction === "bind") {
+    return "bind";
+  }
+  return "reverse";
+}
+
+// ══ 三期(契约 §21):插件板块(Agent G 追加,纯 append,不动上文) ══
+
+// ---- 插件形态 / 语言 / 平台徽标(插件库页与会话「插件」页签共用) ----
+
+const PLUGIN_KIND_META: Record<string, { label: string; badge: string }> = {
+  script: { label: "脚本", badge: "bg-blue-500/15 text-blue-600 border-blue-500/30" },
+  binary: { label: "二进制", badge: "bg-purple-500/15 text-purple-600 border-purple-500/30" },
+};
+
+export function c2PluginKindMeta(kind: string): { label: string; badge: string } {
+  return PLUGIN_KIND_META[kind] ?? { label: kind, badge: "bg-muted text-muted-foreground" };
+}
+
+const PLUGIN_LANGUAGE_META: Record<string, { label: string; badge: string }> = {
+  ps1: { label: "PowerShell", badge: "bg-sky-500/15 text-sky-600 border-sky-500/30" },
+  sh: { label: "Shell", badge: "bg-emerald-500/15 text-emerald-600 border-emerald-500/30" },
+  py: { label: "Python", badge: "bg-amber-500/15 text-amber-600 border-amber-500/30" },
+};
+
+export function c2PluginLanguageMeta(language: string): { label: string; badge: string } {
+  return PLUGIN_LANGUAGE_META[language] ?? { label: language, badge: "bg-muted text-muted-foreground" };
+}
+
+const PLUGIN_PLATFORM_BADGE: Record<string, string> = {
+  windows: "bg-blue-500/15 text-blue-600 border-blue-500/30",
+  linux: "bg-orange-500/15 text-orange-600 border-orange-500/30",
+  macos: "bg-zinc-500/15 text-zinc-600 border-zinc-500/30",
+  cross: "bg-teal-500/15 text-teal-600 border-teal-500/30",
+};
+
+// c2PluginPlatformBadge 插件平台徽标样式(文案复用上面的 c2PayloadTargetLabel)。
+export function c2PluginPlatformBadge(platform: string): string {
+  return PLUGIN_PLATFORM_BADGE[platform] ?? "bg-muted text-muted-foreground";
+}
+
+// ---- params_schema 的前端约定(与后端 server/c2_plugin.go 渲染器同一口径) ----
+
+/** 单个插件参数的声明(type: string|bool|enum,可选 default/options/desc)。 */
+export interface C2PluginParamDef {
+  name: string;
+  type: "string" | "bool" | "enum";
+  default: string;
+  options: string[];
+  desc: string;
+}
+
+// c2PluginParamDefs 把 params_schema 对象收敛成参数声明列表,供动态表单渲染;
+// 坏 schema 容错为空列表。file/content 是后端保留占位,不接受用户输入,这里同样
+// 剔除;after_clean 是 binary 清理开关,保留(bool 表单可切换)。
+export function c2PluginParamDefs(schema: Record<string, unknown> | null | undefined): C2PluginParamDef[] {
+  const out: C2PluginParamDef[] = [];
+  const raw =
+    schema && typeof schema === "object" && !Array.isArray(schema)
+      ? (schema as Record<string, unknown>)
+      : {};
+  for (const [name, value] of Object.entries(raw)) {
+    if (name === "file" || name === "content") continue;
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    const f = value as Record<string, unknown>;
+    const type = f.type === "bool" ? "bool" : f.type === "enum" ? "enum" : "string";
+    const options = Array.isArray(f.options)
+      ? f.options.filter((o): o is string => typeof o === "string")
+      : [];
+    const def =
+      typeof f.default === "string"
+        ? f.default
+        : typeof f.default === "boolean"
+          ? f.default
+            ? "1"
+            : "0"
+          : "";
+    out.push({
+      name,
+      type,
+      default: def,
+      options,
+      desc: typeof f.desc === "string" ? f.desc : "",
+    });
+  }
+  return out;
+}
+
+// c2PluginDefaultParams 按参数声明生成默认取值表(bool 归一 "1"/"0")。
+export function c2PluginDefaultParams(defs: C2PluginParamDef[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const d of defs) {
+    if (d.default !== "") {
+      out[d.name] = d.type === "bool" ? (["1", "true"].includes(d.default.toLowerCase()) ? "1" : "0") : d.default;
+    }
+  }
+  return out;
+}
+
+// c2PluginPlatformMatches 插件平台与会话操作系统的适配判断(cross 恒适配;
+// beacon 上报的 os 串按关键词识别 windows/linux/macos)。
+export function c2PluginPlatformMatches(platform: string, sessionOS: string): boolean {
+  if (!platform || platform === "cross") return true;
+  const os = (sessionOS ?? "").toLowerCase();
+  switch (platform) {
+    case "windows":
+      return os.includes("win");
+    case "linux":
+      return os.includes("linux");
+    case "macos":
+      return os.includes("dar") || os.includes("mac");
+    default:
+      return true;
+  }
 }

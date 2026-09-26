@@ -169,6 +169,29 @@ func ValidC2ListenerHostKind(k string) bool {
 	return k == C2ListenerHostKindLocal || k == C2ListenerHostKindVPS
 }
 
+// 监听器传输协议(三期 §18):http(一期)|ws|tcp|kcp|oss。https 与 DNS 系四期。
+const (
+	C2ProtoHTTP = "http"
+	C2ProtoWS   = "ws"
+	C2ProtoTCP  = "tcp"
+	C2ProtoKCP  = "kcp"
+	C2ProtoOSS  = "oss"
+)
+
+// ValidC2ListenerProto 校验监听器协议(空 = http 一期兼容)。
+func ValidC2ListenerProto(p string) bool {
+	switch p {
+	case "", C2ProtoHTTP, C2ProtoWS, C2ProtoTCP, C2ProtoKCP, C2ProtoOSS:
+		return true
+	}
+	return false
+}
+
+// C2ListenerTransportConfigured 判断该协议是否需要传输配置(oss 必需,kcp 可选 psk)。
+func C2ListenerTransportConfigured(proto string) bool {
+	return proto == C2ProtoOSS || proto == C2ProtoKCP
+}
+
 // ---- 监听器 ----
 
 // C2Listener 是 beacon 回连入口(不含 enc_key,可直接序列化为响应)。
@@ -192,25 +215,30 @@ type C2Listener struct {
 	VPSMachineID   int64  `json:"vps_machine_id"`
 	RemotePort     int    `json:"remote_port"`
 	VPSMachineName string `json:"vps_machine_name,omitempty"`
+	// 三期(§18):oss/kcp 的传输配置是否已设置(密文永不回显,仅此布尔)。
+	TransportConfigured bool `json:"transport_configured"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// c2ListenerCols 是监听器行的取列;enc_key 永不出现(单独 GetC2ListenerKey)。
-// 机器名用相关子查询带出(List/Get 共用同一取列串,口径一致)。
+// c2ListenerCols 是监听器行的取列;enc_key/transport_config_enc 永不出现
+// (分别单独 GetC2ListenerKey/GetC2ListenerTransportConfig)。机器名用相关子查询
+// 带出(List/Get 共用同一取列串,口径一致)。
 const c2ListenerCols = `l.id, l.name, l.proto, l.bind_host, l.port, l.url_path, l.callback,
 	l.enabled,
 	(SELECT COUNT(*) FROM c2_sessions cs WHERE cs.listener_id = l.id AND cs.status = 'online'),
 	l.notes, l.created_at, l.updated_at,
 	COALESCE(l.host_kind,'local'), COALESCE(l.vps_machine_id,0), l.remote_port,
-	COALESCE((SELECT vm.name FROM vps_machines vm WHERE vm.id = l.vps_machine_id), '')`
+	COALESCE((SELECT vm.name FROM vps_machines vm WHERE vm.id = l.vps_machine_id), ''),
+	(l.transport_config_enc IS NOT NULL AND length(l.transport_config_enc) > 0)`
 
 func scanC2Listener(sc interface{ Scan(...any) error }) (*C2Listener, error) {
 	var l C2Listener
 	if err := sc.Scan(&l.ID, &l.Name, &l.Proto, &l.BindHost, &l.Port, &l.URLPath, &l.Callback,
 		&l.Enabled, &l.SessionCount, &l.Notes, &l.CreatedAt, &l.UpdatedAt,
-		&l.HostKind, &l.VPSMachineID, &l.RemotePort, &l.VPSMachineName); err != nil {
+		&l.HostKind, &l.VPSMachineID, &l.RemotePort, &l.VPSMachineName,
+		&l.TransportConfigured); err != nil {
 		return nil, err
 	}
 	return &l, nil
@@ -218,7 +246,8 @@ func scanC2Listener(sc interface{ Scan(...any) error }) (*C2Listener, error) {
 
 // C2ListenerInput 是新建/编辑监听器的输入。EncKeySealed 是 server 层封好的
 // secretbox 密文(创建必填;编辑传 nil = 不改密钥——监听器密钥一经生成不可换,
-// 换了所有已投递载荷全部失效)。
+// 换了所有已投递载荷全部失效)。TransportConfigEnc 同法(三期 §18):oss 的
+// endpoint/bucket/AK/SK 与 kcp 的 psk 密封 JSON;编辑传 nil = 不改配置。
 type C2ListenerInput struct {
 	Name         string
 	BindHost     string
@@ -232,6 +261,9 @@ type C2ListenerInput struct {
 	HostKind     string
 	VPSMachineID int64
 	RemotePort   int
+	// 三期(§18):proto 空=http;TransportConfigEnc nil=不改(创建时为 NULL)。
+	Proto              string
+	TransportConfigEnc []byte
 }
 
 // normalizeC2ListenerInput 填默认值并校验。
@@ -242,6 +274,12 @@ func normalizeC2ListenerInput(in *C2ListenerInput) error {
 	in.Callback = strings.TrimSpace(in.Callback)
 	if in.Name == "" {
 		return fmt.Errorf("监听器名称必填")
+	}
+	if in.Proto == "" {
+		in.Proto = C2ProtoHTTP
+	}
+	if !ValidC2ListenerProto(in.Proto) {
+		return fmt.Errorf("无效协议: %q(仅 http/ws/tcp/kcp/oss)", in.Proto)
 	}
 	if in.BindHost == "" {
 		in.BindHost = "0.0.0.0"
@@ -280,10 +318,10 @@ func (d *DB) CreateC2Listener(in C2ListenerInput) (int64, error) {
 	var id int64
 	err := d.QueryRow(`
 INSERT INTO c2_listeners(name, bind_host, port, url_path, callback, enc_key, notes,
-	host_kind, vps_machine_id, remote_port)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+	host_kind, vps_machine_id, remote_port, proto, transport_config_enc)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
 		in.Name, in.BindHost, in.Port, in.URLPath, in.Callback, in.EncKeySealed, in.Notes,
-		in.HostKind, nullableID(in.VPSMachineID), in.RemotePort).Scan(&id)
+		in.HostKind, nullableID(in.VPSMachineID), in.RemotePort, in.Proto, in.TransportConfigEnc).Scan(&id)
 	return id, err
 }
 
@@ -318,19 +356,21 @@ func (d *DB) GetC2Listener(id int64) (*C2Listener, error) {
 }
 
 // UpdateC2Listener 更新监听器普通字段(整体覆盖,前端整表单提交);
-// EncKeySealed 为 nil = 不改密钥。
+// EncKeySealed 为 nil = 不改密钥;TransportConfigEnc 为 nil = 不改传输配置。
 func (d *DB) UpdateC2Listener(id int64, in C2ListenerInput) error {
 	if err := normalizeC2ListenerInput(&in); err != nil {
 		return err
 	}
 	_, err := d.Exec(`UPDATE c2_listeners SET
 	name=$2, bind_host=$3, port=$4, url_path=$5, callback=$6, notes=$7,
-	host_kind=$8, vps_machine_id=$9, remote_port=$10,
-	enc_key = CASE WHEN $11::boolean THEN $12 ELSE enc_key END
+	host_kind=$8, vps_machine_id=$9, remote_port=$10, proto=$11,
+	enc_key = CASE WHEN $12::boolean THEN $13 ELSE enc_key END,
+	transport_config_enc = CASE WHEN $14::boolean THEN $15 ELSE transport_config_enc END
 WHERE id=$1`,
 		id, in.Name, in.BindHost, in.Port, in.URLPath, in.Callback, in.Notes,
-		in.HostKind, nullableID(in.VPSMachineID), in.RemotePort,
-		in.EncKeySealed != nil, in.EncKeySealed)
+		in.HostKind, nullableID(in.VPSMachineID), in.RemotePort, in.Proto,
+		in.EncKeySealed != nil, in.EncKeySealed,
+		in.TransportConfigEnc != nil, in.TransportConfigEnc)
 	return err
 }
 
@@ -367,6 +407,24 @@ func (d *DB) GetC2ListenerKey(id int64) ([]byte, error) {
 	return sealed, err
 }
 
+// GetC2ListenerTransportConfig 读监听器传输配置密文(三期 §18;仅 server 层解封
+// 用——oss 启动/载荷渲染要 endpoint/bucket/AK/SK,kcp 要 psk,绝不进任何响应)。
+// 未配置返回 nil, nil。
+func (d *DB) GetC2ListenerTransportConfig(id int64) ([]byte, error) {
+	var sealed []byte
+	err := d.QueryRow(`SELECT transport_config_enc FROM c2_listeners WHERE id=$1`, id).Scan(&sealed)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if sealed == nil {
+		return nil, nil
+	}
+	return sealed, nil
+}
+
 // C2ListenerCounts 一次取齐(启用数, 总数),总览用。
 func (d *DB) C2ListenerCounts() (enabled, total int64, err error) {
 	err = d.QueryRow(`SELECT COUNT(*) FILTER (WHERE enabled), COUNT(*) FROM c2_listeners`).
@@ -398,15 +456,19 @@ type C2Session struct {
 	Status string `json:"status"`
 	Labels string `json:"labels"`
 	// Meta 是 beacon 上报的扩展信息,永不 nil(可直接序列化)。
-	Meta      map[string]any `json:"meta"`
-	FirstSeen time.Time      `json:"first_seen"`
-	LastSeen  time.Time      `json:"last_seen"`
+	// 三期(§18)正向连接会话在此标注 direction=bind。
+	Meta map[string]any `json:"meta"`
+	// Transport 是会话承载传输(http/ws/tcp/kcp/oss;一期数据回填 http)。
+	Transport string    `json:"transport"`
+	FirstSeen time.Time `json:"first_seen"`
+	LastSeen  time.Time `json:"last_seen"`
 }
 
-// c2SessionCols 是会话行的取列;可空 task_id 用 COALESCE 归零。
+// c2SessionCols 是会话行的取列;可空 task_id 用 COALESCE 归零,transport 兜底 http。
 const c2SessionCols = `s.id, s.listener_id, s.beacon_uid, s.sid, s.hostname, s.username, s.elevated,
 	s.os, s.arch, s.local_ips, s.pid, s.process, s.sleep_sec, s.jitter_pct,
-	COALESCE(s.task_id,0), s.status, s.labels, s.meta, s.first_seen, s.last_seen`
+	COALESCE(s.task_id,0), s.status, s.labels, s.meta, s.first_seen, s.last_seen,
+	COALESCE(s.transport,'http')`
 
 func scanC2Session(sc interface{ Scan(...any) error }) (*C2Session, error) {
 	var m C2Session
@@ -414,7 +476,7 @@ func scanC2Session(sc interface{ Scan(...any) error }) (*C2Session, error) {
 	if err := sc.Scan(&m.ID, &m.ListenerID, &m.BeaconUID, &m.SID, &m.Hostname, &m.Username,
 		&m.Elevated, &m.OS, &m.Arch, &m.LocalIPs, &m.PID, &m.Process,
 		&m.SleepSec, &m.JitterPct, &m.TaskID, &m.Status, &m.Labels, &meta,
-		&m.FirstSeen, &m.LastSeen); err != nil {
+		&m.FirstSeen, &m.LastSeen, &m.Transport); err != nil {
 		return nil, err
 	}
 	m.Meta = map[string]any{}
@@ -428,6 +490,8 @@ func scanC2Session(sc interface{ Scan(...any) error }) (*C2Session, error) {
 }
 
 // C2SessionInput 是 beacon 注册/复活的会话输入(由 manager 从 reg 信封映射)。
+// Transport/Direction 是三期(§18)追加:空 = 保持原值;Direction 仅正向连接
+// 会话带 "bind"(写入 meta.direction)。
 type C2SessionInput struct {
 	ListenerID int64
 	BeaconUID  string
@@ -440,6 +504,8 @@ type C2SessionInput struct {
 	LocalIPs   string
 	PID        int
 	Process    string
+	Transport  string
+	Direction  string
 }
 
 // normalizeC2SessionInput 校验注册输入。
@@ -456,18 +522,25 @@ func normalizeC2SessionInput(in *C2SessionInput) error {
 // UpsertC2Session 按 listener_id+beacon_uid 幂等注册:存在则刷新主机信息、换绑
 // 新 sid 并置回 online(复活),不存在则新建。sid 全局唯一:极端情况(uid 变了但
 // sid 撞上历史行)也按复活处理,保证唯一索引不被打破。
+// 三期(§18):Transport 空 = 保持原值(心跳路径);Direction 非空(仅 "bind")
+// 合并进 meta.direction,空 = 不动 meta。
 func (d *DB) UpsertC2Session(in C2SessionInput) (int64, error) {
 	if err := normalizeC2SessionInput(&in); err != nil {
 		return 0, err
 	}
+	// 注意:in.Transport 原样透传(空 = 保持原值,心跳路径);插入时的 http 兜底
+	// 由 INSERT 的 COALESCE(NULLIF($12,''),'http') 完成,这里不做归一化。
 	// 1) 同一 beacon(listener_id+beacon_uid)复活。
 	var id int64
 	err := d.QueryRow(`UPDATE c2_sessions SET
 	sid=$3, hostname=$4, username=$5, elevated=$6, os=$7, arch=$8, local_ips=$9,
-	pid=$10, process=$11, status='online', last_seen=now()
+	pid=$10, process=$11, status='online', last_seen=now(),
+	transport = CASE WHEN $12::text <> '' THEN $12 ELSE transport END,
+	meta = CASE WHEN $13::text <> '' THEN c2_sessions.meta || jsonb_build_object('direction', $13::text) ELSE meta END
 WHERE listener_id=$1 AND beacon_uid=$2 RETURNING id`,
 		in.ListenerID, in.BeaconUID, in.SID, in.Hostname, in.Username, in.Elevated,
-		in.OS, in.Arch, in.LocalIPs, in.PID, in.Process).Scan(&id)
+		in.OS, in.Arch, in.LocalIPs, in.PID, in.Process,
+		in.Transport, in.Direction).Scan(&id)
 	if err == nil {
 		return id, nil
 	}
@@ -476,15 +549,20 @@ WHERE listener_id=$1 AND beacon_uid=$2 RETURNING id`,
 	}
 	// 2) 新会话;sid 撞唯一索引时同样按复活更新。
 	err = d.QueryRow(`INSERT INTO c2_sessions
-	(listener_id, beacon_uid, sid, hostname, username, elevated, os, arch, local_ips, pid, process, status)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'online')
+	(listener_id, beacon_uid, sid, hostname, username, elevated, os, arch, local_ips, pid, process, status, transport, meta)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'online',
+	COALESCE(NULLIF($12,''),'http'),
+	CASE WHEN $13::text <> '' THEN jsonb_build_object('direction', $13::text) ELSE '{}'::jsonb END)
 ON CONFLICT (sid) DO UPDATE SET
 	hostname=EXCLUDED.hostname, username=EXCLUDED.username, elevated=EXCLUDED.elevated,
 	os=EXCLUDED.os, arch=EXCLUDED.arch, local_ips=EXCLUDED.local_ips,
-	pid=EXCLUDED.pid, process=EXCLUDED.process, status='online', last_seen=now()
+	pid=EXCLUDED.pid, process=EXCLUDED.process, status='online', last_seen=now(),
+	transport = CASE WHEN $12::text <> '' THEN $12 ELSE c2_sessions.transport END,
+	meta = CASE WHEN $13::text <> '' THEN c2_sessions.meta || jsonb_build_object('direction', $13::text) ELSE c2_sessions.meta END
 RETURNING id`,
 		in.ListenerID, in.BeaconUID, in.SID, in.Hostname, in.Username, in.Elevated,
-		in.OS, in.Arch, in.LocalIPs, in.PID, in.Process).Scan(&id)
+		in.OS, in.Arch, in.LocalIPs, in.PID, in.Process,
+		in.Transport, in.Direction).Scan(&id)
 	return id, err
 }
 

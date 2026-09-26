@@ -29,6 +29,9 @@ import { toast } from "sonner";
 import { TablePagination } from "@/components/table-pagination";
 import {
   C2_SESSION_STATUS_RANK,
+  c2DirectionMeta,
+  c2ProtoMeta,
+  c2SessionDirection,
   c2SessionStatusMeta,
   fmtSleep,
   fmtTime,
@@ -286,17 +289,18 @@ function C2SessionsInner() {
                 <TableHeader>
                   <TableRow className="hover:bg-transparent">
                     {/* 主机列不设宽度:table-fixed 下自动吃掉余量。
-                        固定列合计 688px(64+112+112+128+64+96+64+96),常规容器下余量充足;
+                        固定列合计 736px(64+96+96+112+64+64+80+64+96),常规容器下余量充足;
                         再加列必须先瘦身其他列,否则主机列会被压到看不见。 */}
                     <SortHead field="status" width="w-16">
                       状态
                     </SortHead>
                     <SortHead field="hostname">主机</SortHead>
-                    <TableHead className="w-28">用户</TableHead>
-                    <TableHead className="w-28">系统 / 架构</TableHead>
-                    <TableHead className="w-32">内网 IP</TableHead>
+                    <TableHead className="w-24">用户</TableHead>
+                    <TableHead className="w-24">系统 / 架构</TableHead>
+                    <TableHead className="w-28">内网 IP</TableHead>
+                    <TableHead className="w-16">传输</TableHead>
                     <TableHead className="w-16">Sleep</TableHead>
-                    <SortHead field="last_seen" width="w-24">
+                    <SortHead field="last_seen" width="w-20">
                       心跳
                     </SortHead>
                     <TableHead className="w-16">任务</TableHead>
@@ -358,6 +362,34 @@ function C2SessionsInner() {
                           <span className="block truncate font-mono text-xs" title={s.local_ips}>
                             {s.local_ips || "—"}
                           </span>
+                        </TableCell>
+                        {/* 三期:承载传输徽标(ws/tcp/kcp/oss/http)+ 正向(bind)方向徽标。 */}
+                        <TableCell>
+                          <div className="flex flex-col items-start gap-0.5">
+                            {(() => {
+                              const pm = c2ProtoMeta(String(s.transport ?? "http"));
+                              return (
+                                <Badge
+                                  variant="outline"
+                                  className={pm.badge}
+                                  title={`承载传输:${pm.label}${pm.desc ? ` · ${pm.desc}` : ""}`}
+                                >
+                                  <span className="max-w-12 truncate font-mono text-[10px]">
+                                    {String(s.transport ?? "http")}
+                                  </span>
+                                </Badge>
+                              );
+                            })()}
+                            {c2SessionDirection(s.meta) === "bind" ? (
+                              <Badge
+                                variant="outline"
+                                className={c2DirectionMeta("bind").badge}
+                                title={`连接方向:${c2DirectionMeta("bind").desc}`}
+                              >
+                                {c2DirectionMeta("bind").label}
+                              </Badge>
+                            ) : null}
+                          </div>
                         </TableCell>
                         <TableCell className="text-muted-foreground text-xs tabular-nums" title={`抖动 ${num(s.jitter_pct)}%`}>
                           {fmtSleep(s.sleep_sec, 0)}

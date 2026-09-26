@@ -735,3 +735,138 @@ func TestC2PayloadV2Columns(t *testing.T) {
 		t.Fatalf("构建产物回填未生效: %+v", got)
 	}
 }
+
+// TestC2ListenerV3Transport 三期监听器列(§18):proto 白名单、transport_config_enc
+// 读写与「nil=不改」语义、transport_configured 布尔、协议空值回落 http。
+func TestC2ListenerV3Transport(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v)", err)
+	}
+	defer d.Close()
+
+	// 非法协议拒绝。
+	if _, err := d.CreateC2Listener(C2ListenerInput{
+		Name: "bad-proto", Proto: "grpc", EncKeySealed: []byte("k"),
+	}); err == nil {
+		t.Fatal("grpc 应被白名单拒绝")
+	}
+
+	// oss 监听器:proto + 密封传输配置一起写入。
+	uid := fmt.Sprintf("c2-v3-%d", time.Now().UnixNano())
+	id, err := d.CreateC2Listener(C2ListenerInput{
+		Name: uid, Proto: C2ProtoOSS, BindHost: "127.0.0.1", Port: 0,
+		URLPath:            "oss-" + fmt.Sprint(time.Now().UnixNano()),
+		Callback:           "", // oss 无 callback 语义
+		EncKeySealed:       []byte("sealed-key"),
+		TransportConfigEnc: []byte("sealed-transport-config"),
+	})
+	if err != nil {
+		t.Fatalf("建 oss 监听器失败: %v", err)
+	}
+	defer d.DeleteC2Listener(id) //nolint:errcheck
+
+	l, err := d.GetC2Listener(id)
+	if err != nil || l == nil {
+		t.Fatalf("回读失败: %v(%v)", l, err)
+	}
+	if l.Proto != C2ProtoOSS || !l.TransportConfigured {
+		t.Fatalf("proto/configured 不符: %+v", l)
+	}
+	sealed, err := d.GetC2ListenerTransportConfig(id)
+	if err != nil || string(sealed) != "sealed-transport-config" {
+		t.Fatalf("传输配置密文读取不符: %q(%v)", sealed, err)
+	}
+
+	// 编辑不带配置 = 保持原值;proto 空 = 保持原值。
+	if err := d.UpdateC2Listener(id, C2ListenerInput{
+		Name: uid + "-v2", Notes: "改备注", Proto: C2ProtoOSS,
+	}); err != nil {
+		t.Fatalf("更新失败: %v", err)
+	}
+	if got, _ := d.GetC2Listener(id); got == nil || !got.TransportConfigured || got.Proto != C2ProtoOSS {
+		t.Fatalf("nil 配置应保持: %+v", got)
+	}
+	if sealed2, _ := d.GetC2ListenerTransportConfig(id); string(sealed2) != "sealed-transport-config" {
+		t.Fatalf("nil 更新不应动配置: %q", sealed2)
+	}
+	// 显式新配置覆盖。
+	if err := d.UpdateC2Listener(id, C2ListenerInput{
+		Name: uid + "-v2", Proto: C2ProtoOSS, TransportConfigEnc: []byte("new-config"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if sealed3, _ := d.GetC2ListenerTransportConfig(id); string(sealed3) != "new-config" {
+		t.Fatalf("新配置未覆盖: %q", sealed3)
+	}
+	// 未配置的监听器:GetTransportConfig 返回 nil,nil;configured=false。
+	l2 := c2TestListener(t, d, uid+"-plain")
+	defer d.DeleteC2Listener(l2.ID) //nolint:errcheck
+	if l2.TransportConfigured {
+		t.Fatal("http 监听器不应 configured")
+	}
+	if cfg, err := d.GetC2ListenerTransportConfig(l2.ID); err != nil || cfg != nil {
+		t.Fatalf("未配置应 nil,nil: %q(%v)", cfg, err)
+	}
+}
+
+// TestC2SessionV3Transport 三期会话列(§18):transport 写入与心跳保持、
+// direction=bind 合并进 meta 且心跳不动 meta。
+func TestC2SessionV3Transport(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v)", err)
+	}
+	defer d.Close()
+
+	l := c2TestListener(t, d, fmt.Sprintf("c2-v3-sess-%d", time.Now().UnixNano()))
+	defer d.DeleteC2Listener(l.ID) //nolint:errcheck
+
+	uid := fmt.Sprintf("uid-%d", time.Now().UnixNano())
+	sid := fmt.Sprintf("sid-%d", time.Now().UnixNano())
+	id, err := d.UpsertC2Session(C2SessionInput{
+		ListenerID: l.ID, BeaconUID: uid, SID: sid,
+		Hostname: "bind-host", Username: "bob", OS: "linux", Arch: "amd64",
+		Transport: C2ProtoKCP, Direction: "bind",
+	})
+	if err != nil {
+		t.Fatalf("注册失败: %v", err)
+	}
+	got, err := d.GetC2Session(id)
+	if err != nil || got == nil {
+		t.Fatalf("回读失败: %v(%v)", got, err)
+	}
+	if got.Transport != C2ProtoKCP {
+		t.Fatalf("transport 应为 kcp: %q", got.Transport)
+	}
+	if got.Meta["direction"] != "bind" {
+		t.Fatalf("meta.direction 应为 bind: %+v", got.Meta)
+	}
+
+	// 心跳路径(空 transport/direction)保持原值。
+	if _, err := d.UpsertC2Session(C2SessionInput{
+		ListenerID: l.ID, BeaconUID: uid, SID: fmt.Sprintf("sid2-%d", time.Now().UnixNano()),
+		Hostname: "bind-host", Username: "bob",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got2, err := d.GetC2Session(id)
+	if err != nil || got2 == nil {
+		t.Fatal(err)
+	}
+	if got2.Transport != C2ProtoKCP || got2.Meta["direction"] != "bind" {
+		t.Fatalf("心跳不应改 transport/meta: %+v meta=%+v", got2.Transport, got2.Meta)
+	}
+
+	// 一期口径:不传 transport 的新会话回落 http。
+	sid3 := fmt.Sprintf("sid3-%d", time.Now().UnixNano())
+	id3, err := d.UpsertC2Session(C2SessionInput{
+		ListenerID: l.ID, BeaconUID: uid + "-3", SID: sid3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got3, _ := d.GetC2Session(id3); got3 == nil || got3.Transport != C2ProtoHTTP {
+		t.Fatalf("默认 transport 应为 http: %+v", got3)
+	}
+}

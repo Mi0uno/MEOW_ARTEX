@@ -192,6 +192,12 @@ func (f *fakeStore) UpsertSession(in SessionInput) (int64, error) {
 			s.SID = in.SID
 			s.Hostname, s.Username, s.Elevated = in.Hostname, in.Username, in.Elevated
 			s.OS, s.Arch, s.LocalIPs, s.PID, s.Process = in.OS, in.Arch, in.LocalIPs, in.PID, in.Process
+			if in.Transport != "" {
+				s.Transport = in.Transport // 三期 §18:transport 标注(空=保持)
+			}
+			if in.Direction == "bind" && s.Meta != nil {
+				s.Meta["direction"] = "bind" // 正向连接标注
+			}
 			delete(f.sessBySID, s.SID) // sid 换新令牌
 			f.sessBySID[in.SID] = id
 			if s.Status != StatusDead { // dead 不复活
@@ -209,12 +215,24 @@ func (f *fakeStore) UpsertSession(in SessionInput) (int64, error) {
 		Hostname: in.Hostname, Username: in.Username, Elevated: in.Elevated,
 		OS: in.OS, Arch: in.Arch, LocalIPs: in.LocalIPs, PID: in.PID, Process: in.Process,
 		SleepSec: defaultSleepSec, JitterPct: defaultJitterPct,
-		Status: StatusOnline, Meta: map[string]any{},
+		Transport: transportFallback(in.Transport),
+		Status:    StatusOnline, Meta: map[string]any{},
 		FirstSeen: now, LastSeen: now,
+	}
+	if in.Direction == "bind" {
+		s.Meta["direction"] = "bind"
 	}
 	f.sessions[id] = s
 	f.sessBySID[in.SID] = id
 	return id, nil
+}
+
+// transportFallback 空传输回落 http(与 db 层 COALESCE 口径一致)。
+func transportFallback(t string) string {
+	if t == "" {
+		return ProtoHTTP
+	}
+	return t
 }
 
 func (f *fakeStore) GetSessionBySID(sid string) (*Session, error) {

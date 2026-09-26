@@ -2285,7 +2285,7 @@ export const api = {
       total: r.total,
     }));
   },
-  c2GeneratePayload: (input: { listener_id: number; format: C2PayloadFormat; target?: C2PayloadTarget; name?: string; evasion_profile_id?: number; build_vps_machine_id?: number }) =>
+  c2GeneratePayload: (input: { listener_id: number; format: C2PayloadFormat; target?: C2PayloadTarget; name?: string; evasion_profile_id?: number; build_vps_machine_id?: number; artifact?: C2PayloadArtifact; direction?: C2Direction; staged?: boolean }) =>
     post<{ id: number; oneliner: string; job_id?: number }>("/c2/payloads", input),
   c2DeletePayload: (id: number) => del<{ deleted: boolean }>(`/c2/payloads/${id}`),
   c2PayloadDownloadUrl: (id: number) => `/api/c2/payloads/${id}/download`,

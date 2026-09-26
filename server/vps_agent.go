@@ -31,8 +31,8 @@ import (
 	"github.com/Autumn-27/artex/agent"
 	pgdb "github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/vpscenter"
-	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/permission"
+	actool "github.com/Autumn-27/norma/tool"
 )
 
 // SSH 版 Bash 的执行参数(与 SDK Bash 语义对齐:缺省 120s、上限 600s)。
@@ -320,11 +320,11 @@ func (s *Server) toolVPSMachineInfo() actool.CoreTool {
 				"os": machine.OsName, "os_version": machine.OsVersion,
 				"kernel": machine.Kernel, "arch": machine.Arch,
 				"cpu_cores": machine.CPUCores, "memory_mb": machine.MemoryMB, "disk_gb": machine.DiskGB,
-				"tags":      tags,
-				"workspace": vpsWorkspacePath(machine.WorkspaceBase, taskID),
-				"installed_tools":    installed,
+				"tags":                tags,
+				"workspace":           vpsWorkspacePath(machine.WorkspaceBase, taskID),
+				"installed_tools":     installed,
 				"known_missing_tools": missing,
-				"hint": "工具清单来自最近一次工具检测;套装安装用 vps_install_toolset,单个工具也可用 Bash 直接装",
+				"hint":                "工具清单来自最近一次工具检测;套装安装用 vps_install_toolset,单个工具也可用 Bash 直接装",
 			})
 		})
 }

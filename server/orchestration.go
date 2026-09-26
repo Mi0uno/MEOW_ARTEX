@@ -45,6 +45,7 @@ func (s *Server) hostTools() ([]actool.CoreTool, map[string][]string) {
 	tools = append(tools, s.reportTools()...)     // 报告工具(archive_task_report → 报告中心)
 	tools = append(tools, s.vpsAgentTools()...)   // VPS agent 工具(vps_machine_info/vps_install_toolset, 绑 worker)
 	tools = append(tools, s.c2AgentTools()...)    // C2 agent 工具(c2_session/c2_exec/c2_upload 等 8 个, 绑 worker, stage=post)
+	tools = append(tools, s.c2PluginTools()...)   // C2 插件工具(c2_plugin_list/c2_plugin_run, 三期 §21, 绑 worker, stage=post)
 	custom, err := s.customTools()
 	if err != nil {
 		log.Printf("[custom-tool] 加载失败: %v", err)

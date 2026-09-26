@@ -75,15 +75,16 @@ func ValidC2EvasionTargetAV(av string) bool {
 	return false
 }
 
-// 免杀档案来源:manual(手工)/llm(AI 生成)。
+// 免杀档案来源:manual(手工)/llm(AI 生成)/builtin(三期知识库内置,契约 §20)。
 const (
-	C2EvasionSourceManual = "manual"
-	C2EvasionSourceLLM    = "llm"
+	C2EvasionSourceManual  = "manual"
+	C2EvasionSourceLLM     = "llm"
+	C2EvasionSourceBuiltin = "builtin"
 )
 
 // ValidC2EvasionSource 校验档案来源。
 func ValidC2EvasionSource(src string) bool {
-	return src == C2EvasionSourceManual || src == C2EvasionSourceLLM
+	return src == C2EvasionSourceManual || src == C2EvasionSourceLLM || src == C2EvasionSourceBuiltin
 }
 
 // ---- 免杀档案 ----

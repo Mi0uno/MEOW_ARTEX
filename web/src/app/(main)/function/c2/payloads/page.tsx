@@ -2,11 +2,14 @@
 
 // C2 中心 · 载荷与免杀 —— 载荷生成、投递与清单页。
 //
-// 生成:选监听器(回调地址为空的项禁选)+ 格式 + 目标 → 后端渲染源码落盘,
-// 返回 oneliner(目标机一行执行命令)。列表支持下载、复制一行命令、复制投递 URL
+// 生成(三期四级联动,契约 §19/§22):选监听器(回调地址为空的项禁选)→ 产物
+// (script/exe/dll/shellcode/ebpf)→ 格式(ps1/bash/py/gosrc)→ 方向
+// (reverse/bind)→ staged 开关;按 C2_PAYLOAD_MATRIX 合法组合表禁选非法组合并给
+// 原因 tooltip,监听器协议进一步收窄格式(kcp 仅 py/gosrc)。后端渲染源码/经 VPS
+// 编译后返回 oneliner。列表支持下载、复制一行命令、复制投递 URL
 // (<callback>/<url_path>/p/<token>)与删除。
-// 二期(契约 §13/§14):format=gosrc 可选指派一台 VPS 机器,生成转为异步构建
-// 作业(源码经 SSH 通道在机器上 go build,产物自动回传),前端 3 秒轮询作业状态;
+// 二期(契约 §13/§14):gosrc 可选指派一台 VPS 机器,生成转为异步构建作业
+// (源码经 SSH 通道在机器上 go build,产物自动回传),前端 3 秒轮询作业状态;
 // 免杀档案变形过的载荷标「已变形」,VPS 编译出的标「已编译」。变形与静态自测
 // 在「免杀工作台」页。
 
@@ -27,16 +30,26 @@ import {
   ShieldIcon,
   TerminalIcon,
   Trash2Icon,
+  TriangleAlertIcon,
 } from "lucide-react";
 import { toast } from "sonner";
 
 import { TablePagination } from "@/components/table-pagination";
 import {
   C2StaticReportView,
+  c2ArtifactMeta,
+  c2ComboAllowed,
+  c2DirectionMeta,
   c2JobStatusMeta,
   c2PayloadFormatMeta,
   c2PayloadTargetLabel,
+  c2ProtoMeta,
   c2VpsStatusLabel,
+  C2_DIRECTIONS,
+  C2_PAYLOAD_ARTIFACTS,
+  C2_PAYLOAD_FORMATS,
+  C2_PAYLOAD_MATRIX,
+  C2_PROTO_FORMAT_SUPPORT,
   fmtBytes,
   fmtTime,
   num,
@@ -67,18 +80,28 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
-import type { C2Job, C2Listener, C2Payload, C2PayloadFormat, C2PayloadTarget, VpsMachine } from "@/lib/types";
-import { copyText } from "@/lib/utils";
+import type {
+  C2Direction,
+  C2Job,
+  C2Listener,
+  C2Payload,
+  C2PayloadArtifact,
+  C2PayloadFormat,
+  C2PayloadTarget,
+  C2Proto,
+  VpsMachine,
+} from "@/lib/types";
+import { cn, copyText } from "@/lib/utils";
 
 const PAGE_SIZE = 50;
 
 // Radix Select 的 value="" 是保留值,空语义一律用哨兵串。
 const ALL = "__all__";
 
-const FORMATS: C2PayloadFormat[] = ["ps1", "bash", "py", "gosrc"];
 const TARGETS: C2PayloadTarget[] = ["windows", "linux", "macos", "cross"];
 
 type SortKey = "name" | "created";
@@ -97,9 +120,12 @@ function C2PayloadsInner() {
   const [listeners, setListeners] = React.useState<C2Listener[]>([]);
   const [payloads, setPayloads] = React.useState<C2Payload[]>([]);
   const [loading, setLoading] = React.useState(true);
-  // 生成表单。
+  // 生成表单(三期四级联动:产物 → 格式 → 方向 → staged;监听器协议再收窄格式)。
   const [genListener, setGenListener] = React.useState("");
+  const [genArtifact, setGenArtifact] = React.useState<C2PayloadArtifact>("script");
   const [genFormat, setGenFormat] = React.useState<C2PayloadFormat>("ps1");
+  const [genDirection, setGenDirection] = React.useState<C2Direction>("reverse");
+  const [genStaged, setGenStaged] = React.useState(false);
   const [genTarget, setGenTarget] = React.useState<C2PayloadTarget>("windows");
   const [genName, setGenName] = React.useState("");
   const [generating, setGenerating] = React.useState(false);
@@ -165,6 +191,43 @@ function C2PayloadsInner() {
 
   const reload = React.useCallback(() => load(filterListener), [load, filterListener]);
 
+  // ── 三期矩阵联动(契约 §19 合法组合表 + §18 协议支持矩阵)──
+  // 当前选中监听器的传输协议;未选监听器时不按协议收窄。
+  const selProto: C2Proto | undefined = React.useMemo(() => {
+    const l = listeners.find((x) => x.id === Number(genListener));
+    return (l?.proto as C2Proto | undefined) ?? undefined;
+  }, [listeners, genListener]);
+
+  // 某产物在当前协议下可用的格式(矩阵 ∩ 协议支持);空数组 = 该产物在当前协议下不可选。
+  const formatsForArtifact = React.useCallback(
+    (artifact: C2PayloadArtifact): C2PayloadFormat[] => {
+      const protoOk = selProto ? C2_PROTO_FORMAT_SUPPORT[selProto] : C2_PAYLOAD_FORMATS;
+      return C2_PAYLOAD_MATRIX[artifact].formats.filter((f) => protoOk.includes(f));
+    },
+    [selProto],
+  );
+
+  // 当前表单组合的校验结果(c2ComboAllowed 是组合表的唯一实现,也是最终闸门)。
+  const currentCombo = c2ComboAllowed(genFormat, genArtifact, genDirection, genStaged, selProto, genTarget);
+
+  // 产物 / 协议 / 各轴变化时,把表单修正回最近合法组合:每个分支只在当前组合
+  // 非法时才 setState(合法组合下全为空操作),所以依赖列全不会与用户选择打架。
+  // 协议切换经 formatsForArtifact 的身份变化触发(selProto 是它的 useCallback 依赖)。
+  React.useEffect(() => {
+    const row = C2_PAYLOAD_MATRIX[genArtifact];
+    if (row.directions && !row.directions.includes(genDirection)) setGenDirection(row.directions[0]);
+    if (!row.staged && genStaged) setGenStaged(false);
+    if (genArtifact === "ebpf") setGenTarget("linux");
+    const ok = formatsForArtifact(genArtifact);
+    if (ok.length === 0) {
+      // 当前协议下该产物整体不可用(如 kcp 下选 exe):自动退到第一个可选产物。
+      const alt = C2_PAYLOAD_ARTIFACTS.find((a) => formatsForArtifact(a).length > 0);
+      if (alt) setGenArtifact(alt);
+      return;
+    }
+    if (!ok.includes(genFormat)) setGenFormat(ok[0]);
+  }, [genArtifact, genDirection, genStaged, genFormat, formatsForArtifact]);
+
   // 构建作业轮询:每 3 秒拉一次,结束( done / error )即停并刷新列表。
   React.useEffect(() => {
     if (!pollJobId) return;
@@ -203,9 +266,17 @@ function C2PayloadsInner() {
       toast.error("该监听器未配置回调地址,请先到「监听器」页补上再生成载荷");
       return;
     }
+    // 最终闸门:按 §19 合法组合表 + 协议支持矩阵复检,失败把原因报出来。
+    const gate = c2ComboAllowed(genFormat, genArtifact, genDirection, genStaged, selProto, genTarget);
+    if (!gate.allowed) {
+      toast.error(`非法组合:${gate.reason}`);
+      return;
+    }
     setGenerating(true);
     try {
-      const r = await api.c2GeneratePayload({
+      // 三期 v3 扩展字段(artifact/direction/staged)随请求体下发;冻结的
+      // c2GeneratePayload 签名尚未声明,后端按契约 §19 组合表接收并 400 兜底。
+      const input = {
         listener_id: Number(genListener),
         format: genFormat,
         target: genTarget,
@@ -213,7 +284,11 @@ function C2PayloadsInner() {
         // gosrc 且选了机器 → 走 VPS 构建作业(异步);否则保持一期直出源码 zip。
         build_vps_machine_id:
           genFormat === "gosrc" && genBuildMachine ? Number(genBuildMachine) : undefined,
-      });
+        artifact: genArtifact,
+        direction: genDirection,
+        staged: genStaged,
+      };
+      const r = await api.c2GeneratePayload(input);
       if (r.job_id) {
         toast.success(`构建作业 #${r.job_id} 已创建,正在 VPS 上编译…`);
         setPolledJob(null);
@@ -318,7 +393,8 @@ function C2PayloadsInner() {
       <div className="mb-4">
         <h1 className="font-semibold text-xl">C2 中心 · 载荷与免杀</h1>
         <p className="text-muted-foreground text-sm">
-          生成 beacon 源码载荷(ps1 / bash / py / go 源码工程),复制一行命令或投递 URL 到目标机执行即可上线。
+          按「产物 → 格式 → 方向 → staged」四级联动生成 beacon 载荷(脚本 / EXE / DLL / Shellcode / eBPF),
+          复制一行命令或投递 URL 到目标机执行即可上线;非法组合会禁选并标注原因。
         </p>
       </div>
 
@@ -343,38 +419,30 @@ function C2PayloadsInner() {
                         还没有监听器,请先到「监听器」页创建
                       </SelectItem>
                     ) : (
-                      listeners.map((l) => (
-                        <SelectItem key={l.id} value={String(l.id)} disabled={!l.callback}>
-                          {l.name}
-                          {l.callback ? `(${l.callback})` : "(未配置回调地址)"}
-                        </SelectItem>
-                      ))
+                      listeners.map((l) => {
+                        const pm = c2ProtoMeta(String(l.proto ?? "http"));
+                        return (
+                          <SelectItem key={l.id} value={String(l.id)} disabled={!l.callback}>
+                            [{pm.label}] {l.name}
+                            {l.callback ? `(${l.callback})` : "(未配置回调地址)"}
+                          </SelectItem>
+                        );
+                      })
                     )}
                   </SelectGroup>
                 </SelectContent>
               </Select>
-              <p className="text-muted-foreground text-[10px]">回调地址为空的监听器不可选:先到「监听器」页补齐回调地址</p>
-            </div>
-            <div className="grid gap-1.5">
-              <Label>格式</Label>
-              <Select value={genFormat} onValueChange={(v) => setGenFormat(v as C2PayloadFormat)}>
-                <SelectTrigger className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectGroup>
-                    {FORMATS.map((f) => (
-                      <SelectItem key={f} value={f}>
-                        {f === "gosrc" ? "gosrc(Go 源码工程)" : f}
-                      </SelectItem>
-                    ))}
-                  </SelectGroup>
-                </SelectContent>
-              </Select>
+              <p className="text-muted-foreground text-[10px]">
+                回调地址为空的监听器不可选;选中监听器的协议会收窄可用格式(kcp 仅 py / gosrc)
+              </p>
             </div>
             <div className="grid gap-1.5">
               <Label>目标平台</Label>
-              <Select value={genTarget} onValueChange={(v) => setGenTarget(v as C2PayloadTarget)}>
+              <Select
+                value={genTarget}
+                onValueChange={(v) => setGenTarget(v as C2PayloadTarget)}
+                disabled={genArtifact === "ebpf"}
+              >
                 <SelectTrigger className="w-full">
                   <SelectValue />
                 </SelectTrigger>
@@ -388,8 +456,11 @@ function C2PayloadsInner() {
                   </SelectGroup>
                 </SelectContent>
               </Select>
+              <p className="text-muted-foreground text-[10px]">
+                {genArtifact === "ebpf" ? "eBPF 仅支持 Linux(tc/XDP 触发器)" : "决定载荷脚本的解释器 / 编译目标"}
+              </p>
             </div>
-            <div className="grid gap-1.5">
+            <div className="grid gap-1.5 lg:col-span-2">
               <Label htmlFor="c2-payload-name">名称(可选)</Label>
               <div className="flex items-center gap-2">
                 <Input
@@ -412,6 +483,145 @@ function C2PayloadsInner() {
                 </Button>
               </div>
             </div>
+          </div>
+
+          {/* ── 产物(四级联动第一级):五张产物卡,说明写在选项旁 ── */}
+          <div className="mt-3 grid gap-1.5">
+            <Label>产物形态</Label>
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
+              {C2_PAYLOAD_ARTIFACTS.map((a) => {
+                const m = c2ArtifactMeta(a);
+                const active = genArtifact === a;
+                const ok = formatsForArtifact(a);
+                // 当前协议下该产物无任何合法格式(如 kcp 下的 exe/dll/shellcode)时禁选。
+                const unavailable = ok.length === 0;
+                return (
+                  <button
+                    key={a}
+                    type="button"
+                    disabled={unavailable}
+                    title={
+                      unavailable && selProto
+                        ? `${c2ProtoMeta(selProto).label} 传输下 ${m.label} 不可用(该协议载荷仅支持 ${C2_PROTO_FORMAT_SUPPORT[selProto].join(" / ")})`
+                        : m.desc
+                    }
+                    onClick={() => setGenArtifact(a)}
+                    className={cn(
+                      "rounded-md border p-2 text-left transition-colors",
+                      active
+                        ? "border-primary bg-primary/5 ring-primary/30 ring-1"
+                        : "hover:border-primary/40 hover:bg-muted/40",
+                      unavailable && "cursor-not-allowed opacity-50",
+                    )}
+                  >
+                    <span className="flex items-center gap-1.5">
+                      <m.Icon className={cn("size-3.5", active ? "text-primary" : "text-muted-foreground")} />
+                      <span className="text-xs font-medium">{m.label}</span>
+                    </span>
+                    <span className="text-muted-foreground mt-1 block text-[10px] leading-snug">{m.desc}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* ── 格式 / 方向 / staged(四级联动的后三级)── */}
+          <div className="mt-3 grid gap-3 lg:grid-cols-5">
+            <div className="grid gap-1.5">
+              <Label>格式</Label>
+              <Select value={genFormat} onValueChange={(v) => setGenFormat(v as C2PayloadFormat)}>
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    {C2_PAYLOAD_FORMATS.map((f) => {
+                      const row = C2_PAYLOAD_MATRIX[genArtifact];
+                      const inArtifact = row.formats.includes(f);
+                      const protoOk = !selProto || C2_PROTO_FORMAT_SUPPORT[selProto].includes(f);
+                      const reason = !inArtifact
+                        ? c2ComboAllowed(f, genArtifact, genDirection, genStaged).reason
+                        : !protoOk
+                          ? c2ComboAllowed(f, genArtifact, genDirection, genStaged, selProto).reason
+                          : "";
+                      return (
+                        <SelectItem key={f} value={f} disabled={!inArtifact || !protoOk} title={reason}>
+                          {f === "gosrc" ? "gosrc(Go 源码工程)" : f}
+                        </SelectItem>
+                      );
+                    })}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+              <p className="text-muted-foreground text-[10px]">
+                {selProto
+                  ? `${c2ProtoMeta(selProto).label} 传输支持:${C2_PROTO_FORMAT_SUPPORT[selProto].join(" / ")}`
+                  : "灰选项为当前产物 / 协议不支持的格式,悬停可看原因"}
+              </p>
+            </div>
+            <div className="grid gap-1.5">
+              <Label>连接方向</Label>
+              <Select value={genDirection} onValueChange={(v) => setGenDirection(v as C2Direction)}>
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    {C2_DIRECTIONS.map((d) => {
+                      const dm = c2DirectionMeta(d);
+                      const allowed = c2ComboAllowed(genFormat, genArtifact, d, genStaged, selProto, genTarget).allowed;
+                      return (
+                        <SelectItem
+                          key={d}
+                          value={d}
+                          disabled={!allowed}
+                          title={allowed ? dm.desc : c2ComboAllowed(genFormat, genArtifact, d, genStaged, selProto, genTarget).reason}
+                        >
+                          {dm.label}
+                        </SelectItem>
+                      );
+                    })}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+              <p className="text-muted-foreground text-[10px]">{c2DirectionMeta(genDirection).desc}</p>
+            </div>
+            <div className="grid gap-1.5 lg:col-span-2">
+              <Label className="flex items-center gap-2">
+                Stage 模式(staged)
+                <Switch
+                  checked={genStaged}
+                  disabled={!C2_PAYLOAD_MATRIX[genArtifact].staged}
+                  onCheckedChange={setGenStaged}
+                  title={C2_PAYLOAD_MATRIX[genArtifact].staged ? "开启后产物为小体积 stager" : C2_PAYLOAD_MATRIX[genArtifact].stagedReason}
+                  aria-label="staged 开关"
+                />
+              </Label>
+              {genStaged && genArtifact === "exe" ? (
+                <p className="flex items-start gap-1.5 rounded-md border border-red-500/40 bg-red-500/10 px-2.5 py-1.5 text-[11px] text-red-600 dark:text-red-400">
+                  <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
+                  staged exe:stager 拉取完整产物后落盘执行,OPSEC 弱——完整产物会落在目标磁盘上;推荐
+                  stageless 或 shellcode 反射加载。
+                </p>
+              ) : genStaged && genArtifact === "shellcode" ? (
+                <p className="text-muted-foreground text-[10px]">
+                  staged shellcode:sRDI bootstrap 从信道拉取 DLL stage 后反射加载。
+                </p>
+              ) : !C2_PAYLOAD_MATRIX[genArtifact].staged ? (
+                <p className="text-muted-foreground text-[10px]" title={C2_PAYLOAD_MATRIX[genArtifact].stagedReason}>
+                  {C2_PAYLOAD_MATRIX[genArtifact].stagedReason}
+                </p>
+              ) : (
+                <p className="text-muted-foreground text-[10px]">关闭 = stageless 整段直出;开启 = 先投小体积 stager</p>
+              )}
+            </div>
+            {!currentCombo.allowed ? (
+              <div className="lg:col-span-5">
+                <p className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-700 dark:text-amber-400">
+                  当前组合不可用:{currentCombo.reason}
+                </p>
+              </div>
+            ) : null}
           </div>
 
           {/* gosrc 专属:可选指派一台 VPS 机器编译(二期,契约 §14)。 */}
@@ -444,7 +654,8 @@ function C2PayloadsInner() {
                   </SelectContent>
                 </Select>
                 <p className="text-muted-foreground text-[10px]">
-                  选机器后生成转为异步构建作业:源码经 SSH 通道在机器上编译,产物自动回传(机器需装 Go)
+                  选机器后生成转为异步构建作业:源码经 SSH 通道在机器上编译,产物自动回传(机器需装 Go
+                  {genArtifact === "ebpf" ? ";eBPF 触发器构建还需 clang,缺失时作业明确报错" : ""})
                 </p>
               </div>
             </div>
@@ -575,6 +786,33 @@ function C2PayloadsInner() {
                             <Badge variant="outline" className={fm.badge}>
                               {fm.label}
                             </Badge>
+                            {p.artifact && p.artifact !== "script" ? (
+                              <Badge
+                                variant="outline"
+                                className={c2ArtifactMeta(String(p.artifact)).badge}
+                                title={c2ArtifactMeta(String(p.artifact)).desc}
+                              >
+                                {c2ArtifactMeta(String(p.artifact)).label}
+                              </Badge>
+                            ) : null}
+                            {p.direction === "bind" ? (
+                              <Badge
+                                variant="outline"
+                                className={c2DirectionMeta("bind").badge}
+                                title={c2DirectionMeta("bind").desc}
+                              >
+                                {c2DirectionMeta("bind").label}
+                              </Badge>
+                            ) : null}
+                            {p.staged ? (
+                              <Badge
+                                variant="outline"
+                                className="border-orange-500/30 bg-orange-500/15 text-orange-600"
+                                title="stage 模式:产物为 stager,拉取完整产物后再执行"
+                              >
+                                staged
+                              </Badge>
+                            ) : null}
                             {p.evasion_profile_id > 0 ? (
                               <Badge
                                 variant="outline"

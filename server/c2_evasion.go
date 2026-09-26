@@ -98,6 +98,7 @@ func (s *Server) initC2Evasion() {
 		}
 	}
 	s.seedC2EvasionTool()
+	s.seedC2EvasionKB() // 三期 §20:免杀知识库内置档案(幂等,Agent E;契约 §23 集成项)
 	log.Printf("[c2-evasion] 免杀工作台已启动(档案/变形作业/静态自测)")
 }
 

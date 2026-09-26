@@ -17,7 +17,7 @@
 import * as React from "react";
 
 import Link from "next/link";
-import { useSearchParams } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 
 import {
   ArrowLeftIcon,
@@ -31,6 +31,8 @@ import {
   HistoryIcon,
   InfoIcon,
   Loader2Icon,
+  PlugZapIcon,
+  PuzzleIcon,
   RefreshCwIcon,
   SkullIcon,
   SquareTerminalIcon,
@@ -40,6 +42,9 @@ import {
 import { toast } from "sonner";
 
 import {
+  c2DirectionMeta,
+  c2ProtoMeta,
+  c2SessionDirection,
   c2SessionStatusMeta,
   c2TaskInputText,
   c2TaskKindLabel,
@@ -53,6 +58,8 @@ import {
   pathJoin,
   relTime,
 } from "@/components/c2-shared";
+// 三期(契约 §21,Agent G):会话详情「插件」页签——插件库选择/参数表单/运行入队。
+import { C2PluginRunPanel } from "@/components/c2-plugin-run-panel";
 import { TablePagination } from "@/components/table-pagination";
 import {
   AlertDialog,
@@ -81,7 +88,7 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectVa
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
-import type { C2Session, C2Task, C2Transfer } from "@/lib/types";
+import type { C2Listener, C2Session, C2Task, C2Transfer } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const ALL = "__all__";
@@ -136,6 +143,7 @@ function C2DetailBody({ sessionId, initialTab }: { sessionId: number; initialTab
   const [session, setSession] = React.useState<C2Session | null>(null);
   const [failed, setFailed] = React.useState(false);
   const [sleepOpen, setSleepOpen] = React.useState(false);
+  const [connectOpen, setConnectOpen] = React.useState(false);
   const [killOpen, setKillOpen] = React.useState(false);
   const [killBusy, setKillBusy] = React.useState(false);
 
@@ -175,10 +183,14 @@ function C2DetailBody({ sessionId, initialTab }: { sessionId: number; initialTab
   }
 
   const meta = session ? c2SessionStatusMeta(String(session.status)) : null;
+  // 三期:承载传输与连接方向(bind 会话由平台在 meta.direction 标注,契约 §18)。
+  const transportMeta = session ? c2ProtoMeta(String(session.transport ?? "http")) : null;
+  const direction = session ? c2SessionDirection(session.meta) : "reverse";
+  const directionMeta = c2DirectionMeta(direction);
 
   return (
     <div className="flex flex-1 flex-col">
-      {/* ── 页头:返回 / 主机名 / 状态 / 全局操作 ── */}
+      {/* ── 页头:返回 / 主机名 / 状态 / 传输与方向徽标 / 全局操作 ── */}
       <header className="sticky top-0 z-10 border-b bg-background/95 px-4 py-3 backdrop-blur lg:px-6">
         <div className="flex flex-wrap items-center gap-2">
           <Button asChild variant="ghost" size="sm" className="text-muted-foreground">
@@ -196,6 +208,21 @@ function C2DetailBody({ sessionId, initialTab }: { sessionId: number; initialTab
               {meta.label}
             </span>
           ) : null}
+          {transportMeta ? (
+            <Badge
+              variant="outline"
+              className={transportMeta.badge}
+              title={`承载传输:${transportMeta.label}${transportMeta.desc ? ` · ${transportMeta.desc}` : ""}`}
+            >
+              <transportMeta.Icon className="size-2.5" />
+              {transportMeta.label}
+            </Badge>
+          ) : null}
+          {direction === "bind" ? (
+            <Badge variant="outline" className={directionMeta.badge} title={`连接方向:${directionMeta.desc}`}>
+              {directionMeta.label} · bind
+            </Badge>
+          ) : null}
           {session?.elevated ? (
             <Badge variant="outline" className="border-red-500/30 bg-red-500/15 text-red-600">
               高权限
@@ -207,6 +234,10 @@ function C2DetailBody({ sessionId, initialTab }: { sessionId: number; initialTab
             </code>
           ) : null}
           <div className="ml-auto flex items-center gap-2">
+            <Button variant="outline" size="sm" onClick={() => setConnectOpen(true)} disabled={!session}>
+              <PlugZapIcon className="size-3.5" />
+              正向连接
+            </Button>
             <Button variant="outline" size="sm" onClick={() => setSleepOpen(true)} disabled={!session}>
               <TimerIcon className="size-3.5" />
               心跳节奏
@@ -234,6 +265,14 @@ function C2DetailBody({ sessionId, initialTab }: { sessionId: number; initialTab
             <MetaRow label="进程" value={session ? (session.process ? `${session.process} (${session.pid})` : "—") : "…"} mono />
             <MetaRow label="归属监听器" value={session ? `#${session.listener_id}` : "…"} />
             <MetaRow
+              label="承载传输"
+              value={session ? c2ProtoMeta(String(session.transport ?? "http")).label : "…"}
+            />
+            <MetaRow
+              label="连接方向"
+              value={session ? (direction === "bind" ? `${directionMeta.label}(bind,平台主动连接)` : "反向(reverse,beacon 回连)") : "…"}
+            />
+            <MetaRow
               label="心跳节奏"
               value={session ? `${fmtSleep(session.sleep_sec, session.jitter_pct)}(抖动 ${num(session?.jitter_pct)}%)` : "…"}
             />
@@ -257,6 +296,11 @@ function C2DetailBody({ sessionId, initialTab }: { sessionId: number; initialTab
             <FolderIcon className="size-3.5" />
             文件
           </TabsTrigger>
+          {/* 三期(契约 §21,Agent G):插件页签。 */}
+          <TabsTrigger value="plugins">
+            <PuzzleIcon className="size-3.5" />
+            插件
+          </TabsTrigger>
           <TabsTrigger value="tasks">
             <HistoryIcon className="size-3.5" />
             流水
@@ -272,6 +316,10 @@ function C2DetailBody({ sessionId, initialTab }: { sessionId: number; initialTab
         </TabsContent>
         <TabsContent value="files" className="mt-0">
           {session ? <FilesTab session={session} /> : null}
+        </TabsContent>
+        {/* 三期(契约 §21,Agent G):插件页签。 */}
+        <TabsContent value="plugins" className="mt-0">
+          {session ? <C2PluginRunPanel session={session} /> : null}
         </TabsContent>
         <TabsContent value="tasks" className="mt-0">
           {session ? <TasksTab session={session} /> : null}
@@ -290,6 +338,9 @@ function C2DetailBody({ sessionId, initialTab }: { sessionId: number; initialTab
           load();
         }}
       />
+
+      {/* 三期:正向连接(bind)——平台以所选 tcp/kcp 监听器的密钥/协议主动 dial 目标。 */}
+      <C2ConnectDialog open={connectOpen} onOpenChange={setConnectOpen} session={session} />
 
       {/* 终止确认:置 dead 后由 beacon 下次心跳自行退出。 */}
       <AlertDialog open={killOpen} onOpenChange={setKillOpen}>
@@ -432,6 +483,172 @@ function C2SleepDialog({
           </Button>
           <Button disabled={busy} onClick={() => void submit()}>
             {busy ? "保存中…" : "保存"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ── 正向连接(三期,契约 §18)─────────────────────────────────────────────────
+
+// C2ConnectDialog 正向连接:平台以所选 tcp/kcp 监听器的密钥/协议主动 dial 目标
+// (bind beacon 在目标机监听端口等首帧 reg)。仅 tcp/kcp 支持正向;连接失败
+// (TCP 拒绝 / 超时最常见)把后端错误原文报出来。成功后跳新会话详情。
+function C2ConnectDialog({
+  open,
+  onOpenChange,
+  session,
+}: {
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+  session: C2Session | null;
+}) {
+  const router = useRouter();
+  const [listeners, setListeners] = React.useState<C2Listener[]>([]);
+  const [listenerId, setListenerId] = React.useState("");
+  const [host, setHost] = React.useState("");
+  const [portText, setPortText] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+
+  React.useEffect(() => {
+    if (!open) return;
+    setHost("");
+    setPortText("");
+    let alive = true;
+    api
+      .c2Listeners()
+      .then((r) => {
+        if (!alive) return;
+        const ls = r.listeners ?? [];
+        setListeners(ls);
+        // 预选:当前会话的监听器(若支持正向),否则第一个 tcp/kcp 监听器。
+        const bindable = (l: C2Listener) => l.proto === "tcp" || l.proto === "kcp";
+        const cur = ls.find((l) => l.id === session?.listener_id && bindable(l));
+        const first = cur ?? ls.find(bindable);
+        setListenerId(first ? String(first.id) : "");
+      })
+      .catch(() => {
+        if (alive) setListeners([]);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [open, session?.listener_id]);
+
+  const submit = async () => {
+    const lid = Number(listenerId);
+    if (!Number.isInteger(lid) || lid <= 0) {
+      toast.error("请选择用于正向连接的监听器(仅 tcp / kcp 支持)");
+      return;
+    }
+    const h = host.trim();
+    if (!h) {
+      toast.error("请填写目标 host(bind beacon 正在监听的地址)");
+      return;
+    }
+    const port = Number(portText);
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+      toast.error("端口必须是 1-65535 的整数");
+      return;
+    }
+    setBusy(true);
+    try {
+      const r = await api.c2ConnectBind({ listener_id: lid, host: h, port });
+      toast.success(`正向连接成功,会话 #${r.session_id} 已建立,正在跳转…`);
+      onOpenChange(false);
+      router.push(`/function/c2/detail?id=${r.session_id}`);
+    } catch (e) {
+      // 目标无 beacon 监听时 TCP 拒绝 / 超时都会发生:错误原文直接呈现。
+      toast.error(`正向连接失败:${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>正向连接(bind)</DialogTitle>
+          <DialogDescription>
+            目标机上的 bind beacon 正在监听端口等待握手:平台以所选监听器的密钥与协议主动拨号建立会话。仅
+            tcp / kcp 监听器支持正向连接。
+          </DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-3">
+          <div className="grid gap-1.5">
+            <Label htmlFor="c2-connect-listener">监听器(提供密钥与协议)</Label>
+            <Select value={listenerId} onValueChange={setListenerId}>
+              <SelectTrigger className="w-full">
+                <SelectValue placeholder="选择 tcp / kcp 监听器" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  {listeners.length === 0 ? (
+                    <SelectItem value="__none__" disabled>
+                      没有可用监听器,请先到「监听器」页创建
+                    </SelectItem>
+                  ) : (
+                    listeners.map((l) => {
+                      const bindable = l.proto === "tcp" || l.proto === "kcp";
+                      return (
+                        <SelectItem key={l.id} value={String(l.id)} disabled={!bindable}>
+                          [{c2ProtoMeta(String(l.proto ?? "http")).label}] {l.name}
+                          {!bindable ? "(不支持正向)" : ""}
+                        </SelectItem>
+                      );
+                    })
+                  )}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+            <p className="text-muted-foreground text-[10px]">
+              平台用该监听器的密钥与目标握手,协议必须与 bind beacon 一致
+            </p>
+          </div>
+          <div className="grid grid-cols-3 gap-3">
+            <div className="col-span-2 grid gap-1.5">
+              <Label htmlFor="c2-connect-host">目标 host</Label>
+              <Input
+                id="c2-connect-host"
+                value={host}
+                onChange={(e) => setHost(e.target.value)}
+                placeholder="bind beacon 监听的地址,如 10.0.0.5"
+                className="font-mono"
+              />
+            </div>
+            <div className="grid gap-1.5">
+              <Label htmlFor="c2-connect-port">端口</Label>
+              <Input
+                id="c2-connect-port"
+                type="number"
+                min={1}
+                max={65535}
+                value={portText}
+                onChange={(e) => setPortText(e.target.value)}
+                placeholder="如 4444"
+                className="font-mono"
+              />
+            </div>
+          </div>
+          <p className="text-muted-foreground text-[10px]">
+            连不上会原样报错(TCP 拒绝 / 超时最常见):确认目标防火墙放行、bind beacon 已在监听。
+          </p>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={busy}>
+            取消
+          </Button>
+          <Button disabled={busy} onClick={() => void submit()}>
+            {busy ? (
+              <>
+                <Loader2Icon className="size-3.5 animate-spin" />
+                连接中…
+              </>
+            ) : (
+              "连接"
+            )}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -1096,7 +1313,7 @@ function TasksTab({ session }: { session: C2Session }) {
       return next;
     });
 
-  const KINDS = ["shell", "files_list", "upload", "download", "loot", "info"];
+  const KINDS = ["shell", "files_list", "upload", "download", "loot", "info", "plugin"];
 
   return (
     <Card>
@@ -1269,6 +1486,12 @@ function ProfileTab({ session }: { session: C2Session }) {
           </Row>
           <Row label="归属监听器">
             <span className="font-mono">#{session.listener_id}</span>
+          </Row>
+          <Row label="承载传输">{c2ProtoMeta(String(session.transport ?? "http")).label}</Row>
+          <Row label="连接方向">
+            {c2SessionDirection(session.meta) === "bind"
+              ? "正向 bind(平台主动连接,见页头「正向连接」)"
+              : "反向 reverse(beacon 回连)"}
           </Row>
           <Row label="归属任务">{num(session.task_id) > 0 ? `#${session.task_id}` : "未绑定"}</Row>
           <Row label="标签">{session.labels || "—"}</Row>

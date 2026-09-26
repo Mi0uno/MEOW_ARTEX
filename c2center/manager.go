@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 )
@@ -71,6 +72,10 @@ type Listener struct {
 	VPSMachineID int64  `json:"vps_machine_id"` // vps 载体的机器 id;local=0
 	RemotePort   int    `json:"remote_port"`    // vps 载体的远端监听端口;local=0
 
+	// 三期(§18,Agent T):传输配置明文 JSON,仅供 RenderPayload 生成 oss/kcp 载荷
+	// 用(server 层解封后注入),json:"-" 永不序列化、永不入库(库里只有密封形态)。
+	TransportConfigJSON string `json:"-"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -94,32 +99,39 @@ type ListenerInput struct {
 // Session 是一台上线主机。sid 是 beacon 持有的会话令牌;listener_id+beacon_uid 幂等复活。
 // TaskID 0=未绑定(schema 可空列的 COALESCE 惯例)。
 type Session struct {
-	ID         int64          `json:"id"`
-	ListenerID int64          `json:"listener_id"`
-	BeaconUID  string         `json:"beacon_uid"`
-	SID        string         `json:"sid"`
-	Hostname   string         `json:"hostname"`
-	Username   string         `json:"username"`
-	Elevated   bool           `json:"elevated"`
-	OS         string         `json:"os"`
-	Arch       string         `json:"arch"`
-	LocalIPs   string         `json:"local_ips"`
-	PID        int            `json:"pid"`
-	Process    string         `json:"process"`
-	SleepSec   int            `json:"sleep_sec"`
-	JitterPct  int            `json:"jitter_pct"`
-	TaskID     int64          `json:"task_id"`
-	Status     string         `json:"status"`
-	Labels     string         `json:"labels"`
-	Meta       map[string]any `json:"meta"`
-	FirstSeen  time.Time      `json:"first_seen"`
-	LastSeen   time.Time      `json:"last_seen"`
+	ID         int64  `json:"id"`
+	ListenerID int64  `json:"listener_id"`
+	BeaconUID  string `json:"beacon_uid"`
+	SID        string `json:"sid"`
+	Hostname   string `json:"hostname"`
+	Username   string `json:"username"`
+	Elevated   bool   `json:"elevated"`
+	OS         string `json:"os"`
+	Arch       string `json:"arch"`
+	LocalIPs   string `json:"local_ips"`
+	PID        int    `json:"pid"`
+	Process    string `json:"process"`
+	SleepSec   int    `json:"sleep_sec"`
+	JitterPct  int    `json:"jitter_pct"`
+	TaskID     int64  `json:"task_id"`
+	// Transport 是会话承载传输(http/ws/tcp/kcp/oss;三期 §18,Agent T 追加)。
+	// json:"-":对外口径以 db 层 C2Session 为准,这里只供运行时断言/展示。
+	Transport string         `json:"-"`
+	Status    string         `json:"status"`
+	Labels    string         `json:"labels"`
+	Meta      map[string]any `json:"meta"`
+	FirstSeen time.Time      `json:"first_seen"`
+	LastSeen  time.Time      `json:"last_seen"`
 }
 
 // SessionInput 是 reg 心跳的入参。UpsertSession 按 listener_id+beacon_uid 幂等:
 // 存在则更新主机信息、sid 换成新令牌并置 online(刷新 last_seen),不存在则建
 // (sleep/jitter 用库默认 10/20)。调用方须保证 Status 为 dead 的会话不被心跳复活
 // ——c2center 的监听器在心跳路径已做 guard,server 适配器建议同样兜底。
+//
+// 三期(§18,Agent T 追加):Transport 是会话承载传输标注(http/ws/tcp/kcp/oss),
+// 空 = 保持原值;Direction 是连接方向(仅正向连接会话带 "bind"),空 = 保持原值。
+// 心跳路径不填这两个字段(空),只有 reg 路径由处理核填。
 type SessionInput struct {
 	ListenerID int64  `json:"listener_id"`
 	BeaconUID  string `json:"beacon_uid"`
@@ -132,6 +144,8 @@ type SessionInput struct {
 	LocalIPs   string `json:"local_ips"`
 	PID        int    `json:"pid"`
 	Process    string `json:"process"`
+	Transport  string `json:"transport,omitempty"`
+	Direction  string `json:"direction,omitempty"` // 空=reverse;"bind"=正向
 }
 
 // SessionFilter 是会话列表筛选(零值=不筛)。
@@ -329,6 +343,13 @@ type Manager struct {
 	// PollWait 是 beacon 长轮询的最长挂起时长,默认 25s。
 	PollWait time.Duration
 
+	// 三期(§19,Agent T 加钩子/server 注入):staged 载荷的 stage 分片供给回调
+	//(server 侧适配 c2StageDataFor)。按 token 取 stage blob 的 [offset, offset+len)
+	// 分片;error 非 nil(含「载荷不存在/非 staged/产物形态不符」)= 404 语义。
+	// artifact/staged 白名单校验在回调实现里做(server 有全量 db 访问);nil =
+	// staged 信道未接线,stage_get 一律 404。
+	StageDataOpener func(token string, offset, length int64) (data []byte, eof bool, total int64, err error)
+
 	// IngressOpener 是 vps 载体的转发建立回调(契约 §12,server 在 initC2 注入;
 	// nil 时全部监听器按 local 载体处理)。
 	//
@@ -437,7 +458,11 @@ func (m *Manager) StartListener(l *Listener) error {
 	m.mu.Lock()
 	m.running[l.ID] = cs
 	m.mu.Unlock()
-	m.logf("C2 监听器 «%s»(#%d) 已启动:%s(信道 /%s/e)", l.Name, l.ID, cs.addr(), cs.l.URLPath)
+	if l.Proto == ProtoOSS {
+		m.logf("C2 监听器 «%s»(#%d) 已启动:oss 对象扫描(前缀 %s)", l.Name, l.ID, strings.Trim(l.URLPath, "/"))
+	} else {
+		m.logf("C2 监听器 «%s»(#%d) 已启动:%s(协议 %s,信道 /%s/e)", l.Name, l.ID, cs.addr(), transportName(l.Proto), cs.l.URLPath)
+	}
 	return nil
 }
 
