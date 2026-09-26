@@ -37,6 +37,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { TablePagination } from "@/components/table-pagination";
@@ -46,10 +47,44 @@ import { VulnDetailDialog, VulnEntryDialog, severityBadgeClass } from "@/compone
 
 const PAGE_SIZE = 50;
 
+// 各采集源的中文展示名(与后端 vulndb_sync_runs.source 取值对应,含 v2 新增源)。
+const SOURCE_LABELS: Record<string, string> = {
+  nvd: "NVD",
+  github_advisory: "GitHub Advisory",
+  exploitdb: "Exploit-DB",
+  github_poc: "GitHub PoC",
+  kev: "CISA KEV 在野利用",
+  pocorexp_today: "PocOrExp",
+  nuclei: "nuclei 模板",
+  articles: "安全社区文章",
+  nvd_backfill: "NVD 历史回填",
+};
+// 同步面板的固定展示顺序;后端新增的未知源追加在尾部,不漏显。
+const SOURCE_ORDER = [
+  "nvd",
+  "github_advisory",
+  "exploitdb",
+  "github_poc",
+  "kev",
+  "pocorexp_today",
+  "nuclei",
+  "articles",
+  "nvd_backfill",
+];
+
 function fmtTime(iso?: string): string {
   if (!iso) return "—";
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString();
+}
+
+// 列表/面板列用的紧凑时间(MM-DD HH:mm),完整时间放单元格 title,省列宽。
+function fmtTimeShort(iso?: string): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
 export default function CVEPage() {
@@ -58,6 +93,8 @@ export default function CVEPage() {
   const [query, setQuery] = React.useState("");
   const [severity, setSeverity] = React.useState("all");
   const [hasPoc, setHasPoc] = React.useState("all");
+  // 在野利用筛选:""=全部(接口层用 "all" 表示),1=仅在野(KEV),0=仅非在野。
+  const [kev, setKev] = React.useState("all");
   const [sort, setSort] = React.useState("updated");
   const [sortDesc, setSortDesc] = React.useState(true);
   const [page, setPage] = React.useState(1);
@@ -67,6 +104,11 @@ export default function CVEPage() {
     null,
   );
   const [syncing, setSyncing] = React.useState(false);
+  // NVD 历史回填状态(断点续跑;running 时每 5s 轮询,结束自动停止)。
+  const [backfill, setBackfill] = React.useState<Awaited<ReturnType<typeof api.vulnBackfillStatus>> | null>(null);
+  const [backfillYear, setBackfillYear] = React.useState("2016");
+  const [backfillOpen, setBackfillOpen] = React.useState(false);
+  const [backfillBusy, setBackfillBusy] = React.useState<"start" | "cancel" | null>(null);
   const [editing, setEditing] = React.useState<VulnEntry | null>(null);
   const [creating, setCreating] = React.useState(false);
   const [detailID, setDetailID] = React.useState<number | null>(null);
@@ -90,7 +132,7 @@ export default function CVEPage() {
   const someSelected = !allSelected && entries.some((e) => checkedIds.has(e.id));
 
   const load = React.useCallback(
-    (q: string, sev: string, poc: string, srt: string, desc: boolean, p: number, size: number) => {
+    (q: string, sev: string, poc: string, kevf: string, srt: string, desc: boolean, p: number, size: number) => {
       setLoading(true);
       api
         .vulnEntries({
@@ -98,6 +140,7 @@ export default function CVEPage() {
           q,
           severity: sev === "all" ? "" : sev,
           hasPoc: poc === "all" ? "" : poc,
+          kev: kevf, // "all" 由 api 层忽略,不传参
           sort: srt,
           limit: size,
           offset: (p - 1) * size,
@@ -119,20 +162,35 @@ export default function CVEPage() {
       .catch(() => undefined);
   }, []);
 
+  const loadBackfill = React.useCallback(() => {
+    api
+      .vulnBackfillStatus()
+      .then(setBackfill)
+      .catch(() => undefined);
+  }, []);
+
   React.useEffect(() => {
-    load(query, severity, hasPoc, sort, sortDesc, page, pageSize);
+    load(query, severity, hasPoc, kev, sort, sortDesc, page, pageSize);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [severity, hasPoc, sort, sortDesc, page, pageSize]);
+  }, [severity, hasPoc, kev, sort, sortDesc, page, pageSize]);
 
   React.useEffect(() => {
     loadSync();
-  }, [loadSync]);
+    loadBackfill();
+  }, [loadSync, loadBackfill]);
+
+  // 回填进行中每 5 秒轮询进度,结束后自动停止。
+  React.useEffect(() => {
+    if (!backfill?.running) return;
+    const t = setInterval(loadBackfill, 5000);
+    return () => clearInterval(t);
+  }, [backfill?.running, loadBackfill]);
 
   const search = () => {
     setPage(1);
-    load(query, severity, hasPoc, sort, sortDesc, 1, pageSize);
+    load(query, severity, hasPoc, kev, sort, sortDesc, 1, pageSize);
   };
-  const reload = () => load(query, severity, hasPoc, sort, sortDesc, page, pageSize);
+  const reload = () => load(query, severity, hasPoc, kev, sort, sortDesc, page, pageSize);
 
   const runSync = async () => {
     setSyncing(true);
@@ -180,7 +238,43 @@ export default function CVEPage() {
     }
   };
 
-  const lastRun = sync?.runs?.[0];
+  // 各采集源最近一轮(runs 按开始时间倒序,每个 source 取首次出现即最近),
+  // 按 SOURCE_ORDER 固定顺序排列,未出现过的源不显示、未知源追加尾部。
+  const latestRuns = React.useMemo(() => {
+    const seen = new Map<string, VulnSyncRun>();
+    for (const r of sync?.runs ?? []) if (!seen.has(r.source)) seen.set(r.source, r);
+    const ordered = SOURCE_ORDER.map((s) => seen.get(s)).filter((r): r is VulnSyncRun => !!r);
+    for (const [s, r] of seen) if (!SOURCE_ORDER.includes(s)) ordered.push(r);
+    return ordered;
+  }, [sync]);
+
+  // 历史回填:启动(带确认,写明量级/耗时/可中断)与取消(优雅停止,断点保留)。
+  const startBackfill = async () => {
+    setBackfillBusy("start");
+    try {
+      await api.startVulnBackfill({ start_year: Number(backfillYear) });
+      toast.success("历史回填已启动,后台执行中,可离开本页稍后回来看进度");
+      setBackfillOpen(false);
+      loadBackfill();
+    } catch (e) {
+      toast.error(`启动失败:${(e as Error).message}`);
+    } finally {
+      setBackfillBusy(null);
+    }
+  };
+
+  const cancelBackfill = async () => {
+    setBackfillBusy("cancel");
+    try {
+      await api.cancelVulnBackfill();
+      toast.success("已请求取消,当前窗口完成后停止;进度保留,可随时续跑");
+      loadBackfill();
+    } catch (e) {
+      toast.error(`取消失败:${(e as Error).message}`);
+    } finally {
+      setBackfillBusy(null);
+    }
+  };
 
   const SortHead = ({ field, width, children }: { field: string; width?: string; children: React.ReactNode }) => (
     <TableHead className={width}>
@@ -214,7 +308,8 @@ export default function CVEPage() {
         <div>
           <h1 className="font-semibold text-xl">CVE 情报</h1>
           <p className="text-muted-foreground text-sm">
-            有编号的公开漏洞;后台定时从 NVD / GitHub Advisory / Exploit-DB / GitHub PoC 持续搜集并自动发现 PoC
+            有编号的公开漏洞;后台定时从 NVD / GitHub Advisory / Exploit-DB / CISA KEV / 安全社区文章等公开源持续搜集并自动发现
+            PoC
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -246,13 +341,93 @@ export default function CVEPage() {
         </div>
       </div>
 
-      {lastRun && (
-        <p className="text-muted-foreground mb-3 text-xs">
-          上次采集:{lastRun.source} · {fmtTime(lastRun.started_at)} · 新增 {lastRun.inserted} / 更新 {lastRun.updated} /
-          PoC {lastRun.pocs_found}
-          {lastRun.status === "failed" && <span className="text-destructive"> · 失败:{lastRun.error}</span>}
-        </p>
+      {/* 各采集源最近一轮状态:按 source 分组(状态/新增/PoC/时间),替代旧的单行「上次采集」。 */}
+      {latestRuns.length > 0 && (
+        <div className="mb-3 overflow-hidden rounded-lg border">
+          <Table className="table-fixed text-xs">
+            <TableHeader>
+              <TableRow className="hover:bg-transparent">
+                <TableHead className="w-44">采集源</TableHead>
+                <TableHead className="w-16">状态</TableHead>
+                <TableHead className="w-16">新增</TableHead>
+                <TableHead className="w-16">PoC</TableHead>
+                <TableHead className="w-36">时间</TableHead>
+                <TableHead>说明</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {latestRuns.map((r) => (
+                <TableRow key={r.source}>
+                  <TableCell className="truncate font-medium">{SOURCE_LABELS[r.source] ?? r.source}</TableCell>
+                  <TableCell>
+                    {r.status === "failed" ? (
+                      <span className="text-destructive font-medium">失败</span>
+                    ) : r.status === "running" ? (
+                      <span>进行中</span>
+                    ) : (
+                      <span className="text-muted-foreground">完成</span>
+                    )}
+                  </TableCell>
+                  <TableCell className="tabular-nums">{r.inserted}</TableCell>
+                  <TableCell className="tabular-nums">{r.pocs_found}</TableCell>
+                  <TableCell className="text-muted-foreground" title={fmtTime(r.started_at)}>
+                    {fmtTimeShort(r.started_at)}
+                  </TableCell>
+                  <TableCell
+                    className="text-muted-foreground truncate"
+                    title={r.status === "failed" ? r.error : undefined}
+                  >
+                    {r.status === "failed" ? r.error || "—" : "—"}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
       )}
+
+      {/* NVD 历史回填卡片:运行中显示进度(phase 中文 + 已推进窗口),空闲时提供启动入口。 */}
+      <Card className="mb-3">
+        <CardContent className="flex flex-wrap items-center gap-2 px-4 py-3 lg:px-6">
+          <span className="text-sm font-medium">NVD 历史回填</span>
+          {backfill?.running ? (
+            <>
+              <span className="text-muted-foreground text-xs">
+                {backfill.phase === "pocorexp"
+                  ? "PocOrExp 历史挂载中"
+                  : `NVD 历史分窗拉取中(已推进至 ${backfill.window_end?.split("T")[0] || "…"} )`}
+              </span>
+              <span className="text-muted-foreground text-xs">· 每 5 秒自动刷新</span>
+              <Button
+                variant="destructive"
+                size="sm"
+                className="ml-auto"
+                disabled={backfillBusy !== null}
+                onClick={() => void cancelBackfill()}
+              >
+                取消回填
+              </Button>
+            </>
+          ) : (
+            <>
+              {backfill?.done ? (
+                <span className="text-emerald-600 text-xs">历史回填已完成</span>
+              ) : backfill && (backfill.start_year > 0 || backfill.error) ? (
+                <span className="text-amber-600 text-xs">
+                  上次回填未完成{backfill.error ? `(${backfill.error})` : ""},再次启动将从断点续跑
+                </span>
+              ) : (
+                <span className="text-muted-foreground text-xs">
+                  回填 2016 年至今的 NVD 历史存量(全量约 20+ 万条),补齐检索体验
+                </span>
+              )}
+              <Button variant="outline" size="sm" className="ml-auto" onClick={() => setBackfillOpen(true)}>
+                启动历史回填
+              </Button>
+            </>
+          )}
+        </CardContent>
+      </Card>
 
       <Card>
         <CardContent className="px-0 pt-4">
@@ -308,6 +483,24 @@ export default function CVEPage() {
                 </SelectGroup>
               </SelectContent>
             </Select>
+            <Select
+              value={kev}
+              onValueChange={(v) => {
+                setPage(1);
+                setKev(v);
+              }}
+            >
+              <SelectTrigger className="w-28" title="CISA 已知被在野利用(KEV)筛选">
+                <SelectValue placeholder="在野利用" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectItem value="all">全部</SelectItem>
+                  <SelectItem value="1">在野利用</SelectItem>
+                  <SelectItem value="0">非在野</SelectItem>
+                </SelectGroup>
+              </SelectContent>
+            </Select>
             {checkedIds.size > 0 && (
               <Button variant="destructive" size="sm" disabled={deleting} onClick={() => setConfirmOpen(true)}>
                 <Trash2Icon className="size-4" />
@@ -348,14 +541,19 @@ export default function CVEPage() {
                     </TableHead>
                     <TableHead className="w-32">CVE 编号</TableHead>
                     {/* 标题列不设宽度:table-fixed 下它会自动吃掉其余列之外的余量。
-                        设 w-full 会挤掉后面的列(实测导致「更新时间」与「操作」重叠)。 */}
+                        设 w-full 会挤掉后面的列(实测导致「更新时间」与「操作」重叠)。
+                        固定列宽总和(688px)必须明显小于容器宽(约 897px),新列的宽度
+                        从既有固定列里省(厂商 w-28→w-24、更新时间 w-40→w-36),别再加。 */}
                     <TableHead>标题</TableHead>
-                    <TableHead className="w-28">厂商 / 产品</TableHead>
+                    <TableHead className="w-24">厂商 / 产品</TableHead>
                     <TableHead className="w-20">严重度</TableHead>
+                    <TableHead className="w-14" title="CISA 已知被在野利用">
+                      KEV
+                    </TableHead>
                     <SortHead field="poc" width="w-14">
                       PoC
                     </SortHead>
-                    <SortHead field="updated" width="w-40">
+                    <SortHead field="updated" width="w-36">
                       更新时间
                     </SortHead>
                     <TableHead className="w-24">操作</TableHead>
@@ -409,6 +607,19 @@ export default function CVEPage() {
                           "—"
                         )}
                       </TableCell>
+                      <TableCell>
+                        {e.kev ? (
+                          <Badge
+                            variant="outline"
+                            className="border-red-500/30 bg-red-500/15 px-1.5 text-[10px] text-red-600"
+                            title="CISA 已知被在野利用"
+                          >
+                            KEV
+                          </Badge>
+                        ) : (
+                          <span className="text-muted-foreground">—</span>
+                        )}
+                      </TableCell>
                       <TableCell className="tabular-nums">
                         {e.poc_count > 0 ? (
                           <span className="text-emerald-600">{e.poc_count}</span>
@@ -416,7 +627,9 @@ export default function CVEPage() {
                           <span className="text-muted-foreground">0</span>
                         )}
                       </TableCell>
-                      <TableCell className="text-muted-foreground text-xs">{fmtTime(e.updated_at)}</TableCell>
+                      <TableCell className="text-muted-foreground truncate text-xs" title={fmtTime(e.updated_at)}>
+                        {fmtTimeShort(e.updated_at)}
+                      </TableCell>
                       <TableCell>
                         <div className="flex items-center gap-1">
                           <Button variant="ghost" size="sm" onClick={() => setDetailID(e.id)} title="查看详情与 PoC">
@@ -468,6 +681,46 @@ export default function CVEPage() {
               }}
             >
               {deleting ? "删除中…" : "删除"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* 历史回填启动确认:选起始年,并写明数据量/耗时/可中断,避免误触发大批量拉取。 */}
+      <AlertDialog open={backfillOpen} onOpenChange={setBackfillOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>启动 NVD 历史回填</AlertDialogTitle>
+            <AlertDialogDescription>
+              从选定的起始年起分窗全量拉取 NVD 历史 CVE,随后逐年在 PocOrExp 上挂载历史 PoC。全量约 20+
+              万条,首次回填预计 15-30 分钟;可随时中断、从断点续跑,期间实例正常可用。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <div className="grid gap-1.5">
+            <Label>起始年份</Label>
+            <Select value={backfillYear} onValueChange={setBackfillYear}>
+              <SelectTrigger className="w-44">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectItem value="2016">2016 年起(推荐)</SelectItem>
+                  <SelectItem value="2011">2011 年起</SelectItem>
+                  <SelectItem value="2020">2020 年起</SelectItem>
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+          </div>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={backfillBusy !== null}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={backfillBusy !== null}
+              onClick={(e) => {
+                e.preventDefault(); // 启动完成后再关弹层,期间确认按钮呈禁用态
+                void startBackfill();
+              }}
+            >
+              {backfillBusy === "start" ? "启动中…" : "开始回填"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

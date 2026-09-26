@@ -481,6 +481,10 @@ func (d *DB) UpsertCVE(cveID, title, description, severity, vendor, product, aff
 	if refs == nil {
 		refs = json.RawMessage("[]")
 	}
+	// refs 用合并而非覆盖:文章/RSS 源先补进去的参考链接不能被下一轮 NVD 拉取冲掉。
+	// ⚠️ 这条注释必须留在 Go 层——曾把 `//` 注释写进下面的 SQL 字符串里,导致
+	// PostgreSQL 对所有调用报 42601(语法错误在 "//" 附近),且常规轮/回填同时
+	// 静默失败(2026-09-26 冒烟抓到)。SQL 字符串里只能用 `--` 注释。
 	err = d.QueryRow(`
 INSERT INTO vulndb_entries(category, title, cve_id, description, severity, vendor, product, affected, refs, source)
 VALUES ('cve', $1, $2, $3, $4, $5, $6, $7, $8, 'cve_feed')
@@ -491,7 +495,6 @@ ON CONFLICT (cve_id) WHERE cve_id <> '' DO UPDATE SET
 	vendor = CASE WHEN EXCLUDED.vendor <> '' THEN EXCLUDED.vendor ELSE vulndb_entries.vendor END,
 	product = CASE WHEN EXCLUDED.product <> '' THEN EXCLUDED.product ELSE vulndb_entries.product END,
 	affected = CASE WHEN EXCLUDED.affected <> '' THEN EXCLUDED.affected ELSE vulndb_entries.affected END,
-	// refs 用合并而非覆盖:文章/RSS 源先补进去的参考链接不能被下一轮 NVD 拉取冲掉。
 	refs = (SELECT COALESCE(jsonb_agg(DISTINCT x), '[]'::jsonb)
 		FROM jsonb_array_elements(vulndb_entries.refs || EXCLUDED.refs) AS x),
 	updated_at = now()

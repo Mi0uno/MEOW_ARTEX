@@ -49,6 +49,16 @@ export function categoryBadgeClass(category: string): string {
   return (CATEGORY_BADGE[category] ?? CATEGORY_BADGE.nday).badge;
 }
 
+// PoC 来源的中文标签(详情对话框 PoC 列表用;未知来源回退显示原始值,两页共用)。
+export const POC_SOURCE_LABEL: Record<string, string> = {
+  manual: "手工",
+  github: "GitHub",
+  exploitdb: "Exploit-DB",
+  pocorexp: "PocOrExp",
+  nuclei: "nuclei 模板",
+  ai_generated: "AI",
+};
+
 // VulnEntryDialog 新建/编辑漏洞条目。
 export function VulnEntryDialog({
   entry,
@@ -288,6 +298,15 @@ export function VulnDetailDialog({
                   {entry.severity}
                 </Badge>
               )}
+              {entry?.kev && (
+                <Badge
+                  variant="outline"
+                  className="border-red-500/30 bg-red-500/15 px-1.5 text-[10px] text-red-600"
+                  title="CISA 已知被在野利用"
+                >
+                  KEV
+                </Badge>
+              )}
             </DialogTitle>
             <DialogDescription className="flex flex-wrap gap-x-3 gap-y-1 text-xs">
               {entry?.cve_id && <span className="font-mono">{entry.cve_id}</span>}
@@ -364,7 +383,7 @@ export function VulnDetailDialog({
                           </span>
                           {p.language && <span className="text-muted-foreground text-xs">{p.language}</span>}
                           <Badge variant="outline" className="text-xs">
-                            {p.source}
+                            {POC_SOURCE_LABEL[p.source] ?? p.source}
                           </Badge>
                           <Button variant="ghost" size="sm" onClick={() => setEditingPoc(p)}>
                             <PencilIcon className="size-3.5" />
