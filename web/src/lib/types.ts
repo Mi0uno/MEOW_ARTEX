@@ -58,6 +58,8 @@ export interface Task {
   archive_blocked_by_task_id?: string; // live direct dependent that must be archived first
   company_ids?: number[]; // associated company scopes; current company assets join the task at creation
   coverage_enabled?: boolean; // 资产覆盖度功能开关(创建时定,默认开)；false=不计算/不展示覆盖度
+  /** 奖励标准(创建时 AI 识别拆分或人工填写,创建后不可改);空=无;任务详情总览有内容才渲染卡片 */
+  reward_note?: string;
 }
 
 // ---- 三阶段平台:信息搜集 ----
@@ -961,6 +963,29 @@ export interface TaskConstraint {
   text: string;
   origin?: string;
   ts?: string;
+}
+
+// 创建任务时随任务一起写入的操作约束(建任务表单「AI 识别拆分」与手填共用)。
+// 与 TaskConstraint 的区别:创建时还没有 id/时间戳,只有 kind+text。
+export interface TaskConstraintInput {
+  kind: ConstraintKind;
+  text: string;
+}
+
+// AI 识别拆分任务描述的返回结构(POST /api/tasks/parse-input)。
+// 契约:AI 只建议不落库——前端预填表单由人工检查后随创建请求提交;
+// 原文没提到某类内容时对应字段为空串,禁止编造。
+export interface TaskInputParse {
+  /** 提炼后的目标(原文没有可识别的目标时为空串) */
+  goal: string;
+  /** 整理后的描述:剔除目标/约束/奖励后的背景与测试范围;无剩余内容为空串 */
+  description: string;
+  /** 拆出的操作约束(禁止→deny,范围/允许事项→allow),可能为空数组 */
+  constraints: TaskConstraintInput[];
+  /** 奖励标准整理(仅 src_mode=true 时识别;普通任务恒为空串) */
+  rewards: string;
+  /** 识别依据说明(用了哪些段落、哪些归类存疑),展示给用户参考 */
+  note: string;
 }
 
 // ---- Findings ----

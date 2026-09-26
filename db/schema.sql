@@ -566,6 +566,9 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS pinned_at TIMESTAMPTZ;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS active_llm_profile_id BIGINT REFERENCES llm_profiles(id) ON DELETE SET NULL;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS llm_chain_revision BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
+-- 奖励标准:创建任务时由 AI 识别拆分(SRC 模式)或人工填写,创建后只读;
+-- 空串=无。任务详情总览有内容才渲染「奖励标准」卡片。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS reward_note TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_tasks_category ON tasks(category_id, created_at DESC)
     WHERE deleted_at IS NULL AND category_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_tasks_pinned ON tasks(pinned_at DESC)

@@ -175,6 +175,8 @@ import type {
   Wordbook,
   WorkspaceFile,
   WorkspaceListing,
+  TaskConstraintInput,
+  TaskInputParse,
 } from "@/lib/types";
 
 function getToken(): string | null {
@@ -388,6 +390,8 @@ export const api = {
     guardRuleIds?: number[]; // 仅本任务启用这些拦截规则;空=用全部已启用规则
     vpsMachineId?: number; // 执行环境:指定机器 id(创建即指派,发生在任务启动之前)
     vpsAuto?: boolean; // 执行环境:true=自动分配一台空闲在线机器(vps_machine_id 为空时生效)
+    constraints?: TaskConstraintInput[]; // 创建时写入的操作约束(建任务表单 AI 识别拆分/手填的落点)
+    rewardNote?: string; // 奖励标准文本(SRC 任务识别奖励的落点;任务详情总览展示)
     stepKey?: string; // recon 单步骤:收集器 key(推荐)
     stepConfig?: Record<string, unknown>; // 步骤配置
     pipeline?: ReconPipeline; // 兼容旧多步编排;stepKey 优先
@@ -414,9 +418,30 @@ export const api = {
       guard_rule_ids: input.guardRuleIds ?? [],
       vps_machine_id: input.vpsMachineId ?? 0,
       vps_auto: input.vpsAuto ?? false,
+      constraints: input.constraints ?? [],
+      reward_note: input.rewardNote ?? "",
       step_key: input.stepKey,
       step_config: input.stepConfig,
       pipeline: input.pipeline,
+    }),
+  // AI 识别拆分任务描述:把一大段描述拆成 目标/约束/精简描述(SRC 模式额外识别奖励)。
+  // ⚠️ LLM 长请求:必须传 signal=AbortSignal.timeout(320_000),否则 http() 默认 60s 必超时
+  // (与 src 平台 spec/ai-fill 同一套超时纪律);识别结果只预填表单,随创建请求才落库。
+  parseTaskInput: (
+    input: { description: string; goal?: string; srcMode?: boolean; srcPlatformId?: number; srcTargetId?: number },
+    signal?: AbortSignal,
+  ) =>
+    http<TaskInputParse>("/tasks/parse-input", {
+      method: "POST",
+      body: JSON.stringify({
+        description: input.description,
+        goal: input.goal ?? "",
+        src_mode: input.srcMode ?? false,
+        src_platform_id: input.srcPlatformId ?? 0,
+        src_target_id: input.srcTargetId ?? 0,
+      }),
+      // 调用方不传 signal 时给 320s 兜底,而不是 http() 的默认 60s——LLM 拆长文实测 1-2 分钟。
+      signal: signal ?? AbortSignal.timeout(320_000),
     }),
   taskCategories: () => get<{ categories: TaskCategory[] }>("/task-categories").then((r) => arr(r.categories)),
   // ---- 信息搜集(stage=recon)执行面 ----
