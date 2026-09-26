@@ -23,6 +23,9 @@ type monitorConfigDTO struct {
 	IntervalHours int        `json:"interval_hours"`
 	Running       bool       `json:"running"`
 	LastRoundAt   *time.Time `json:"last_round_at"`
+	// 监控独立出网:proxy_mode ""=跟随全局 / direct / pool;pool 时可指定组(0=自动)。
+	ProxyMode   string `json:"proxy_mode"`
+	ProxyGroupID int64 `json:"proxy_group_id"`
 }
 
 // monitorLastRunDTO target.last_run 摘要(仅 status/new_count/finished_at)。
@@ -83,12 +86,14 @@ func monitorTargetDTOOf(mc db.MonitorCompany, row *db.MonitorTarget, lastRun *db
 	return dto
 }
 
-// monitorConfig 汇总当前 config:settings(缺省关/24h)+ running 标志 + 最近一轮完成时间。
+// monitorConfig 汇总当前 config:settings(缺省关/24h)+ 出网模式 + running 标志 + 最近一轮完成时间。
 func (s *Server) monitorConfig() monitorConfigDTO {
 	cfg := monitorConfigDTO{
 		Enabled:       s.reconMonitor.enabled(),
 		IntervalHours: s.reconMonitor.intervalHours(),
 		Running:       s.reconMonitor.isRunning(),
+		ProxyMode:     s.reconMonitor.proxyMode(),
+		ProxyGroupID:  s.reconMonitor.proxyGroupID(),
 	}
 	if t, err := s.m.PG().LatestMonitorRoundAt(); err == nil {
 		cfg.LastRoundAt = t
@@ -141,12 +146,15 @@ func (s *Server) reconMonitorOverview(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, 200, map[string]any{"config": cfg, "targets": targets})
 }
 
-// reconMonitorSetConfig PUT /api/recon/monitor/config — 全局开关与间隔。
-// interval 越界(合法域 [1,720])400;开启时顺带唤醒调度器。返回更新后的 config。
+// reconMonitorSetConfig PUT /api/recon/monitor/config — 全局开关、间隔与独立出网模式。
+// interval 越界(合法域 [1,720])400;proxy_mode 非法 400(合法: ""/direct/pool);
+// 开启时顺带唤醒调度器。返回更新后的 config。
 func (s *Server) reconMonitorSetConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Enabled       *bool `json:"enabled"`
-		IntervalHours *int  `json:"interval_hours"`
+		Enabled       *bool   `json:"enabled"`
+		IntervalHours *int    `json:"interval_hours"`
+		ProxyMode     *string `json:"proxy_mode"`
+		ProxyGroupID  *int64  `json:"proxy_group_id"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
 		writeErr(w, 400, "invalid JSON: "+err.Error())
@@ -154,6 +162,18 @@ func (s *Server) reconMonitorSetConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.IntervalHours != nil && !monitorIntervalInRange(*req.IntervalHours) {
 		writeErr(w, 400, fmt.Sprintf("interval_hours 必须在 %d..%d 之间", reconMonitorMinInterval, reconMonitorMaxInterval))
+		return
+	}
+	if req.ProxyMode != nil {
+		switch *req.ProxyMode {
+		case "", "direct", "pool":
+		default:
+			writeErr(w, 400, "proxy_mode 仅支持空(跟随全局)/direct/pool")
+			return
+		}
+	}
+	if req.ProxyGroupID != nil && *req.ProxyGroupID < 0 {
+		writeErr(w, 400, "proxy_group_id 不能为负")
 		return
 	}
 	pg := s.m.PG()
@@ -175,6 +195,18 @@ func (s *Server) reconMonitorSetConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.IntervalHours != nil {
 		if err := pg.SetSetting(settingReconMonitorInterval, strconv.Itoa(*req.IntervalHours)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.ProxyMode != nil {
+		if err := pg.SetSetting(settingReconMonitorProxyMode, *req.ProxyMode); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.ProxyGroupID != nil {
+		if err := pg.SetSetting(settingReconMonitorProxyGroup, strconv.FormatInt(*req.ProxyGroupID, 10)); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}

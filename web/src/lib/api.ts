@@ -491,8 +491,12 @@ export const api = {
     httpText(`/tasks/${encodeURIComponent(taskId)}/collector-runs/${runId}/raw`),
   // ---- 资产监控（24h 持续子域测绘，契约见 MONITOR_CONTRACTS.md） ----
   reconMonitorOverview: () => get<ReconMonitorOverview>("/recon/monitor"),
-  saveReconMonitorConfig: (input: { enabled?: boolean; interval_hours?: number }) =>
-    put<ReconMonitorConfig>("/recon/monitor/config", input),
+  saveReconMonitorConfig: (input: {
+    enabled?: boolean;
+    interval_hours?: number;
+    proxy_mode?: string;
+    proxy_group_id?: number;
+  }) => put<ReconMonitorConfig>("/recon/monitor/config", input),
   saveReconMonitorTarget: (companyId: number, input: { enabled?: boolean; interval_hours?: number | null }) =>
     put<ReconMonitorTarget>(`/recon/monitor/targets/${companyId}`, input),
   // 手动触发：带 companyId 只跑那一家（清水位，绕过全局开关）；不带跑所有到期企业。

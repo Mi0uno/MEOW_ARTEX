@@ -30,10 +30,11 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { api } from "@/lib/api";
-import type { Asset, Company, ReconMonitorOverview, ReconMonitorRun, ReconMonitorTarget } from "@/lib/types";
+import type { Asset, Company, ProxyGroup, ReconMonitorOverview, ReconMonitorRun, ReconMonitorTarget } from "@/lib/types";
 
 const RUNS_PAGE_SIZE = 20;
 const FEED_PAGE_SIZE = 20;
@@ -309,6 +310,41 @@ export default function ReconMonitorPage() {
       .finally(() => setConfigBusy(false));
   };
 
+  // ---- 监控独立出网(空=跟随全局/direct/pool;pool 可指定组) ----
+  const [proxyGroups, setProxyGroups] = React.useState<ProxyGroup[]>([]);
+  React.useEffect(() => {
+    api
+      .proxyGroups({ limit: 200 })
+      .then((r) => setProxyGroups(r.groups))
+      .catch(() => setProxyGroups([]));
+  }, []);
+
+  const saveProxyMode = (mode: string) => {
+    setConfigBusy(true);
+    api
+      .saveReconMonitorConfig({ proxy_mode: mode })
+      .then(() => {
+        toast.success(
+          mode === "direct" ? "监控出网:直连" : mode === "pool" ? "监控出网:代理池" : "监控出网:跟随全局",
+        );
+        loadOverview();
+      })
+      .catch((e) => toast.error(`保存失败:${(e as Error).message}`))
+      .finally(() => setConfigBusy(false));
+  };
+
+  const saveProxyGroup = (id: number) => {
+    setConfigBusy(true);
+    api
+      .saveReconMonitorConfig({ proxy_group_id: id })
+      .then(() => {
+        toast.success(id > 0 ? "监控代理池已指定代理组" : "监控代理池已跟随全局组选择");
+        loadOverview();
+      })
+      .catch((e) => toast.error(`保存失败:${(e as Error).message}`))
+      .finally(() => setConfigBusy(false));
+  };
+
   const triggerAll = () => {
     setTriggerAllBusy(true);
     api
@@ -460,6 +496,45 @@ export default function ReconMonitorPage() {
                 <SaveIcon className="size-3.5" />
                 保存间隔
               </Button>
+            </div>
+            <div className="flex items-center gap-2">
+              <Label htmlFor="monitor-egress" className="text-sm">
+                出网
+              </Label>
+              <Select
+                value={config?.proxy_mode || "inherit"}
+                onValueChange={(v) => saveProxyMode(v === "inherit" ? "" : v)}
+                disabled={configBusy || !config}
+              >
+                <SelectTrigger id="monitor-egress" className="h-8 w-28">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="inherit">跟随全局</SelectItem>
+                  <SelectItem value="direct">直连</SelectItem>
+                  <SelectItem value="pool">代理池</SelectItem>
+                </SelectContent>
+              </Select>
+              {config?.proxy_mode === "pool" && (
+                <Select
+                  value={String(config?.proxy_group_id ?? 0)}
+                  onValueChange={(v) => saveProxyGroup(Number(v))}
+                  disabled={configBusy || !config}
+                >
+                  <SelectTrigger className="h-8 w-40">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="0">默认组(自动)</SelectItem>
+                    {proxyGroups.map((g) => (
+                      <SelectItem key={g.id} value={String(g.id)}>
+                        {g.name}
+                        {g.enabled ? "" : "(已停用)"}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              )}
             </div>
             <div className="flex flex-wrap items-center gap-2 text-sm">
               {configStatusBadge}

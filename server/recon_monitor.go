@@ -32,6 +32,10 @@ import (
 const (
 	settingReconMonitorEnabled  = "recon_monitor_enabled"
 	settingReconMonitorInterval = "recon_monitor_interval_hours"
+	// 监控独立出网:空=跟随全局出口;direct=强制直连;pool=走代理池(可指定组)。
+	// 解析复用任务级 ProxyAddrForTask/ProxyCACertForTask 的语义与回落规则。
+	settingReconMonitorProxyMode  = "recon_monitor_proxy_mode"
+	settingReconMonitorProxyGroup = "recon_monitor_proxy_group_id"
 	// reconMonitorDefaultInterval 全局缺省间隔(小时);合法域 [1,720],越界回退缺省。
 	reconMonitorDefaultInterval = 24
 	reconMonitorMinInterval     = 1
@@ -333,14 +337,36 @@ func (v *reconMonitor) runDue(ctx context.Context) {
 	}
 }
 
-// runCompanyWithBudget 给单企业一轮包上 30 分钟预算与全局出网代理后执行。
+// runCompanyWithBudget 给单企业一轮包上 30 分钟预算与出网代理后执行。
 func (v *reconMonitor) runCompanyWithBudget(mc db.MonitorCompany, trigger string) {
 	ctx, cancel := context.WithTimeout(v.s.ctx, reconMonitorCompanyTimeout)
 	defer cancel()
-	// 出网走全局出口(代理池/MITM/全局代理的当前落点)。与任务侧按任务归因不同:
-	// 监控轮没有任务身份,统一走全局出口即可。
-	ctx = recon.WithProxy(ctx, v.s.m.ProxyAddr(), v.s.m.ProxyCACert())
+	// 出网按监控自己的配置解析(缺省跟随全局):direct/pool 与任务级同一套解析语义
+	// 与回落规则(池不可用回落全局出口而非静默直连——保护真实出口 IP)。
+	mode, gid := v.proxyMode(), v.proxyGroupID()
+	ctx = recon.WithProxy(ctx, v.s.m.ProxyAddrForTask(mode, gid), v.s.m.ProxyCACertForTask(mode, gid))
 	v.runOneCompany(ctx, mc, trigger)
+}
+
+// proxyMode 监控独立出网模式;缺省/非法值一律回退 ""(跟随全局)。
+func (v *reconMonitor) proxyMode() string {
+	val, _, _ := v.s.m.PG().GetSetting(settingReconMonitorProxyMode)
+	switch val {
+	case "direct", "pool":
+		return val
+	default:
+		return ""
+	}
+}
+
+// proxyGroupID 监控 pool 模式指定的代理组(0=跟随全局组选择/自动)。
+func (v *reconMonitor) proxyGroupID() int64 {
+	val, _, _ := v.s.m.PG().GetSetting(settingReconMonitorProxyGroup)
+	n, _ := strconv.ParseInt(val, 10, 64)
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 
 // runOneCompany 执行单企业一轮监控(契约「单轮执行语义」1-8):

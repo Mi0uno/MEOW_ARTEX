@@ -216,6 +216,10 @@ export interface ReconMonitorConfig {
   interval_hours: number;
   running: boolean;
   last_round_at?: string | null;
+  /** 监控独立出网: ""=跟随全局 / direct=强制直连 / pool=代理池 */
+  proxy_mode: string;
+  /** pool 模式指定的代理组 id;0=跟随全局组选择 */
+  proxy_group_id: number;
 }
 
 export interface ReconMonitorTarget {
