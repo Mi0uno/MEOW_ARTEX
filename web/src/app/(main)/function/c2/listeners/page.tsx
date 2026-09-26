@@ -10,6 +10,8 @@
 // 的流量转回本机监听器(契约 §12)。oss 协议(三期)直连云端对象存储,没有
 // bind_host/载体概念,改为填写 endpoint/bucket/AK/SK/prefix(契约 §18)。
 // 启停失败(端口占用 / SSH 不通最常见)把后端错误原文报出来。
+// 测活(v3.1,契约 §24B):行操作「测活」调 /check 逐项探测端口 / 载体转发链 /
+// OSS 桶 / kcp 进程活性,结果弹窗展示总徽标 + 逐项检查;仅运行中可测,结果不落库。
 //
 // 接口(c2Listeners)没有服务端筛选/分页参数,四件套(搜索/筛选/排序/分页)
 // 全部在客户端对全量列表做。
@@ -22,6 +24,7 @@ import {
   ChevronDownIcon,
   ChevronUpIcon,
   CopyIcon,
+  HeartPulseIcon,
   PencilIcon,
   PlayIcon,
   PlusIcon,
@@ -72,7 +75,7 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectVa
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
-import type { C2Listener, C2Proto, VpsMachine } from "@/lib/types";
+import type { C2Listener, C2ListenerCheck, C2Proto, VpsMachine } from "@/lib/types";
 import { cn, copyText } from "@/lib/utils";
 
 const PAGE_SIZE = 50;
@@ -111,6 +114,9 @@ function C2ListenersInner() {
   const [editing, setEditing] = React.useState<C2Listener | null>(null);
   // 行级启停 busy。
   const [busyId, setBusyId] = React.useState<number | null>(null);
+  // 测活(v3.1,契约 §24B):行级转圈 busy + 结果(带所属监听器)弹窗;结果不落库。
+  const [checkingId, setCheckingId] = React.useState<number | null>(null);
+  const [checked, setChecked] = React.useState<{ listener: C2Listener; result: C2ListenerCheck } | null>(null);
   // 删除确认。
   const [removing, setRemoving] = React.useState<C2Listener | null>(null);
   const [deleteBusy, setDeleteBusy] = React.useState(false);
@@ -179,6 +185,20 @@ function C2ListenersInner() {
       toast.error(`${starting ? "启动" : "停止"}失败:${(e as Error).message}`);
     } finally {
       setBusyId(null);
+    }
+  };
+
+  // 测活:调 /check 逐项探测(local 探端口 / vps 探转发链 / oss 验桶 / kcp 进程级),
+  // 结果弹窗展示;接口 5xx / 超时把后端错误原文 toast 出来。
+  const runCheck = async (l: C2Listener) => {
+    setCheckingId(l.id);
+    try {
+      const result = await api.c2CheckListener(l.id);
+      setChecked({ listener: l, result });
+    } catch (e) {
+      toast.error(`测活失败:${(e as Error).message}`);
+    } finally {
+      setCheckingId(null);
     }
   };
 
@@ -324,19 +344,20 @@ function C2ListenersInner() {
                 <TableHeader>
                   <TableRow className="hover:bg-transparent">
                     {/* 名称列不设宽度:table-fixed 下自动吃掉余量。
-                        固定列合计 688px(64+112+96+48+80+64+112+112),常规容器下余量充足;
-                        再加列必须先瘦身其他列,否则名称列会被压到看不见。 */}
+                        固定列合计 696px(64+96+96+48+80+56+112+144),操作列已放宽到
+                        w-36 容纳 5 个图标按钮(启停/测活/复制/编辑/删除),回调地址与
+                        备注列相应瘦身;再加列必须先瘦身其他列,否则名称列会被压到看不见。 */}
                     <SortHead field="name">名称</SortHead>
                     <TableHead className="w-16">协议</TableHead>
-                    <TableHead className="w-28">回调地址</TableHead>
+                    <TableHead className="w-24">回调地址</TableHead>
                     <TableHead className="w-24">载体</TableHead>
                     <TableHead className="w-12">会话</TableHead>
                     <TableHead className="w-20">启用状态</TableHead>
-                    <TableHead className="w-16">备注</TableHead>
+                    <TableHead className="w-14">备注</TableHead>
                     <SortHead field="created" width="w-28">
                       创建时间
                     </SortHead>
-                    <TableHead className="w-28">操作</TableHead>
+                    <TableHead className="w-36">操作</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -450,6 +471,19 @@ function C2ListenersInner() {
                             <Button
                               variant="ghost"
                               size="icon-xs"
+                              onClick={() => void runCheck(l)}
+                              disabled={!running || checkingId === l.id}
+                              title={running ? "测活:探测监听器是否可达" : "监听器未运行"}
+                            >
+                              {checkingId === l.id ? (
+                                <RefreshCwIcon className="size-3.5 animate-spin" />
+                              ) : (
+                                <HeartPulseIcon className="size-3.5" />
+                              )}
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon-xs"
                               onClick={() => void copyChannel(l)}
                               disabled={!l.callback}
                               title="复制回调地址(信道路径)"
@@ -508,6 +542,68 @@ function C2ListenersInner() {
           load();
         }}
       />
+
+      {/* 测活结果(v3.1,契约 §24B):总结果徽标 + 逐项检查;结果只返回不落库。 */}
+      <Dialog open={!!checked} onOpenChange={(o) => !o && setChecked(null)}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex flex-wrap items-center gap-2">
+              测活 · {checked?.listener.name ?? ""}
+              {checked ? (
+                <Badge
+                  variant="outline"
+                  className={
+                    checked.result.ok
+                      ? "border-emerald-500/30 bg-emerald-500/15 text-emerald-600"
+                      : "border-red-500/30 bg-red-500/15 text-red-600"
+                  }
+                >
+                  {checked.result.ok
+                    ? checked.result.latency_ms != null
+                      ? `正常 ${checked.result.latency_ms}ms`
+                      : "正常"
+                    : "异常"}
+                </Badge>
+              ) : null}
+            </DialogTitle>
+            <DialogDescription>
+              逐项探测端口 / 载体转发链 / OSS 桶 / kcp 进程活性;结果仅本次展示,不落库。
+            </DialogDescription>
+          </DialogHeader>
+          {checked && checked.result.checks.length > 0 ? (
+            <ul className="grid gap-1.5">
+              {checked.result.checks.map((c, i) => (
+                <li
+                  key={`${c.item}-${i}`}
+                  className="flex items-start gap-2 rounded-md border bg-muted/30 px-2.5 py-1.5 text-xs"
+                >
+                  <span
+                    className={cn("mt-1 size-1.5 shrink-0 rounded-full", c.ok ? "bg-emerald-500" : "bg-red-500")}
+                  />
+                  <span className="min-w-0">
+                    <span className="font-medium">{c.item}</span>
+                    <span
+                      className={cn(
+                        "block break-all",
+                        c.ok ? "text-muted-foreground" : "text-red-600 dark:text-red-400",
+                      )}
+                    >
+                      {c.detail}
+                    </span>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-muted-foreground text-xs">无逐项检查数据。</p>
+          )}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setChecked(null)}>
+              关闭
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* 删除确认:有会话的监听器会被后端 409 拒绝,文案写明先清会话。 */}
       <AlertDialog open={!!removing} onOpenChange={(o) => !o && setRemoving(null)}>

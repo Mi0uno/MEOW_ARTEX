@@ -48,6 +48,7 @@ func (s *Server) registerC2Routes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/c2/listeners/{id}", s.deleteC2Listener)
 	mux.HandleFunc("POST /api/c2/listeners/{id}/start", s.startC2Listener)
 	mux.HandleFunc("POST /api/c2/listeners/{id}/stop", s.stopC2Listener)
+	mux.HandleFunc("POST /api/c2/listeners/{id}/check", s.checkC2Listener) // 三期补丁 A(§24B)监听器测活,c2_listener_check.go
 
 	// ---- 会话 ----
 	mux.HandleFunc("GET /api/c2/sessions", s.listC2Sessions)

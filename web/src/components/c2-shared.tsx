@@ -755,3 +755,15 @@ export function c2PluginPlatformMatches(platform: string, sessionOS: string): bo
       return true;
   }
 }
+
+// ══ 三期补丁 v3.1(契约 §24A/§24B):载荷↔免杀联动 ══
+
+// c2EvasionProfileSourceMeta 免杀档案来源徽标:三期起档案新增 builtin(知识库内置)
+// 来源,而既有 c2EvasionSourceMeta 只认 llm 与手工(免杀工作台页在用,不改其行为),
+// 这里在它之上补一层 builtin 分支,载荷页「免杀档案」下拉与其余档案展示共用。
+export function c2EvasionProfileSourceMeta(source: string): { label: string; badge: string } {
+  if (source === "builtin") {
+    return { label: "内置", badge: "bg-cyan-500/15 text-cyan-600 border-cyan-500/30" };
+  }
+  return c2EvasionSourceMeta(source);
+}

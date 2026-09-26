@@ -12,6 +12,10 @@
 // (源码经 SSH 通道在机器上 go build,产物自动回传),前端 3 秒轮询作业状态;
 // 免杀档案变形过的载荷标「已变形」,VPS 编译出的标「已编译」。变形与静态自测
 // 在「免杀工作台」页。
+// v3.1(契约 §24A):生成表单加「免杀档案」下拉——script 产物(ps1/bash/py)
+// 选中档案后提交带 evasion_profile_id,后端改走免杀变形作业管线(与免杀工作台
+// 同一条链路),响应带 job_id 复用既有 3 秒作业轮询进度条;编译型产物不支持
+// 档案变形,选中档案时预先禁用提交并提示;切格式后不匹配的档案自动清回「不使用」。
 
 import * as React from "react";
 
@@ -40,6 +44,8 @@ import {
   c2ArtifactMeta,
   c2ComboAllowed,
   c2DirectionMeta,
+  c2EvasionAVMeta,
+  c2EvasionProfileSourceMeta,
   c2JobStatusMeta,
   c2PayloadFormatMeta,
   c2PayloadTargetLabel,
@@ -86,6 +92,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
 import type {
   C2Direction,
+  C2EvasionProfile,
   C2Job,
   C2Listener,
   C2Payload,
@@ -132,6 +139,11 @@ function C2PayloadsInner() {
   // gosrc 的 VPS 构建(二期):空串 = 不编译,只出源码 zip。
   const [machines, setMachines] = React.useState<VpsMachine[]>([]);
   const [genBuildMachine, setGenBuildMachine] = React.useState("");
+  // 免杀档案(v3.1,契约 §24A):全量拉一次、前端按当前 format 过滤;空串 = 不使用(直出)。
+  const [profiles, setProfiles] = React.useState<C2EvasionProfile[]>([]);
+  const [genEvasion, setGenEvasion] = React.useState("");
+  // 轮询中的作业种类:vps 构建 / 档案变形(决定进度条与完成 toast 的文案)。
+  const [pollJobKind, setPollJobKind] = React.useState<"build" | "evasion">("build");
   // 构建作业轮询:job 未结束时生成按钮保持转圈,结束后刷新列表。
   const [pollJobId, setPollJobId] = React.useState<number | null>(null);
   const [polledJob, setPolledJob] = React.useState<C2Job | null>(null);
@@ -189,6 +201,14 @@ function C2PayloadsInner() {
       .catch(() => setMachines([]));
   }, [genFormat, machines.length]);
 
+  // 免杀档案列表进页拉一次(前端按 format 过滤,后端还会做一致性校验兜底)。
+  React.useEffect(() => {
+    api
+      .c2EvasionProfiles()
+      .then((r) => setProfiles(r.profiles ?? []))
+      .catch(() => setProfiles([]));
+  }, []);
+
   const reload = React.useCallback(() => load(filterListener), [load, filterListener]);
 
   // ── 三期矩阵联动(契约 §19 合法组合表 + §18 协议支持矩阵)──
@@ -228,10 +248,28 @@ function C2PayloadsInner() {
     if (!ok.includes(genFormat)) setGenFormat(ok[0]);
   }, [genArtifact, genDirection, genStaged, genFormat, formatsForArtifact]);
 
-  // 构建作业轮询:每 3 秒拉一次,结束( done / error )即停并刷新列表。
+  // ── 免杀档案联动(v3.1,契约 §24A)──
+  // 当前 format 下可用的档案(后端会再校验 profile.payload_format 与请求 format 一致)。
+  const profileOptions = React.useMemo(
+    () => profiles.filter((p) => p.payload_format === genFormat),
+    [profiles, genFormat],
+  );
+  const selProfile = profileOptions.find((p) => String(p.id) === genEvasion) ?? null;
+  // 档案变形仅覆盖 script 产物(ps1/bash/py);exe/dll/shellcode/ebpf 编译型产物后端 400,
+  // 前端预先禁用提交并提示。
+  const profileUsable = genArtifact === "script";
+
+  // 组合联动收尾:切换 format / 产物 / 协议后,已选档案若不再匹配当前格式,自动清回「不使用」。
+  React.useEffect(() => {
+    if (genEvasion && !profileOptions.some((p) => String(p.id) === genEvasion)) setGenEvasion("");
+  }, [genEvasion, profileOptions]);
+
+  // 作业轮询:每 3 秒拉一次,结束( done / error )即停并刷新列表。档案变形作业
+  // (v3.1)与 VPS 构建作业共用这条轮询,只按 pollJobKind 区分文案。
   React.useEffect(() => {
     if (!pollJobId) return;
     let alive = true;
+    const isEvasion = pollJobKind === "evasion";
     const t = setInterval(() => {
       api
         .c2Job(pollJobId)
@@ -241,9 +279,13 @@ function C2PayloadsInner() {
           if (j.status === "running" || j.status === "queued") return;
           clearInterval(t);
           if (j.status === "done") {
-            toast.success(`VPS 构建完成(作业 #${j.id}),载荷已就绪`);
+            toast.success(
+              isEvasion
+                ? `变形完成(作业 #${j.id}),变形载荷已入列`
+                : `VPS 构建完成(作业 #${j.id}),载荷已就绪`,
+            );
           } else {
-            toast.error(`VPS 构建失败:${j.error || "未知原因"}`);
+            toast.error(`${isEvasion ? "变形" : "VPS 构建"}失败:${j.error || "未知原因"}`);
           }
           setPollJobId(null);
           reload();
@@ -254,7 +296,7 @@ function C2PayloadsInner() {
       alive = false;
       clearInterval(t);
     };
-  }, [pollJobId, reload]);
+  }, [pollJobId, pollJobKind, reload]);
 
   const generate = async () => {
     if (!genListener) {
@@ -272,10 +314,15 @@ function C2PayloadsInner() {
       toast.error(`非法组合:${gate.reason}`);
       return;
     }
+    // 兜底复检(按钮已禁用):档案只配 script 产物,编译型产物后端会 400。
+    if (genEvasion && genArtifact !== "script") {
+      toast.error("编译型产物暂不支持档案变形,请改选 script 产物或到免杀工作台处理");
+      return;
+    }
     setGenerating(true);
     try {
-      // 三期 v3 扩展字段(artifact/direction/staged)随请求体下发;冻结的
-      // c2GeneratePayload 签名尚未声明,后端按契约 §19 组合表接收并 400 兜底。
+      // 三期 v3 扩展字段(artifact/direction/staged)与 v3.1 的 evasion_profile_id
+      // 随请求体下发,后端按契约 §19/§24A 接收并 400 兜底。
       const input = {
         listener_id: Number(genListener),
         format: genFormat,
@@ -287,10 +334,18 @@ function C2PayloadsInner() {
         artifact: genArtifact,
         direction: genDirection,
         staged: genStaged,
+        // script 产物选了档案 → 后端改走免杀变形作业管线,响应带 job_id(§24A)。
+        evasion_profile_id: genEvasion ? Number(genEvasion) : undefined,
       };
       const r = await api.c2GeneratePayload(input);
       if (r.job_id) {
-        toast.success(`构建作业 #${r.job_id} 已创建,正在 VPS 上编译…`);
+        const evasion = !!genEvasion;
+        setPollJobKind(evasion ? "evasion" : "build");
+        toast.success(
+          evasion
+            ? `变形作业 #${r.job_id} 已创建,LLM 正在按档案变形…`
+            : `构建作业 #${r.job_id} 已创建,正在 VPS 上编译…`,
+        );
         setPolledJob(null);
         setPollJobId(r.job_id);
       } else {
@@ -469,11 +524,15 @@ function C2PayloadsInner() {
                   onChange={(e) => setGenName(e.target.value)}
                   placeholder="留空自动命名"
                 />
-                <Button onClick={() => void generate()} disabled={generating || pollJobId != null}>
+                <Button
+                  onClick={() => void generate()}
+                  disabled={generating || pollJobId != null || (!!genEvasion && !profileUsable)}
+                  title={genEvasion && !profileUsable ? "编译型产物暂不支持档案变形,请改选 script 产物或到免杀工作台处理" : undefined}
+                >
                   {pollJobId != null ? (
                     <>
                       <RefreshCwIcon className="size-3.5 animate-spin" />
-                      构建中…
+                      {pollJobKind === "evasion" ? "变形中…" : "构建中…"}
                     </>
                   ) : generating ? (
                     "生成中…"
@@ -624,6 +683,77 @@ function C2PayloadsInner() {
             ) : null}
           </div>
 
+          {/* ── 免杀档案(v3.1,契约 §24A):script 产物可选档案走变形作业,编译型产物禁用 ── */}
+          <div className="mt-3 grid gap-3 lg:grid-cols-5">
+            <div className="grid gap-1.5 lg:col-span-2">
+              <Label>免杀档案(可选)</Label>
+              <Select
+                value={genEvasion}
+                onValueChange={(v) => setGenEvasion(v === "__none__" ? "" : v)}
+                disabled={!profileUsable}
+              >
+                <SelectTrigger className="w-full">
+                  <SelectValue placeholder="不使用(直出)" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectItem value="__none__">不使用(直出)</SelectItem>
+                    {!profileUsable ? (
+                      <SelectItem value="__no_evasion__" disabled>
+                        编译型产物不支持档案变形
+                      </SelectItem>
+                    ) : profileOptions.length === 0 ? (
+                      <SelectItem value="__no_profiles__" disabled>
+                        暂无 {genFormat} 格式的档案,可到「免杀工作台」创建
+                      </SelectItem>
+                    ) : (
+                      profileOptions.map((p) => {
+                        const src = c2EvasionProfileSourceMeta(String(p.source));
+                        const av = c2EvasionAVMeta(String(p.target_av));
+                        return (
+                          <SelectItem key={p.id} value={String(p.id)} title={p.instructions || p.notes}>
+                            [{src.label}] {p.name} · {av.label}
+                          </SelectItem>
+                        );
+                      })
+                    )}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+              {selProfile ? (
+                <p className="text-muted-foreground flex flex-wrap items-center gap-1 text-[10px]">
+                  <span>生成转为档案变形作业(LLM 变形 + 静态自测),完成后自动入列:</span>
+                  <span className="text-foreground font-medium">{selProfile.name}</span>
+                  <Badge
+                    variant="outline"
+                    className={cn("px-1 py-0", c2EvasionProfileSourceMeta(String(selProfile.source)).badge)}
+                  >
+                    {c2EvasionProfileSourceMeta(String(selProfile.source)).label}
+                  </Badge>
+                  <Badge
+                    variant="outline"
+                    className={cn("px-1 py-0", c2EvasionAVMeta(String(selProfile.target_av)).badge)}
+                  >
+                    {c2EvasionAVMeta(String(selProfile.target_av)).label}
+                  </Badge>
+                </p>
+              ) : (
+                <p className="text-muted-foreground text-[10px]">
+                  {profileUsable
+                    ? "选档案后生成转为 LLM 变形作业,不选则源码直出;选项按当前格式过滤,来源分内置 / 手工 / AI 生成"
+                    : "档案变形仅覆盖 ps1 / bash / py 脚本产物,编译型产物请到免杀工作台处理脚本"}
+                </p>
+              )}
+            </div>
+            {genEvasion && !profileUsable ? (
+              <div className="flex items-end lg:col-span-3">
+                <p className="w-full rounded-md border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-700 dark:text-amber-400">
+                  编译型产物暂不支持档案变形,请改选 script 产物或到免杀工作台处理
+                </p>
+              </div>
+            ) : null}
+          </div>
+
           {/* gosrc 专属:可选指派一台 VPS 机器编译(二期,契约 §14)。 */}
           {genFormat === "gosrc" ? (
             <div className="mt-3 grid gap-3 lg:grid-cols-5">
@@ -661,13 +791,15 @@ function C2PayloadsInner() {
             </div>
           ) : null}
 
-          {/* 构建作业进度条(gosrc + VPS 编译时):轮询中每 3 秒刷新。 */}
+          {/* 作业进度条(VPS 构建 / 档案变形共用):轮询中每 3 秒刷新。 */}
           {pollJobId != null || polledJob != null ? (
             <div className="mt-3 flex flex-wrap items-center gap-2 rounded-md border px-3 py-2 text-xs">
               <RefreshCwIcon
                 className={pollJobId != null ? "size-3.5 animate-spin text-blue-600" : "text-muted-foreground size-3.5"}
               />
-              <span className="tabular-nums">构建作业 #{pollJobId ?? polledJob?.id}</span>
+              <span className="tabular-nums">
+                {pollJobKind === "evasion" ? "变形作业" : "构建作业"} #{pollJobId ?? polledJob?.id}
+              </span>
               {polledJob ? (
                 <Badge variant="outline" className={c2JobStatusMeta(String(polledJob.status)).badge}>
                   {c2JobStatusMeta(String(polledJob.status)).label}
@@ -678,7 +810,11 @@ function C2PayloadsInner() {
                   {polledJob.error}
                 </span>
               ) : (
-                <span className="text-muted-foreground">源码上传 → 远程 go build → 产物回传,全程经 SSH 通道</span>
+                <span className="text-muted-foreground">
+                  {pollJobKind === "evasion"
+                    ? "LLM 按档案变形 → 静态自测 → 载荷自动入列"
+                    : "源码上传 → 远程 go build → 产物回传,全程经 SSH 通道"}
+                </span>
               )}
               {polledJob && (polledJob.status === "done" || polledJob.status === "error") ? (
                 <Button variant="outline" size="xs" onClick={() => setViewingJob(polledJob)}>
@@ -917,12 +1053,12 @@ function C2PayloadsInner() {
         </CardContent>
       </Card>
 
-      {/* ── 构建作业详情(静态报告 / 构建日志,共用 C2StaticReportView) ── */}
+      {/* ── 作业详情(静态报告 / 构建日志,共用 C2StaticReportView;VPS 构建与档案变形共用) ── */}
       <Dialog open={!!viewingJob} onOpenChange={(o) => !o && setViewingJob(null)}>
         <DialogContent className="max-h-[88vh] overflow-y-auto sm:max-w-2xl">
           <DialogHeader>
             <DialogTitle className="flex flex-wrap items-center gap-2">
-              构建作业 #{viewingJob?.id ?? "—"}
+              {pollJobKind === "evasion" ? "变形作业" : "构建作业"} #{viewingJob?.id ?? "—"}
               {viewingJob ? (
                 <Badge variant="outline" className={c2JobStatusMeta(String(viewingJob.status)).badge}>
                   {c2JobStatusMeta(String(viewingJob.status)).label}
@@ -930,7 +1066,9 @@ function C2PayloadsInner() {
               ) : null}
             </DialogTitle>
             <DialogDescription>
-              VPS 构建作业的信息与日志尾部。构建在指派机器上进行,产物经 SSH 通道回传落盘。
+              {pollJobKind === "evasion"
+                ? "档案变形作业的信息与静态自测报告:LLM 按免杀档案变形脚本,自测通过后载荷自动入列。"
+                : "VPS 构建作业的信息与日志尾部。构建在指派机器上进行,产物经 SSH 通道回传落盘。"}
             </DialogDescription>
           </DialogHeader>
           {viewingJob ? (
@@ -942,8 +1080,10 @@ function C2PayloadsInner() {
               ) : null}
               <div className="text-muted-foreground grid gap-1 text-xs">
                 <span>
-                  载荷:#{viewingJob.payload_id > 0 ? viewingJob.payload_id : "—"} · 构建机器:
-                  #{viewingJob.vps_machine_id > 0 ? viewingJob.vps_machine_id : "—"}
+                  载荷:#{viewingJob.payload_id > 0 ? viewingJob.payload_id : "—"}
+                  {pollJobKind === "evasion"
+                    ? ""
+                    : ` · 构建机器:#${viewingJob.vps_machine_id > 0 ? viewingJob.vps_machine_id : "—"}`}
                 </span>
                 <span>
                   创建:{fmtTime(viewingJob.created_at)}

@@ -33,7 +33,7 @@ import {
   C2_EVASION_AVS,
   C2StaticReportView,
   c2EvasionAVMeta,
-  c2EvasionSourceMeta,
+  c2EvasionProfileSourceMeta,
   c2JobKindMeta,
   c2JobStatusMeta,
   c2PayloadFormatMeta,
@@ -538,7 +538,7 @@ function C2EvasionInner() {
                   {profilePageItems.map((p) => {
                     const av = c2EvasionAVMeta(String(p.target_av));
                     const fm = c2PayloadFormatMeta(String(p.payload_format));
-                    const src = c2EvasionSourceMeta(String(p.source));
+                    const src = c2EvasionProfileSourceMeta(String(p.source));
                     return (
                       <TableRow key={p.id}>
                         <TableCell className="min-w-0">

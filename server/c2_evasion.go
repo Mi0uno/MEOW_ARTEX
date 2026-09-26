@@ -346,6 +346,8 @@ type c2EvasionJobInput struct {
 // startC2EvasionJob 发起一条变形作业:校验 → 防重入 → 建监看会话 + stage=post
 // 监看任务 + queued 作业 → 异步启动。返回 (job_id, 平台任务数字 id)。
 // errC2EvasionBusy 由调用方映射 409;其余错误 400。
+// 【共享 helper,§24A】generate 端点、作业重试、agent 工具与三期补丁 A 的
+// POST /api/c2/payloads(evasion_profile_id>0)全部走这里,防两份逻辑漂移。
 func (s *Server) startC2EvasionJob(in c2EvasionJobInput) (int64, int64, error) {
 	pg := s.m.PG()
 	l, err := pg.GetC2Listener(in.ListenerID)

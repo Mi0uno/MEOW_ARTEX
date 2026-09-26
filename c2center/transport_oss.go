@@ -340,3 +340,43 @@ func (s *channelServer) processOSSRequest(cli *ossClient, reqKey string) error {
 	}
 	return cli.Delete(reqKey)
 }
+
+// ---- 测活(§24B 监听器测活;三期补丁 A 的追加方法,不改既有行) ----
+
+// CheckOSS 对 oss 载体做签名探活(§24B):按监听器解封后的传输配置构造客户端,
+// 发一次签名 GetBucket(ListObjectsV2 max-keys=1)验证 endpoint/bucket/AK/SK
+// 全链;401/403/404 与网络错误都原样返回,由调用方组装 detail。探测限时 5s/项
+// (覆盖 newOSSClient 默认的 30s httpc)。存储层未实现传输配置读取或监听器未
+// 配置 oss 传输 → 明确错误(「未配置 → ok=false」语义)。
+func (m *Manager) CheckOSS(l *Listener) error {
+	if m == nil || m.store == nil {
+		return errors.New("C2 中心未初始化")
+	}
+	if l == nil || l.ID <= 0 {
+		return errors.New("监听器无效")
+	}
+	src, ok := m.store.(transportConfigStore)
+	if !ok {
+		return errors.New("存储层未实现传输配置读取,无法探测 oss")
+	}
+	raw, err := src.GetListenerTransportConfig(l.ID)
+	if err != nil {
+		return fmt.Errorf("读取传输配置失败: %w", err)
+	}
+	if len(raw) == 0 {
+		return errors.New("oss 传输配置未设置(endpoint/bucket/access_key/secret_key)")
+	}
+	cfg, err := parseTransportConfig(raw)
+	if err != nil {
+		return err
+	}
+	cli, err := newOSSClient(cfg)
+	if err != nil {
+		return err
+	}
+	cli.httpc = &http.Client{Timeout: 5 * time.Second} // 测活预算 5s/项
+	if _, err := cli.List(cfg.ossPrefix(l.URLPath), 1); err != nil {
+		return err
+	}
+	return nil
+}
