@@ -77,6 +77,9 @@ func (s *Server) registerC2Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/c2/payloads", s.createC2Payload)
 	mux.HandleFunc("DELETE /api/c2/payloads/{id}", s.deleteC2Payload)
 	mux.HandleFunc("GET /api/c2/payloads/{id}/download", s.c2PayloadDownload)
+
+	// ---- 二期:免杀工作台/作业/loot→finding(Agent B,c2_evasion.go;签名冻结)----
+	s.registerC2EvasionRoutes(mux)
 }
 
 // ---- 公共小件 ----
@@ -184,16 +187,21 @@ func (s *Server) c2ListenerAddrOf(l *pgdb.C2Listener) string {
 	return c2ListenerDisplayAddr(l)
 }
 
-// c2ListenerDTO 是监听器响应 DTO:db 行 + runtime_addr(运行中才有,可选字段)。
+// c2ListenerDTO 是监听器响应 DTO:db 行 + runtime_addr(运行中才有,可选字段)
+// + ingress_error(vps 载体的转发最近一次异常,§12 runtime 标注;正常为空)。
 type c2ListenerDTO struct {
 	*pgdb.C2Listener
-	RuntimeAddr string `json:"runtime_addr,omitempty"`
+	RuntimeAddr  string `json:"runtime_addr,omitempty"`
+	IngressError string `json:"ingress_error,omitempty"`
 }
 
 func (s *Server) c2ListenerDTOOf(l *pgdb.C2Listener) *c2ListenerDTO {
 	dto := &c2ListenerDTO{C2Listener: l}
 	if s.c2ListenerRunning(l.ID) {
 		dto.RuntimeAddr = s.c2ListenerAddrOf(l)
+	}
+	if l.HostKind == pgdb.C2ListenerHostKindVPS {
+		dto.IngressError = getC2IngressErr(l.ID)
 	}
 	return dto
 }
@@ -278,6 +286,8 @@ func (s *Server) listC2Listeners(w http.ResponseWriter, r *http.Request) {
 }
 
 // c2ListenerPayload 是建/编监听器的请求体(同 POST 字段;密钥由服务端生成,不收)。
+// 二期载体字段(契约 §12):host_kind 空串=local;vps 时 vps_machine_id/remote_port
+// 必填且 callback 可空(前端用机器 host 拼)。
 type c2ListenerPayload struct {
 	Name     string `json:"name"`
 	BindHost string `json:"bind_host"`
@@ -285,6 +295,39 @@ type c2ListenerPayload struct {
 	Callback string `json:"callback"`
 	URLPath  string `json:"url_path"`
 	Notes    string `json:"notes"`
+	// 二期载体(§12)。
+	HostKind     string `json:"host_kind"`
+	VPSMachineID int64  `json:"vps_machine_id"`
+	RemotePort   int    `json:"remote_port"`
+}
+
+// c2NormalizeCarrier 校验并补齐载体三元组(host_kind/machine/remote_port);返回
+// 归一后的三元组(local 载体归零)。vps 载体要求机器存在。
+func (s *Server) c2NormalizeCarrier(hostKind string, machineID int64, remotePort int) (string, int64, int, error) {
+	hostKind = strings.TrimSpace(hostKind)
+	if hostKind == "" {
+		hostKind = pgdb.C2ListenerHostKindLocal
+	}
+	if !pgdb.ValidC2ListenerHostKind(hostKind) {
+		return "", 0, 0, fmt.Errorf("无效载体类型: %q(仅 local/vps)", hostKind)
+	}
+	if hostKind != pgdb.C2ListenerHostKindVPS {
+		return pgdb.C2ListenerHostKindLocal, 0, 0, nil
+	}
+	if machineID <= 0 {
+		return "", 0, 0, fmt.Errorf("vps 载体必须选择机器(vps_machine_id)")
+	}
+	if remotePort <= 0 || remotePort > 65535 {
+		return "", 0, 0, fmt.Errorf("vps 载体必须指定远端端口 remote_port(1-65535)")
+	}
+	vm, err := s.m.PG().GetVpsMachine(machineID)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	if vm == nil {
+		return "", 0, 0, fmt.Errorf("载体机器 #%d 不存在", machineID)
+	}
+	return hostKind, machineID, remotePort, nil
 }
 
 // c2ValidURLPath 信道路径随机段只允许 URL 安全字符(beacon 拼 /<url_path>/e)。
@@ -336,15 +379,21 @@ func (s *Server) createC2Listener(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	hostKind, machineID, remotePort, err := s.c2NormalizeCarrier(p.HostKind, p.VPSMachineID, p.RemotePort)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	id, err := s.m.PG().CreateC2Listener(pgdb.C2ListenerInput{
 		Name: p.Name, BindHost: p.BindHost, Port: p.Port,
 		URLPath: urlPath, Callback: p.Callback, EncKeySealed: sealed, Notes: p.Notes,
+		HostKind: hostKind, VPSMachineID: machineID, RemotePort: remotePort,
 	})
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	log.Printf("[c2-center] 监听器 «%s»(#%d) 已创建(url_path=%s)", p.Name, id, urlPath)
+	log.Printf("[c2-center] 监听器 «%s»(#%d) 已创建(url_path=%s,载体=%s)", p.Name, id, urlPath, hostKind)
 	writeJSON(w, 201, map[string]any{"id": id})
 }
 
@@ -406,8 +455,33 @@ func (s *Server) updateC2Listener(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "url_path 只允许字母/数字/-/_(1-64 字符)")
 		return
 	}
-	if (port != existing.Port || urlPath != existing.URLPath) && s.c2ListenerRunning(id) {
-		writeErr(w, 409, "监听器运行中,请先停止再修改端口/信道路径")
+	// 载体三元组局部合并:逐字段回退原值后整体校验(改载体必须先停,同端口/路径)。
+	carrierKind := p.HostKind
+	carrierMachine := p.VPSMachineID
+	carrierPort := p.RemotePort
+	if carrierKind == "" && carrierMachine == 0 && carrierPort == 0 {
+		carrierKind = existing.HostKind
+		carrierMachine = existing.VPSMachineID
+		carrierPort = existing.RemotePort
+	} else {
+		if carrierKind == "" {
+			carrierKind = existing.HostKind
+		}
+		if carrierMachine == 0 {
+			carrierMachine = existing.VPSMachineID
+		}
+		if carrierPort == 0 {
+			carrierPort = existing.RemotePort
+		}
+	}
+	hostKind, machineID, remotePort, err := s.c2NormalizeCarrier(carrierKind, carrierMachine, carrierPort)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	carrierChanged := hostKind != existing.HostKind || machineID != existing.VPSMachineID || remotePort != existing.RemotePort
+	if (port != existing.Port || urlPath != existing.URLPath || carrierChanged) && s.c2ListenerRunning(id) {
+		writeErr(w, 409, "监听器运行中,请先停止再修改端口/信道路径/载体")
 		return
 	}
 	name := p.Name
@@ -418,11 +492,12 @@ func (s *Server) updateC2Listener(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(bindHost) == "" {
 		bindHost = existing.BindHost
 	}
-	if err := s.m.PG().UpdateC2Listener(id, pgdb.C2ListenerInput{
+	if uerr := s.m.PG().UpdateC2Listener(id, pgdb.C2ListenerInput{
 		Name: name, BindHost: bindHost, Port: port,
 		URLPath: urlPath, Callback: p.Callback, Notes: p.Notes,
-	}); err != nil {
-		writeErr(w, 400, err.Error())
+		HostKind: hostKind, VPSMachineID: machineID, RemotePort: remotePort,
+	}); uerr != nil {
+		writeErr(w, 400, uerr.Error())
 		return
 	}
 	fresh, err := s.m.PG().GetC2Listener(id)
@@ -474,6 +549,7 @@ func (s *Server) deleteC2Listener(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	setC2IngressErr(id, "") // 清理 vps 载体的运行时异常标注(行已删,不留悬空状态)
 	deleted, err := s.m.PG().DeleteC2Listener(id)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -484,8 +560,10 @@ func (s *Server) deleteC2Listener(w http.ResponseWriter, r *http.Request) {
 }
 
 // startC2Listener POST /api/c2/listeners/{id}/start — 拉起运行时;
-// 端口占用等错误原文返回(前端 toast 原文)。返回 {addr}(实际监听地址,
-// port=0 自动分配时为空串,见 c2ListenerDisplayAddr 注)。
+// 端口占用/SSH 失败等错误原文返回(前端 toast 原文)。返回 {addr}。
+//
+// vps 载体编排(契约 §12):先起本地监听(转发目标就是它)→ 取实际地址
+// OpenRemoteForward → 登记转发器;SSH 失败回滚本地监听并把错误原样报给 API。
 func (s *Server) startC2Listener(w http.ResponseWriter, r *http.Request) {
 	if !s.c2Ready(w) {
 		return
@@ -507,20 +585,50 @@ func (s *Server) startC2Listener(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "监听器不存在")
 		return
 	}
-	if err := mgr.StartListener(c2centerListenerFromDB(l)); err != nil {
+	// 幂等语义:local 载体已在运行直接返回;vps 载体仅在转发在位且无异常时短路
+	//(转发已断/缺失则推倒重建——先整体停,防重复建转发泄漏远端端口)。
+	if mgr.ListenerRunning(id) {
+		if l.HostKind != pgdb.C2ListenerHostKindVPS ||
+			(mgr.IngressRunning(id) && getC2IngressErr(id) == "") {
+			writeJSON(w, 200, map[string]any{"addr": s.c2ListenerAddrOf(l), "stopped": false})
+			return
+		}
+		_ = mgr.StopListener(id)
+		log.Printf("[c2-center] 监听器 #%d 的入口转发异常,重建中: %q", id, getC2IngressErr(id))
+	}
+	if l.HostKind == pgdb.C2ListenerHostKindVPS {
+		if err := mgr.StartListener(c2centerListenerFromDB(l)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		fwd, ferr := s.c2OpenIngressForward(l.ID, l.VPSMachineID, l.RemotePort)
+		if ferr != nil {
+			_ = mgr.StopListener(l.ID) // 回滚本地半边;SSH 错误原样上报
+			writeErr(w, 500, ferr.Error())
+			return
+		}
+		if err := mgr.StartListenerWithIngress(c2centerListenerFromDB(l), fwd); err != nil {
+			_ = fwd.Stop()
+			_ = mgr.StopListener(l.ID)
+			writeErr(w, 500, err.Error())
+			return
+		}
+	} else if err := mgr.StartListener(c2centerListenerFromDB(l)); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	// 与持久化 enabled 状态对齐:启了的监听器随进程重启自动拉起。
+	// 与持久化 enabled 状态对齐:启了的监听器随进程重启自动拉起(boot 恢复路径
+	// 会经 IngressOpener 重建 vps 载体的转发)。
 	if err := s.m.PG().SetC2ListenerEnabled(id, true); err != nil {
 		log.Printf("[c2-center] 监听器 #%d 启动态落库失败: %v", id, err)
 	}
 	addr := s.c2ListenerAddrOf(l)
-	log.Printf("[c2-center] 监听器 «%s»(#%d) 已启动(%s)", l.Name, id, addr)
+	log.Printf("[c2-center] 监听器 «%s»(#%d) 已启动(%s,载体=%s)", l.Name, id, addr, l.HostKind)
 	writeJSON(w, 200, map[string]any{"addr": addr, "stopped": false})
 }
 
 // stopC2Listener POST /api/c2/listeners/{id}/stop — 停止运行时(幂等)。
+// vps 载体:StopListener 已按「先停转发再停监听」的顺序连带处理(契约 §12)。
 func (s *Server) stopC2Listener(w http.ResponseWriter, r *http.Request) {
 	if !s.c2Ready(w) {
 		return
@@ -539,6 +647,7 @@ func (s *Server) stopC2Listener(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	setC2IngressErr(id, "")
 	if err := s.m.PG().SetC2ListenerEnabled(id, false); err != nil {
 		log.Printf("[c2-center] 监听器 #%d 停止态落库失败: %v", id, err)
 	}
@@ -1202,8 +1311,11 @@ func (s *Server) listC2Payloads(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"payloads": nonNilPtrSlice(items), "total": len(items)})
 }
 
-// createC2Payload POST /api/c2/payloads — {listener_id,format,target,name} → 201 {id,oneliner}。
-// callback 为空 → 400(先填回调地址;载荷内容内嵌 callback,没它就是废纸)。
+// createC2Payload POST /api/c2/payloads — {listener_id,format,target,name} → 201
+// {id,oneliner}。callback 为空 → 400(先填回调地址;载荷内容内嵌 callback,没它就是
+// 废纸)。vps 载体监听器(§12)的 callback 可空:按机器 host+remote_port 现拼。
+// 二期(§14):gosrc + 可选 build_vps_machine_id → 额外建 c2_jobs(kind=build)
+// 并异步经 VPS 编译 → 202 {id,job_id};不给保持一期行为(只出源码 zip)。
 func (s *Server) createC2Payload(w http.ResponseWriter, r *http.Request) {
 	if !s.c2Ready(w) {
 		return
@@ -1213,6 +1325,8 @@ func (s *Server) createC2Payload(w http.ResponseWriter, r *http.Request) {
 		Format     string `json:"format"`
 		Target     string `json:"target"`
 		Name       string `json:"name"`
+		// 二期 §14:指定则 gosrc 源码包额外经该机器编译出二进制。
+		BuildVPSMachineID int64 `json:"build_vps_machine_id"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		writeErr(w, 400, "invalid JSON: "+err.Error())
@@ -1222,13 +1336,50 @@ func (s *Server) createC2Payload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "listener_id 必填")
 		return
 	}
+	buildOnVPS := req.BuildVPSMachineID > 0
+	if buildOnVPS {
+		if req.Format != "" && req.Format != pgdb.C2PayloadFormatGoSrc {
+			writeErr(w, 400, "build_vps_machine_id 仅支持 format=gosrc")
+			return
+		}
+		req.Format = pgdb.C2PayloadFormatGoSrc
+		vm, err := s.m.PG().GetVpsMachine(req.BuildVPSMachineID)
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		if vm == nil {
+			writeErr(w, 400, fmt.Sprintf("构建机器 #%d 不存在", req.BuildVPSMachineID))
+			return
+		}
+	}
 	pl, _, err := s.c2GeneratePayload(req.ListenerID, req.Format, req.Target, req.Name, "user")
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	log.Printf("[c2-center] 载荷 «%s»(#%d) 已生成(%s/%s)", pl.Name, pl.ID, pl.Format, pl.Target)
-	writeJSON(w, 201, map[string]any{"id": pl.ID, "oneliner": pl.Oneliner})
+	if !buildOnVPS {
+		log.Printf("[c2-center] 载荷 «%s»(#%d) 已生成(%s/%s)", pl.Name, pl.ID, pl.Format, pl.Target)
+		writeJSON(w, 201, map[string]any{"id": pl.ID, "oneliner": pl.Oneliner})
+		return
+	}
+	// 建构建作业并异步执行(c2_jobs 由 db/c2_evasion.go 提供,Agent B;kind=build)。
+	input, _ := json.Marshal(map[string]any{"payload_id": pl.ID, "source": "api"})
+	jobID, jerr := s.m.PG().CreateC2Job(pgdb.C2JobInput{
+		Kind:         pgdb.C2JobKindBuild,
+		PayloadID:    pl.ID,
+		ListenerID:   pl.ListenerID,
+		VPSMachineID: req.BuildVPSMachineID,
+		Input:        input,
+	})
+	if jerr != nil {
+		writeErr(w, 500, "载荷已生成但创建构建作业失败: "+jerr.Error())
+		return
+	}
+	go s.runC2BuildJob(jobID) // 事件驱动(仿免杀 runner);崩溃遗留由 initC2Build 恢复
+	log.Printf("[c2-center] 载荷 «%s»(#%d) 已生成(%s/%s),VPS 构建作业 #%d 已排队",
+		pl.Name, pl.ID, pl.Format, pl.Target, jobID)
+	writeJSON(w, 202, map[string]any{"id": pl.ID, "job_id": jobID, "oneliner": pl.Oneliner})
 }
 
 // c2GeneratePayload 载荷生成共用核心(API 与 agent 工具同走一条路):
@@ -1245,6 +1396,18 @@ func (s *Server) c2GeneratePayload(listenerID int64, format, target, name, creat
 		return nil, "", fmt.Errorf("监听器 #%d 不存在", listenerID)
 	}
 	callback := strings.TrimRight(strings.TrimSpace(l.Callback), "/")
+	if callback == "" && l.HostKind == pgdb.C2ListenerHostKindVPS {
+		// vps 载体(契约 §12):callback 可空,按机器 host + remote_port 现拼
+		//(与前端 Dialog 预填同口径;机器已删则报错)。
+		vm, merr := pg.GetVpsMachine(l.VPSMachineID)
+		if merr != nil {
+			return nil, "", merr
+		}
+		if vm == nil {
+			return nil, "", fmt.Errorf("监听器 «%s» 的载体机器 #%d 不存在,请先修正监听器载体配置", l.Name, l.VPSMachineID)
+		}
+		callback = fmt.Sprintf("http://%s:%d", vm.Host, l.RemotePort)
+	}
 	if callback == "" {
 		return nil, "", fmt.Errorf("监听器 «%s» 未配置回调地址(callback),请先填写再生成载荷", l.Name)
 	}

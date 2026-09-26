@@ -215,7 +215,7 @@ func newForwardTestManager(t *testing.T, ts *forwardTestSSHServer) *Manager {
 	t.Helper()
 	host, port := ts.hostPort()
 	return NewManager(newFakeStore(&MachineRuntime{
-		Machine: Machine{ID: 7, Name: "载体机", Host: host, Port: port, Username: "testuser", AuthType: AuthPassword},
+		Machine:  Machine{ID: 7, Name: "载体机", Host: host, Port: port, Username: "testuser", AuthType: AuthPassword},
 		Password: "testpass",
 	}), nil)
 }

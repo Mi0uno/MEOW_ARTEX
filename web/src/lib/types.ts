@@ -2555,6 +2555,8 @@ export interface C2Loot {
   has_content?: boolean;
   source_path: string;
   created_at: string;
+  /** 已转发现的 finding id(findings 表主键,0 = 未转换;二期 loot→finding)。 */
+  finding_id?: number;
 }
 
 /** 载荷投递物。oneliner = 目标机一行执行命令;下载走 /api/c2/payloads/{id}/download。 */

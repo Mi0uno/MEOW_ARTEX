@@ -372,6 +372,12 @@ func (s *Server) deleteVpsMachine(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, fmt.Sprintf("机器正被任务 #%d 占用,请先解绑再删除", m.AssignedTaskID))
 		return
 	}
+	// C2 载体引用检查(契约 C2_CONTRACTS.md §12):有监听器以这台机器为出入口时拒绝删除,
+	// 否则监听器 boot 恢复/启停会指向不存在的机器。
+	if n, err := s.m.PG().CountC2ListenersForMachine(id); err == nil && n > 0 {
+		writeErr(w, 409, fmt.Sprintf("机器正被 %d 个 C2 监听器用作载体,请先删除或改载体再删除", n))
+		return
+	}
 	deleted, err := s.m.PG().DeleteVpsMachine(id)
 	if err != nil {
 		writeErr(w, 500, err.Error())

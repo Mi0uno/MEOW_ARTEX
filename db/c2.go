@@ -350,6 +350,13 @@ func (d *DB) SetC2ListenerEnabled(id int64, enabled bool) error {
 	return err
 }
 
+// CountC2ListenersForMachine 统计以该 VPS 机器为载体的监听器数(删除机器前 409 用)。
+func (d *DB) CountC2ListenersForMachine(machineID int64) (int, error) {
+	var n int
+	err := d.QueryRow(`SELECT COUNT(*) FROM c2_listeners WHERE vps_machine_id=$1`, machineID).Scan(&n)
+	return n, err
+}
+
 // GetC2ListenerKey 读监听器密钥密文(仅 server 层解封用,绝不进任何响应)。
 func (d *DB) GetC2ListenerKey(id int64) ([]byte, error) {
 	var sealed []byte

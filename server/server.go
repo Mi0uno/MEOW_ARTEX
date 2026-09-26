@@ -360,6 +360,12 @@ func (s *Server) restoreTaskRuntimes() {
 				}
 				continue
 			}
+			if t.StepKey == "c2_evasion" {
+				// C2 免杀变形监看任务:由 initC2Evasion 的启动恢复接管
+				// (ResetStuckC2Jobs 拨回 + ListOpenC2Jobs 重launch,CAS 防双跑),
+				// 不走 agent 引擎,否则引擎会把它当普通 post 任务空跑一遍。
+				continue
+			}
 			s.engine.Run(s.ctx, t)
 		}
 	}

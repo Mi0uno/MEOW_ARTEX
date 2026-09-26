@@ -142,8 +142,12 @@ func TestC2EvasionJobs(t *testing.T) {
 		job.ProfileID != p.ID || job.ListenerID != l.ID {
 		t.Fatalf("作业默认值不对: %+v", job)
 	}
-	if string(job.Input) != string(input) {
-		t.Fatalf("input 原样回读不对: %s vs %s", job.Input, input)
+	// JSONB 列会归一化键序/空白:按语义比较,不做字符串全等。
+	var gotInput, wantInput any
+	_ = json.Unmarshal(job.Input, &gotInput)
+	_ = json.Unmarshal(input, &wantInput)
+	if fmt.Sprint(gotInput) != fmt.Sprint(wantInput) {
+		t.Fatalf("input 语义回读不对: %s vs %s", job.Input, input)
 	}
 	if string(job.Result) != "{}" {
 		t.Fatalf("result 空值应归一 {}: %s", job.Result)
@@ -174,13 +178,19 @@ func TestC2EvasionJobs(t *testing.T) {
 		t.Fatalf("无档案计数不应串到有档案作业: %d", n)
 	}
 
-	// 终态回填:result JSON + done_at 盖章 + 非终态拒绝。
+	// 终态回填:result JSON 语义回读 + done_at 盖章 + 非终态拒绝。
 	result := json.RawMessage(`{"static":{"hits":[],"entropy":4.2,"risk":"low"},"rounds":1}`)
 	if err := d.FinishC2Job(jobID, C2JobStatusDone, result, ""); err != nil {
 		t.Fatalf("回填终态失败: %v", err)
 	}
-	if job, _ = d.GetC2Job(jobID); string(job.Result) != string(result) || job.DoneAt == nil {
-		t.Fatalf("终态回填未生效: %+v", job)
+	if job, _ = d.GetC2Job(jobID); job.DoneAt == nil {
+		t.Fatalf("done_at 未盖章: %+v", job)
+	}
+	var gotResult, wantResult any
+	_ = json.Unmarshal(job.Result, &gotResult)
+	_ = json.Unmarshal(result, &wantResult)
+	if fmt.Sprint(gotResult) != fmt.Sprint(wantResult) {
+		t.Fatalf("result 回读不对: %s vs %s", job.Result, result)
 	}
 	if err := d.FinishC2Job(jobID, C2JobStatusQueued, nil, ""); err == nil {
 		t.Fatalf("非终态应被拒绝")

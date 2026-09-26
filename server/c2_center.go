@@ -29,6 +29,7 @@ import (
 
 	c2center "github.com/Autumn-27/artex/c2center"
 	pgdb "github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/vpscenter"
 )
 
 // c2Manager 是进程内唯一的 C2 中心运行时。
@@ -71,6 +72,7 @@ func c2centerListenerFromDB(l *pgdb.C2Listener) *c2center.Listener {
 		ID: l.ID, Name: l.Name, Proto: l.Proto, BindHost: l.BindHost, Port: l.Port,
 		URLPath: l.URLPath, Callback: l.Callback, Enabled: l.Enabled,
 		SessionCount: int(l.SessionCount), Notes: l.Notes,
+		HostKind: l.HostKind, VPSMachineID: l.VPSMachineID, RemotePort: l.RemotePort,
 		CreatedAt: l.CreatedAt, UpdatedAt: l.UpdatedAt,
 	}
 }
@@ -137,6 +139,7 @@ func (p *c2Store) CreateListener(in c2center.ListenerInput) (int64, error) {
 	return p.pg.CreateC2Listener(pgdb.C2ListenerInput{
 		Name: in.Name, BindHost: in.BindHost, Port: in.Port,
 		URLPath: in.URLPath, Callback: in.Callback, EncKeySealed: sealed, Notes: in.Notes,
+		HostKind: in.HostKind, VPSMachineID: in.VPSMachineID, RemotePort: in.RemotePort,
 	})
 }
 
@@ -164,6 +167,7 @@ func (p *c2Store) UpdateListener(id int64, in c2center.ListenerInput) error {
 	return p.pg.UpdateC2Listener(id, pgdb.C2ListenerInput{
 		Name: in.Name, BindHost: in.BindHost, Port: in.Port,
 		URLPath: in.URLPath, Callback: in.Callback, Notes: in.Notes,
+		HostKind: in.HostKind, VPSMachineID: in.VPSMachineID, RemotePort: in.RemotePort,
 	})
 }
 
@@ -448,9 +452,12 @@ func ensureC2BlobDirs(baseDir string) {
 // initC2 构造 C2 中心运行时并启动(New() 调用,照 initVPS 惯例;契约 §6):
 //  1. 建 blob 目录(uploads/outputs/downloads/payloads);
 //  2. 播种 8 个 C2 agent 工具(见 c2_agent.go;SeedTool 首插入 only);
-//  3. 构造 Manager 并 goroutine 启动:拉起 enabled 监听器 + 30s 离线巡检。
+//  3. 构造 Manager 并 goroutine 启动:拉起 enabled 监听器 + 30s 离线巡检
+//     (vps 载体的入口转发经 IngressOpener 回调由本文件建立,见 c2OpenIngress);
+//  4. 二期接线尾部:免杀工作台(Agent B,c2_evasion.go)+ gosrc VPS 构建
+//     runner(c2_build.go)。
 //
-// 任务终态不挂钩(契约 §6:C2 会话不随平台任务终态销毁,二期再议)。
+// 任务终态不挂钩(契约 §6:C2 会话不随平台任务终态销毁)。
 func (s *Server) initC2() {
 	if s.m == nil || s.m.PG() == nil {
 		return
@@ -459,6 +466,7 @@ func (s *Server) initC2() {
 	store := newC2Store(s, pg)
 	mgr := c2center.NewManager(store, slog.Default())
 	mgr.BaseDir = s.m.dir
+	mgr.IngressOpener = s.c2OpenIngress // vps 载体(§12):boot 恢复路径的转发编排点
 	setC2Manager(mgr)
 
 	ensureC2BlobDirs(s.m.dir)
@@ -466,4 +474,80 @@ func (s *Server) initC2() {
 
 	go mgr.Start(s.ctx)
 	log.Printf("[c2-center] C2 中心已启动(监听器/会话/任务/战利品/载荷)")
+
+	// ---- 二期接线(契约 §11)----
+	s.initC2Evasion() // 免杀工作台(Agent B;签名冻结,只此一行调用)
+	s.initC2Build()   // gosrc 经 VPS 构建 runner(§14,c2_build.go)
+}
+
+// ---- vps 载体:入口转发编排(契约 §12) ----
+
+// c2IngressErr 记录各监听器入口转发的最近一次异常(runtime 状态标注:
+// 监听器 DTO 的 ingress_error 字段;成功重建转发时清除)。包级变量与 c2Mgr 同级。
+var (
+	c2IngressErrMu sync.Mutex
+	c2IngressErr   = map[int64]string{}
+)
+
+func setC2IngressErr(listenerID int64, msg string) {
+	c2IngressErrMu.Lock()
+	defer c2IngressErrMu.Unlock()
+	if msg == "" {
+		delete(c2IngressErr, listenerID)
+	} else {
+		c2IngressErr[listenerID] = msg
+	}
+}
+
+func getC2IngressErr(listenerID int64) string {
+	c2IngressErrMu.Lock()
+	defer c2IngressErrMu.Unlock()
+	return c2IngressErr[listenerID]
+}
+
+// c2OpenIngress 是注入 c2center.Manager.IngressOpener 的回调(boot 恢复路径)。
+// 调用时本地监听已起(Manager.Start 先 StartListener),vps 载体在此取实际监听
+// 地址并建立 SSH 远程转发;local 载体返回 (nil, nil)。
+func (s *Server) c2OpenIngress(l *c2center.Listener) (c2center.IngressForwarder, error) {
+	if l == nil || l.HostKind != c2center.HostKindVPS {
+		return nil, nil
+	}
+	return s.c2OpenIngressForward(l.ID, l.VPSMachineID, l.RemotePort)
+}
+
+// c2OpenIngressForward 建立「VPS:remotePort → 本地监听器」的 SSH 远程转发并启动
+// 断开监看。SSH 失败原样返回(API start 路径要把错误报给前端;boot 路径由
+// c2center 只记日志)。成功时清除该监听器的历史转发异常标注。
+func (s *Server) c2OpenIngressForward(listenerID, machineID int64, remotePort int) (c2center.IngressForwarder, error) {
+	vm := VPSManager()
+	if vm == nil {
+		return nil, fmt.Errorf("VPS 中心未初始化,无法建立入口转发")
+	}
+	mgr := C2Manager()
+	if mgr == nil {
+		return nil, fmt.Errorf("C2 中心未初始化")
+	}
+	localAddr := mgr.ListenerAddr(listenerID)
+	if localAddr == "" {
+		return nil, fmt.Errorf("监听器 #%d 的本地监听未运行,无法建立入口转发(先起本地监听)", listenerID)
+	}
+	fwd, err := vm.OpenRemoteForward(machineID, remotePort, localAddr)
+	if err != nil {
+		return nil, err
+	}
+	setC2IngressErr(listenerID, "")
+	go s.c2WatchIngress(listenerID, fwd)
+	return fwd, nil
+}
+
+// c2WatchIngress 盯一条转发的错误流:SSH 断开时记日志并标注运行时状态
+// (ingress_error;§12)。本地监听保持运行,beacon 按自身退避重连,用户在页面
+// 手动 start 即可重建转发。
+func (s *Server) c2WatchIngress(listenerID int64, fwd *vpscenter.RemoteForward) {
+	err, ok := <-fwd.ErrCh()
+	if !ok || err == nil {
+		return
+	}
+	setC2IngressErr(listenerID, err.Error())
+	log.Printf("[c2-center] 监听器 #%d 的 VPS 入口转发断开: %v(本地监听仍在运行,可手动 start 重建)", listenerID, err)
 }

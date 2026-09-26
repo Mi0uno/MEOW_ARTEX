@@ -593,7 +593,7 @@ func (s *Server) runC2EvasionJob(ctx context.Context, jobID int64) {
 				fail("已停止或服务重启")
 				return
 			}
-			fail("AI 变形失败: "+firstLine(err.Error(), 200)+"(瞬态失败已自动退避重试)")
+			fail("AI 变形失败: " + firstLine(err.Error(), 200) + "(瞬态失败已自动退避重试)")
 			return
 		}
 		plan, code = splitC2EvasionOutput(out)
@@ -1069,11 +1069,11 @@ func (s *Server) toolC2EvasionGenerate() actool.CoreTool {
 				})
 			}
 			var result struct {
-				PayloadID int64           `json:"payload_id"`
-				Rounds    int             `json:"rounds"`
-				Plan      string          `json:"plan"`
-				Static    c2StaticReport  `json:"static"`
-				Oneliner  string          `json:"oneliner"`
+				PayloadID  int64          `json:"payload_id"`
+				Rounds     int            `json:"rounds"`
+				Plan       string         `json:"plan"`
+				Static     c2StaticReport `json:"static"`
+				Oneliner   string         `json:"oneliner"`
 				DeliverURL string         `json:"deliver_url"`
 			}
 			_ = json.Unmarshal(job.Result, &result)

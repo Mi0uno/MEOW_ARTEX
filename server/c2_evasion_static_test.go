@@ -59,10 +59,12 @@ schtasks /create /tn up
 // TestC2StaticScanPy py 特征串清单逐项命中。
 func TestC2StaticScanPy(t *testing.T) {
 	dirty := `
-import urllib, socket, subprocess
+import urllib, subprocess
+import socket
 exec(base64.b64decode("Li4u"))
 eval("__import__('os')")
 requests.get("http://x")
+socket.socket().connect(("h", 80))
 pty.spawn("sh")
 `
 	rep := c2EvasionStaticScan("py", dirty)

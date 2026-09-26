@@ -30,7 +30,12 @@ func (s *Server) autoArchiveTaskReport(taskID int64) {
 		return
 	}
 	// 报告识别任务(report 阶段)与信息搜集流水线不产渗透总结报告,跳过。
+	// C2 免杀/VPS 构建监看任务(stage=post 的管线任务)同理——它们不是渗透作业,
+	// 归档只会得到 0 发现空壳噪音(契约 C2_CONTRACTS.md §13)。
 	if t.Stage == "report" || t.Stage == "recon" {
+		return
+	}
+	if t.StepKey == "c2_evasion" || t.StepKey == "c2_build" {
 		return
 	}
 	title, summary, md := s.renderTaskReport(t)
