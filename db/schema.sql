@@ -2590,3 +2590,26 @@ CREATE INDEX IF NOT EXISTS idx_monitor_runs_status ON recon_monitor_runs(status,
 
 -- 「新发现」筛选走 created_at;给 type+created_at 复合索引喂 feed 查询。
 CREATE INDEX IF NOT EXISTS idx_av2_type_created ON assets(type, created_at DESC);
+
+-- =====================================================================
+-- 任务资产识别入库(契约见 ASSET_EXTRACT_CONTRACTS.md)
+-- 每个任务一条识别轮记录(1:1,重跑覆盖):确定性提取候选进 staged_assets
+-- (collector='auto_extract'),LLM 确认的直接采纳入库(source='ai')。
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS asset_extract_runs (
+    id                  BIGSERIAL PRIMARY KEY,
+    task_id             BIGINT NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
+    status              TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending','running','done','partial','failed')),
+    deterministic_count INTEGER NOT NULL DEFAULT 0,
+    ai_confirmed_count  INTEGER NOT NULL DEFAULT 0,
+    ai_new_count        INTEGER NOT NULL DEFAULT 0,
+    adopted_count       INTEGER NOT NULL DEFAULT 0,
+    detail              JSONB NOT NULL DEFAULT '[]',
+    error               TEXT NOT NULL DEFAULT '',
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+DROP TRIGGER IF EXISTS trg_asset_extract_runs_upd ON asset_extract_runs;
+CREATE TRIGGER trg_asset_extract_runs_upd BEFORE UPDATE ON asset_extract_runs
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();

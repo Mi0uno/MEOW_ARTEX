@@ -18,6 +18,10 @@ const TASK_ASSET_SOURCE_LABELS: Record<string, string> = {
   manual: "人工加入",
   system: "系统关联",
   task: "任务初始化",
+  recon: "信息搜集",
+  import: "文件导入",
+  auto: "自动提取",
+  ai: "AI 识别",
 };
 
 export function taskAssetTypeLabel(type: NewAssetType): string {

@@ -152,6 +152,10 @@ import type {
   StagedAsset,
   StagedAssetCounts,
   StagedDecideResult,
+  ArchiveAssetResult,
+  AssetExtractConfig,
+  AssetExtractRun,
+  TaskAssetUpsert,
   Stats,
   SPECAIFillSuggestion,
   SRCGuardOverview,
@@ -816,6 +820,22 @@ export const api = {
   detachTaskAsset: (taskId: string, assetId: number) => del<{ detached: number }>(`/tasks/${taskId}/assets/${assetId}`),
   taskIntentAssets: (taskId: string) =>
     get<{ assets: IntentAsset[] }>(`/tasks/${taskId}/intent-assets`).then((r) => arr(r.assets)),
+  // ---- 任务资产识别入库（契约见 ASSET_EXTRACT_CONTRACTS.md） ----
+  // 识别轮状态：无 run 返回 null（从未识别过的任务）。
+  taskAssetExtract: (taskId: string) =>
+    get<{ run: AssetExtractRun | null }>(`/tasks/${taskId}/asset-extract`).then((r) => r?.run ?? null),
+  // 手动触发识别（202 异步）：running 中 409、非渗透任务 400 由调用方按错误文案提示。
+  runAssetExtract: (taskId: string) => post<{ run_id: number }>(`/tasks/${taskId}/asset-extract`),
+  assetExtractConfig: () => get<AssetExtractConfig>("/asset-extract/config"),
+  saveAssetExtractConfig: (config: AssetExtractConfig) => put<AssetExtractConfig>("/asset-extract/config", config),
+  // 手动归档：单条资产直录进资产库并关联当前任务（source='manual'）。
+  archiveTaskAsset: (taskId: string, asset: TaskAssetUpsert) =>
+    post<ArchiveAssetResult>("/assets", {
+      task_id: taskId,
+      source: "manual",
+      source_summary: "手动归档",
+      assets: [asset],
+    }),
 
   // ---- companies (企业 + 资产范围；归属唯一来源) ----
   companies: () => get<Company[]>("/companies").then(arr),

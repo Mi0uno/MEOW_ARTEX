@@ -147,6 +147,56 @@ export interface StagedDecideResult {
   remaining_pending: number;
 }
 
+// ---- 任务资产识别入库（契约见 ASSET_EXTRACT_CONTRACTS.md） ----
+
+// 识别轮（1:1 task）：确定性提取候选进暂存，LLM 确认的直接采纳入库。
+export interface AssetExtractRun {
+  id: number;
+  task_id: number;
+  status: "pending" | "running" | "done" | "partial" | "failed" | string;
+  deterministic_count: number;
+  ai_confirmed_count: number;
+  ai_new_count: number;
+  adopted_count: number;
+  error: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AssetExtractConfig {
+  ai_enabled: boolean;
+}
+
+// 手动归档单条资产的载荷：字段名与 POST /api/assets 内层 assets[] 一致，
+// 按类型选填（root_domain/subdomain→domain；ip→ip；service 有 url 走 HTTP 服务，
+// 否则 host/ip + port + service_name 走端口服务；app→app_name）。
+export interface TaskAssetUpsert {
+  type: NewAssetType;
+  domain?: string;
+  icp?: string;
+  record_type?: string;
+  record_value?: string[];
+  ip?: string;
+  bound_domains?: string[];
+  open_ports?: { port: number; service?: string }[];
+  app_name?: string;
+  bundle_id?: string;
+  category?: string;
+  description?: string;
+  url?: string;
+  technologies?: string[];
+  page_title?: string;
+  service_ip?: string;
+  port?: number;
+  service_name?: string;
+}
+
+export interface ArchiveAssetResult {
+  results: { index: number; id: number; type: string }[];
+  errors: { index: number; error: string }[];
+}
+
+
 // ---- 资产监控（24h 持续子域测绘，契约见 MONITOR_CONTRACTS.md） ----
 
 export interface MonitorCollectorStat {

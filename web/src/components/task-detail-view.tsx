@@ -84,6 +84,7 @@ const TABS = [
   { value: "findings", label: "发现" },
   { value: "retests", label: "复测" },
   { value: "assets", label: "测试资产" },
+  { value: "staged", label: "暂存区" },
   { value: "coverage", label: "资产覆盖图" },
   { value: "intercept", label: "拦截审批" },
   { value: "vps", label: "执行环境" },
@@ -625,6 +626,11 @@ export function TaskDetailView() {
             </TabsContent>
             <TabsContent value="assets" className="mt-0">
               <AssetsTab taskId={id} />
+            </TabsContent>
+            {/* 暂存区与 recon 任务共用 ReconStagedPanel(本体复用):资产识别入库的
+                确定性候选落在这里 pending,AI 确认/人工采纳后才进正式资产。 */}
+            <TabsContent value="staged" className="mt-0">
+              <ReconStagedPanel taskId={id} taskStatus={task.status} />
             </TabsContent>
             <TabsContent value="coverage" className="mt-0">
               <CoverageGraphTab taskId={id} coverageEnabled={task?.coverage_enabled !== false} />
