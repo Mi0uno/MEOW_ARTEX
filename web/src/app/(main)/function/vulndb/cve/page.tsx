@@ -163,7 +163,8 @@ export default function CVEPage() {
   const [hasPoc, setHasPoc] = React.useState("all");
   // 在野利用筛选:""=全部(接口层用 "all" 表示),1=仅在野(KEV),0=仅非在野。
   const [kev, setKev] = React.useState("all");
-  const [sort, setSort] = React.useState("updated");
+  // 默认按编号新到旧(年份+序列号自然排序);表头点击可正序/反序。
+  const [sort, setSort] = React.useState("number");
   const [sortDesc, setSortDesc] = React.useState(true);
   const [page, setPage] = React.useState(1);
   const [pageSize, setPageSize] = React.useState(PAGE_SIZE);
@@ -817,7 +818,9 @@ export default function CVEPage() {
                           aria-label="全选本页"
                         />
                       </TableHead>
-                      <TableHead className="w-32">CVE 编号</TableHead>
+                      <SortHead field="number" width="w-32">
+                        编号
+                      </SortHead>
                       {/* 标题列不设宽度:table-fixed 下它会自动吃掉其余列之外的余量。
                           设 w-full 会挤掉后面的列(实测导致「更新时间」与「操作」重叠)。
                           固定列宽总和(688px)必须明显小于容器宽(约 897px),新列的宽度

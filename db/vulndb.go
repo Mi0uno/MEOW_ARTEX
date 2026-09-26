@@ -215,19 +215,32 @@ func (d *DB) ListVulnEntries(f VulnEntryFilter) ([]*VulnEntry, int, map[string]i
 		return nil, 0, nil, err
 	}
 
-	order := "updated_at DESC, id DESC"
+	// 排序:除 severity(严重度分级本身固定升序)外,其余全部统一跟方向变量走,
+	// 避免旧实现「字符串替换第一个 DESC」在多段排序键下只翻一半的问题。
+	dir := "DESC"
+	if !f.Desc && f.Sort != "" {
+		// 显式升序请求(默认降序)。
+		dir = "ASC"
+	}
+	var order string
 	switch f.Sort {
 	case "created":
-		order = "created_at DESC, id DESC"
+		order = "created_at " + dir + ", id " + dir
 	case "severity":
 		// 严重度按语义排序(critical 最前),同级别按更新时间。
-		order = `CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END ASC, updated_at DESC`
+		order = `CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END ASC, updated_at ` + dir
 	case "poc":
-		order = "poc_count DESC, updated_at DESC"
-	}
-	if f.Desc == false && f.Sort != "" {
-		// 显式升序请求(默认降序)。
-		order = strings.Replace(order, " DESC", " ASC", 1)
+		order = "poc_count " + dir + ", updated_at " + dir
+	case "number":
+		// 编号自然排序(CVE&CNVD 页默认):先年份后序列号,且按数值而非字典序比较
+		// (字典序下 CVE-2026-9999 会排在 CVE-2026-12345 前面)。CNVD 条目的编号
+		// 在标题开头、cve_id 为空,用 COALESCE 从标题提取;无编号条目固定垫底
+		// (两个方向都 NULLS LAST,不给空编号条目抢占头部)。
+		num := `COALESCE(NULLIF(cve_id,''), substring(title from '[A-Z]+-[0-9]{4}-[0-9]+'))`
+		order = "substring(" + num + " from '-[0-9]{4}-') " + dir + " NULLS LAST, " +
+			"lpad(substring(" + num + " from '[0-9]+$'), 10, '0') " + dir + " NULLS LAST, id " + dir
+	default:
+		order = "updated_at " + dir + ", id " + dir
 	}
 
 	q := `SELECT ` + vulnEntryListCols + ` FROM vulndb_entries WHERE ` + filtered +
