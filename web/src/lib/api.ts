@@ -68,6 +68,18 @@ import type {
   LLMTask,
   MCPServer,
   MCPTool,
+  MemoryBriefing,
+  MemoryCompanyStat,
+  MemoryFact,
+  MemoryFactInput,
+  MemoryOverview,
+  MemoryRun,
+  EvolveInsight,
+  EvolveInsightInput,
+  EvolveOverview,
+  EvolvePlaybook,
+  EvolvePlaybookInput,
+  EvolveStatus,
   MissingSkill,
   ModelTokenStat,
   PromptVar,
@@ -2427,10 +2439,11 @@ export const api = {
   memoryCreateFact: (input: MemoryFactInput) => post<{ id: number }>("/memory/facts", input),
   memoryInvalidateFact: (id: number) => post<{ updated: boolean }>(`/memory/facts/${id}/invalidate`, {}),
   memoryDeleteFact: (id: number) => del<{ deleted: boolean }>(`/memory/facts/${id}`),
-  memoryRuns: (input: { companyId?: number; taskId?: number; limit?: number; offset?: number }) => {
+  memoryRuns: (input: { companyId?: number; taskId?: number; status?: string; limit?: number; offset?: number }) => {
     const p = new URLSearchParams();
     if (input.companyId) p.set("company_id", String(input.companyId));
     if (input.taskId) p.set("task_id", String(input.taskId));
+    if (input.status) p.set("status", input.status);
     p.set("limit", String(input.limit ?? 50));
     p.set("offset", String(input.offset ?? 0));
     return get<{ runs: MemoryRun[]; total: number }>(`/memory/runs?${p.toString()}`).then((r) => ({

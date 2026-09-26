@@ -37,6 +37,10 @@ type MainAgent struct {
 	// 对话里的 Bash 同样必须在远端执行——主 agent 把命令落到本机也是掉马甲。
 	// nil resolver 或 nil 结果 = 本机执行(原行为)。
 	vpsContextFn func(taskID int64) *VPSRunContext
+
+	// 记忆简报/检索回调(契约 §7,setter 在 agent/memory.go);nil = 不注入/工具不可用。
+	memoryBriefFn  func(taskID string) string
+	memoryRecallFn func(ctx context.Context, taskID, query, scope string) (string, error)
 }
 
 // SetNoaEnabled wires a resolver deciding whether runs use the experimental noa
@@ -130,6 +134,7 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	tsx.SetNotifyGoal(notifyGoal) // set_goals 新增目标 → 给 planner 记一条「人新增了目标：…」触发
 	tsx.SetNotifyHint(notifyHint) // add_hint 新增提示 → 给 planner 记一条「人新增了 N 条战略提示：…」触发
 	tsx.steerWork = m.steerWork   // enable steer_work tool (nil = unavailable)
+	wireMemoryRecall(tsx, taskID, m.memoryRecallFn) // 跨任务记忆检索(契约 §7):nil 时工具自然降级
 	// 领域工具 + 基础默认工具集（Read/Write/Edit/MultiEdit/LS/Glob/Grep/Bash）
 	// 资产覆盖度功能关闭时剔除 add_task_scope/list_untested_assets（不入 prompt）。
 	// 远程执行环境(每次 Chat 解析一次):任务指派了 VPS 时,主 agent 对话里的 Bash
@@ -146,6 +151,7 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	mainDir := ensureRunDir(m.workDir, taskID, 0)
 	ctx = intercept.WithReviewWorkingDirectory(ctx, mainDir)
 	sysBody := mainAgentSystem(goal, m.workDir, mainDir)
+	sysBody = appendMemoryBrief(sysBody, m.memoryBriefFn, taskID) // 记忆简报(契约 §7.2):vps 块之前追加
 	if vps != nil {
 		sysBody += vps.SystemBlock // 远程执行环境:机器档案 + Bash 走 SSH 的使用规约
 	}

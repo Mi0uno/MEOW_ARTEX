@@ -196,6 +196,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		go func() {
 			releaseTaskVPSOnTerminal(taskID)
 			s.autoArchiveTaskReport(taskID)
+			s.maybeStartMemoryReflect(taskID) // AI 记忆库:终态复盘沉淀(契约 §5,自带门禁/骨架/串行)
 		}()
 	})
 	// 报告生成作业的路由层需要 Server 引用(POST /export-ai 等建任务入口);
@@ -308,6 +309,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	// 报告中心自动汇聚的历史回填:必须在任务加载进内存之后——任务总结报告经
 	// renderTaskReport 渲染,而它走内存任务句柄(store/资产快照)。一次性 flag 守卫。
 	s.backfillReportArchive()
+	go s.backfillMemoryRuns() // AI 记忆库:历史任务复盘骨架回填(契约 §8,幂等,不打 LLM)
 	go s.reconcileConcurrency()
 	s.startTaskArchiveWorker()
 	s.wireInterceptReviewer() // LLM 兜底审批:未命中拦截规则的命令交给模型判定
@@ -927,6 +929,9 @@ func (s *Server) Handler() http.Handler {
 	s.registerTaskVPSRoutes(mux)
 	// ---- C2 中心 ----
 	s.registerC2Routes(mux)
+	// ---- AI 记忆库 + 自进化(契约 AI_MEMORY_CONTRACTS.md §4)----
+	s.registerMemoryRoutes(mux)
+	s.registerEvolveRoutes(mux)
 	mux.HandleFunc("GET /api/exploration/findings/{id}", s.getFinding)
 	mux.HandleFunc("GET /api/exploration/findings/{id}/lineage", s.findingLineage)
 	mux.HandleFunc("POST /api/exploration/findings/{id}/deepen", s.deepenFinding)

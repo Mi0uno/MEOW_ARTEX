@@ -581,6 +581,8 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		t.searchAllWorkerTraces(), t.getWorkerTrace(),
 		// node_detail：worker 拿到 intent_id/节点 id 后可查该节点完整详情（配合上面的回看）。
 		t.nodeDetail(),
+		// memory_recall：跨任务记忆检索(契约 §7)——执行前先查历史结论,防重复枚举。
+		t.memoryRecallTool(),
 		// 以下工具仍【不给】worker，只留给 planner/main（读上下文、跨 work 复盘是规划职责，
 		// worker 只做单条意图的执行与写回）：list_facts / list_companies / list_worker_traces。
 	}
@@ -604,6 +606,8 @@ func (t *ToolSet) MainAgentTools() []actool.CoreTool {
 		t.addTaskScope(),
 		// list_untested_assets：按需查本任务范围内未测资产(类型+分页)，自行决定补测。
 		t.listUntestedAssets(),
+		// memory_recall：跨任务记忆检索(契约 §7)——主 agent 对话同样可查历史沉淀。
+		t.memoryRecallTool(),
 	}
 }
 

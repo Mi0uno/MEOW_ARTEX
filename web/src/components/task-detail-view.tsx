@@ -35,6 +35,7 @@ import { ReportTab } from "@/app/(main)/function/tasks/detail/_tabs/report-tab";
 import { RetestsTab } from "@/app/(main)/function/tasks/detail/_tabs/retests-tab";
 import { SessionsTab } from "@/app/(main)/function/tasks/detail/_tabs/sessions-tab";
 import { TaskVpsTab } from "@/app/(main)/function/tasks/detail/_tabs/vps-tab";
+import { TaskMemoryBriefingCard } from "@/components/memory-briefing-dialog";
 import {
   ReconAssetsPanel,
   ReconEvidencePanel,
@@ -604,7 +605,11 @@ export function TaskDetailView() {
               <SessionsTab taskId={id} />
             </TabsContent>
             <TabsContent value="overview" className="mt-0">
-              <OverviewTab taskId={id} />
+              {/* 记忆简报卡(AI 记忆库,契约 §9):拉取失败时静默不渲染,不影响总览其余卡片。 */}
+              <div className="flex flex-col gap-4">
+                <TaskMemoryBriefingCard taskId={id} />
+                <OverviewTab taskId={id} />
+              </div>
             </TabsContent>
             <TabsContent value="graph" className="mt-0">
               <GraphTab taskId={id} />

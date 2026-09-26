@@ -74,6 +74,8 @@ func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[
 // One ToolSet is created per planner/worker run; per-run signals live here.
 type ToolSet struct {
 	findingRecorder FindingRecorder
+	// memoryRecall 跨任务记忆检索回调(契约 §7,接线见 agent/memory.go);nil = 工具报「记忆功能不可用」。
+	memoryRecall func(ctx context.Context, query, scope string) (string, error)
 	as              *db.AssetStore   // asset store (optional; nil = asset tools not available)
 	cs              *db.CompanyStore // company store (optional)
 	ts              *db.ExplorationStore
@@ -2205,5 +2207,7 @@ func (t *ToolSet) PlannerTools() []actool.CoreTool {
 		t.addTaskScope(),
 		// list_untested_assets：按需查本任务范围内未测资产(类型+分页)，自行决定补测。
 		t.listUntestedAssets(),
+		// memory_recall：跨任务记忆检索(契约 §7)——规划前先查历史沉淀,防重复探索。
+		t.memoryRecallTool(),
 	}
 }
