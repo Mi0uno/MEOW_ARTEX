@@ -11,6 +11,7 @@ package server
 // 人工归档(任务报告页按钮 / archive_task_report 工具)仍可用,覆盖同一行。
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"strconv"
@@ -68,7 +69,7 @@ func (s *Server) autoArchiveTaskReport(taskID int64) {
 // 在 Server 构造时调用一次;回调内部各自起 goroutine,不阻塞工具返回。
 func (s *Server) wireFindingHooks() {
 	agent.OnFindingRecorded = func(findingID, taskID int64) {
-		go s.autoClassifyFinding(findingID)
+		go s.autoClassifyFinding(context.Background(), findingID)
 		if taskID > 0 {
 			go s.autoCreateSRCRewardForFinding(findingID, taskID)
 		}

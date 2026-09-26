@@ -11,8 +11,10 @@ import * as React from "react";
 import {
   ChevronDownIcon,
   ChevronUpIcon,
+  Loader2Icon,
   PencilIcon,
   PlusIcon,
+  RefreshCwIcon,
   SearchIcon,
   ShieldAlertIcon,
   SparklesIcon,
@@ -160,6 +162,24 @@ function VulnDBInner() {
       reload();
     } catch (err) {
       toast.error(`删除失败:${(err as Error).message}`);
+    }
+  };
+
+  // 重新识别:对 AI 自动入库的条目重走「搜索取证 + AI 分类」链路(删旧建新,
+  // 服务端同步执行,典型 20-60s)。失败时旧条目已删,同样刷新避免行悬空。
+  const [reclassifying, setReclassifying] = React.useState<number | null>(null);
+  const reclassify = async (e: VulnEntry) => {
+    if (reclassifying !== null) return;
+    setReclassifying(e.id);
+    try {
+      const r = await api.reclassifyVulnEntry(e.id);
+      toast.success(`已重新识别:「${r.entry.title}」归类为 ${r.entry.category}`);
+      reload();
+    } catch (err) {
+      toast.error(`重新识别失败:${(err as Error).message}`);
+      reload();
+    } finally {
+      setReclassifying(null);
     }
   };
 
@@ -441,6 +461,21 @@ function VulnDBInner() {
                       <TableCell className="text-muted-foreground text-xs">{fmtTime(e.updated_at)}</TableCell>
                       <TableCell>
                         <div className="flex items-center gap-1">
+                          {e.source === "ai_finding" && e.finding_id ? (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => void reclassify(e)}
+                              disabled={reclassifying !== null}
+                              title="重新识别(AI + 搜索取证重新归类)"
+                            >
+                              {reclassifying === e.id ? (
+                                <Loader2Icon className="text-muted-foreground size-3.5 animate-spin" />
+                              ) : (
+                                <RefreshCwIcon className="size-3.5" />
+                              )}
+                            </Button>
+                          ) : null}
                           <Button variant="ghost" size="sm" onClick={() => setEditing(e)} title="编辑">
                             <PencilIcon className="size-3.5" />
                           </Button>

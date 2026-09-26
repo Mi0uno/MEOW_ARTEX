@@ -825,6 +825,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/vulndb/entries/{id}", s.getVulnEntry)
 	mux.HandleFunc("PUT /api/vulndb/entries/{id}", s.updateVulnEntry)
 	mux.HandleFunc("DELETE /api/vulndb/entries/{id}", s.deleteVulnEntry)
+	mux.HandleFunc("POST /api/vulndb/entries/{id}/reclassify", s.reclassifyVulnEntry)
 	mux.HandleFunc("GET /api/vulndb/entries/{id}/pocs", s.listVulnPocs)
 	mux.HandleFunc("POST /api/vulndb/entries/{id}/pocs", s.createVulnPoc)
 	mux.HandleFunc("PUT /api/vulndb/pocs/{id}", s.updateVulnPoc)

@@ -1199,6 +1199,13 @@ export const api = {
   updateVulnEntry: (id: number, input: Partial<VulnEntry>) =>
     put<{ entry: VulnEntry }>(`/vulndb/entries/${id}`, input),
   deleteVulnEntry: (id: number) => del<{ deleted: boolean }>(`/vulndb/entries/${id}`),
+  // 重新识别:删旧 AI 条目后重走「搜索取证+AI 分类」链路。同步长请求
+  // (典型 20-60s),必须用专用超时,不能落在 http() 默认 60s 上。
+  reclassifyVulnEntry: (id: number) =>
+    http<{ entry: VulnEntry }>(`/vulndb/entries/${id}/reclassify`, {
+      method: "POST",
+      signal: AbortSignal.timeout(200_000),
+    }),
   createVulnPoc: (entryId: number, input: Partial<VulnPoc>) =>
     post<{ poc: VulnPoc }>(`/vulndb/entries/${entryId}/pocs`, input),
   updateVulnPoc: (id: number, input: Partial<VulnPoc>) => put<{ ok: boolean }>(`/vulndb/pocs/${id}`, input),

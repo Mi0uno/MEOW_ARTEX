@@ -458,8 +458,8 @@ func (s *Server) toolUpdateFindingReport() actool.CoreTool {
 			// finding_id 是探索节点 id,归档用独立记录 id,故做一次映射。
 			if fid, err := s.m.pg.FindingIDByNodeID(nodeID); err == nil && fid > 0 {
 				go s.autoArchiveFindingReport(fid)
-				// 漏洞库自动归类:AI 判定 0day/nday/cve 后入库(异步)。
-				go s.autoClassifyFinding(fid)
+				// 漏洞库自动归类:搜索取证 + AI 判定 0day/nday/cve 后入库(异步)。
+				go s.autoClassifyFinding(context.Background(), fid)
 			}
 			return actool.Text(fmt.Sprintf("finding %d report updated (%d chars)", nodeID, len(a.Report))), nil
 		})

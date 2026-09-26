@@ -167,6 +167,43 @@ func (s *Server) deleteVulnEntry(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"deleted": deleted})
 }
 
+// reclassifyVulnEntry POST /api/vulndb/entries/{id}/reclassify —
+// 对 AI 自动入库的条目重新识别:删旧条目(连带其 PoC)后重走
+// 「搜索取证 + AI 分类」链路。仅允许 source=ai_finding 且带 finding_id 的条目。
+// 同步执行(典型 20-60s,内部各环节有独立超时),前端用专用长超时调用。
+func (s *Server) reclassifyVulnEntry(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeErr(w, 400, "bad entry id")
+		return
+	}
+	e, err := s.m.PG().GetVulnEntry(id)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if e == nil {
+		writeErr(w, 404, "entry not found")
+		return
+	}
+	if e.Source != "ai_finding" || e.FindingID == nil || *e.FindingID <= 0 {
+		writeErr(w, 400, "仅 AI 自动入库的条目支持重新识别")
+		return
+	}
+	findingID := *e.FindingID
+	if _, err := s.m.PG().DeleteVulnEntry(id); err != nil {
+		writeErr(w, 500, "删除旧条目失败: "+err.Error())
+		return
+	}
+	s.autoClassifyFinding(r.Context(), findingID)
+	fresh, err := s.m.PG().FindVulnEntryByFinding(findingID)
+	if err != nil || fresh == nil {
+		writeErr(w, 500, "重新识别未产出条目(详见服务端日志)")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"entry": fresh})
+}
+
 // ---- PoC ----
 
 // listVulnPocs GET /api/vulndb/entries/{id}/pocs?content=1
