@@ -181,10 +181,10 @@ export const sidebarItems: NavGroup[] = [
           { id: "external-apis", title: "外部接口", url: "/function/external-apis", icon: Plug },
           { id: "assets", title: "资产", url: "/function/assets", icon: Network },
           { id: "sync", title: "资产同步", url: "/function/sync", icon: FolderSync },
-          // 漏洞库(0day/Nday 人工沉淀)与 CVE 情报(定时搜集)分为两页:
+          // 漏洞库(0day/Nday 人工沉淀)与 CVE&CNVD 情报(定时搜集)分为两页:
           // 前者重编辑与利用指引,后者是机器持续灌入的大批量情报,重检索与同步状态。
           { id: "vulndb", title: "漏洞库", url: "/function/vulndb", icon: Database },
-          { id: "vulndb-cve", title: "CVE 情报", url: "/function/vulndb/cve", icon: ShieldAlert },
+          { id: "vulndb-cve", title: "CVE&CNVD 情报", url: "/function/vulndb/cve", icon: ShieldAlert },
         ],
       },
       {

@@ -19,12 +19,15 @@ const (
 	VulnCategoryZeroDay = "0day"
 	VulnCategoryNDay    = "nday"
 	VulnCategoryCVE     = "cve"
+	// VulnCategoryCNVD 国家漏洞库收录(按 CNVD 编号管理、无 CVE 映射的国内漏洞)。
+	// 数据来自文章源提取的 CNVD 编号与可配置的 CNVD 数据端点(官方会员 API/自建镜像)。
+	VulnCategoryCNVD = "cnvd"
 )
 
 // ValidVulnCategory 校验分类取值。
 func ValidVulnCategory(c string) bool {
 	switch c {
-	case VulnCategoryZeroDay, VulnCategoryNDay, VulnCategoryCVE:
+	case VulnCategoryZeroDay, VulnCategoryNDay, VulnCategoryCVE, VulnCategoryCNVD:
 		return true
 	}
 	return false
@@ -533,6 +536,25 @@ func (d *DB) FindVulnEntryByFinding(findingID int64) (*VulnEntry, error) {
 	}
 	e, err := scanVulnEntry(d.QueryRow(`SELECT `+vulnEntryListCols+` FROM vulndb_entries
 		WHERE finding_id=$1 LIMIT 1`, findingID), false)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return e, nil
+}
+
+// FindVulnEntryByTitlePrefix 按标题前缀精确查条目(cnvd 等「无唯一键分类」的
+// 判重专用:入库标题统一为「编号 空格 描述」,前缀 LIKE 比模糊 Q 检索更准)。
+// 没有命中返回 (nil, nil)。
+func (d *DB) FindVulnEntryByTitlePrefix(prefix string) (*VulnEntry, error) {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return nil, nil
+	}
+	e, err := scanVulnEntry(d.QueryRow(`SELECT `+vulnEntryListCols+` FROM vulndb_entries
+		WHERE title LIKE $1 || '%' ORDER BY id LIMIT 1`, prefix), false)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

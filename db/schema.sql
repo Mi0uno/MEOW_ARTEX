@@ -1478,7 +1478,8 @@ CREATE INDEX IF NOT EXISTS idx_report_jobs_report ON report_jobs(report_id, id D
 -- ============================================================
 CREATE TABLE IF NOT EXISTS vulndb_entries (
     id           BIGSERIAL PRIMARY KEY,
-    -- 分类:0day / nday / cve(不加 CHECK,由 server 白名单校验,便于将来扩展)
+    -- 分类:0day / nday / cve / cnvd(国家库收录,无 CVE 映射的国内漏洞)
+    -- (不加 CHECK,由 server 白名单校验,便于将来扩展)
     category     TEXT NOT NULL DEFAULT 'nday',
     title        TEXT NOT NULL DEFAULT '',
     -- CVE 编号(仅 category=cve 时非空,如 CVE-2024-1234);唯一索引防重复入库。

@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/recon"
 )
 
@@ -51,8 +52,11 @@ var articleFeeds = []struct {
 
 // articleCVERe 匹配 CVE 编号主体(大小写不敏感)。前后边界不在正则里做,原因:
 // Go RE2 不支持 lookahead,而 `\b` 挡不住「编号后紧跟更多数字」的截断误报
-// (如 CVE-2024-12345678 会配出 CVE-2024-1234567),边界由 articleExtractCVEs 校验。
+// (如 CVE-2024-12345678 会配出 CVE-2024-1234567),边界由 articleExtractIDs 校验。
 var articleCVERe = regexp.MustCompile(`(?i)CVE-\d{4}-\d{4,7}`)
+
+// articleCNVDRe 匹配 CNVD 编号(国家信息安全漏洞共享平台,形状与 CVE 同构)。
+var articleCNVDRe = regexp.MustCompile(`(?i)CNVD-\d{4}-\d{4,7}`)
 
 // articleHTMLTagRe 匹配 HTML 标签(RSS 摘要里常见 <p>/<a href=…>/<br/> 等)。
 var articleHTMLTagRe = regexp.MustCompile(`<[^>]+>`)
@@ -184,8 +188,64 @@ func (v *vulnSync) syncArticleFeeds(ctx context.Context) (merged int, err error)
 			}
 			created++
 		}
+
+		// CNVD 编号:国家漏洞库收录的国内漏洞(多数无 CVE 映射),独立 category=cnvd,
+		// 供「CVE&CNVD 情报」页的 CNVD 页签展示。同一篇文章同时提 CVE 和 CNVD 时两边
+		// 各建各的(分属不同分类视图,ref 都指向同一篇文章)。
+		for _, cnvd := range articleExtractCNVDs(it.Title + " " + it.Description) {
+			if ctx.Err() != nil {
+				log.Printf("[vulndb-sync] 文章抓取预算用尽,提前收尾")
+				return merged, nil
+			}
+			created2, refAdded2, err := v.articleUpsertCNVD(it, cnvd, strings.TrimSpace(it.Link))
+			if err != nil {
+				log.Printf("[vulndb-sync] 文章源 CNVD %s 入库失败: %v", cnvd, err)
+				continue
+			}
+			created += created2
+			refAdded += refAdded2
+		}
 	}
 	return merged, nil
+}
+
+// articleUpsertCNVD 把文章里提到的 CNVD 编号入库(category=cnvd;已有条目则把文章
+// 链接并入 refs)。cnvd 分类无唯一键,判重靠「标题 = 编号 + 空格 + 描述」的前缀
+// 匹配(FindVulnEntryByTitlePrefix);命中前缀但编号更长的条目(CNVD-2026-1234 撞
+// CNVD-2026-12345)视为不存在,走正常新建。返回 (新建数, 补 ref 数, 错误)。
+func (v *vulnSync) articleUpsertCNVD(it articleRSSItem, cnvdID, link string) (created, refAdded int, err error) {
+	entry, err := v.s.m.PG().FindVulnEntryByTitlePrefix(cnvdID)
+	if err != nil {
+		return 0, 0, err
+	}
+	if entry != nil && !strings.HasPrefix(entry.Title, cnvdID+" ") {
+		entry = nil
+	}
+	if entry != nil {
+		if link == "" || articleHasRef(entry.Refs, link) {
+			return 0, 0, nil
+		}
+		if err := v.s.m.PG().MergeVulnRefs(entry.ID, []string{link}); err != nil {
+			return 0, 0, err
+		}
+		return 0, 1, nil
+	}
+	title := strings.TrimSpace(cnvdID + " " + truncateRunes(articleStripHTML(it.Title), articleTitleMax))
+	desc := truncateRunes(articleStripHTML(it.Description), articleDescMax)
+	refs := []string{}
+	if link != "" {
+		refs = append(refs, link)
+	}
+	_, err = v.s.m.PG().CreateVulnEntry(db.VulnEntryInput{
+		Category:    db.VulnCategoryCNVD,
+		Title:       title,
+		Description: desc,
+		Source:      "cve_feed",
+		Status:      "active",
+		Refs:        vulnJSON(refs),
+		Tags:        vulnJSON([]string{"CNVD"}),
+	})
+	return 1, 0, err
 }
 
 // articleFetchText 拉取一个文本资源:先过 recon.ValidatePublicURL(只允许公网
@@ -239,14 +299,23 @@ func articleParseRSS(body string) ([]articleRSSItem, error) {
 }
 
 // articleExtractCVEs 从文本抽取全部 CVE 编号:统一大写、去重、保序。
-// 边界校验过滤三类误报:
+func articleExtractCVEs(s string) []string {
+	return articleExtractIDs(s, articleCVERe)
+}
+
+// articleExtractCNVDs 从文本抽取全部 CNVD 编号:统一大写、去重、保序。
+func articleExtractCNVDs(s string) []string {
+	return articleExtractIDs(s, articleCNVDRe)
+}
+
+// articleExtractIDs 编号抽取的公共实现。边界校验过滤三类误报:
 //   - 前缀粘连(如 xCVE-2024-1234,编号连在更长 token 里);
 //   - 尾部截断(如「CVE-2024-」后面没有序列号);
 //   - 序列号超长(如 CVE-2024-12345678,8 位以上不合法,宁可漏收不误收)。
-func articleExtractCVEs(s string) []string {
+func articleExtractIDs(s string, re *regexp.Regexp) []string {
 	seen := map[string]bool{}
 	out := []string{}
-	for _, loc := range articleCVERe.FindAllStringIndex(s, -1) {
+	for _, loc := range re.FindAllStringIndex(s, -1) {
 		start, end := loc[0], loc[1]
 		if start > 0 {
 			prev := s[start-1]
@@ -257,10 +326,10 @@ func articleExtractCVEs(s string) []string {
 		if end < len(s) && s[end] >= '0' && s[end] <= '9' {
 			continue // 序列号后面还是数字:被截断或超长,不收
 		}
-		cve := strings.ToUpper(s[start:end])
-		if !seen[cve] {
-			seen[cve] = true
-			out = append(out, cve)
+		id := strings.ToUpper(s[start:end])
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, id)
 		}
 	}
 	return out

@@ -39,6 +39,49 @@ func TestCVEExtrArticleExtract(t *testing.T) {
 	}
 }
 
+func TestCVEExtrArticleCNVD(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{"中英混排", "国家漏洞库收录 CNVD-2026-123456,涉及某国产 OA 系统", []string{"CNVD-2026-123456"}},
+		{"中文紧邻编号", "漏洞编号CNVD-2025-99999已公开,请及时修复", []string{"CNVD-2025-99999"}},
+		{"多编号去重保序", "对应 CNVD-2026-1234 与 cnvd-2026-1234 及 CNVD-2024-7777777", []string{"CNVD-2026-1234", "CNVD-2024-7777777"}},
+		{"截断误报:序列号超长", "CNVD-2026-12345678 不是合法编号", nil},
+		{"前缀粘连", "xCNVD-2026-1234 不算", nil},
+		{"7 位序列号合法", "CNVD-2023-1234567 可收", []string{"CNVD-2023-1234567"}},
+		{"8 位序列号不合法", "CNVD-2023-12345678 不收", nil},
+		{"空文本", "", nil},
+	}
+	for _, c := range cases {
+		got := articleExtractCNVDs(c.in)
+		if len(got) != len(c.want) {
+			t.Fatalf("%s: articleExtractCNVDs(%q) = %v, want %v", c.name, c.in, got, c.want)
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Fatalf("%s: articleExtractCNVDs(%q)[%d] = %q, want %q", c.name, c.in, i, got[i], c.want[i])
+			}
+		}
+	}
+}
+
+func TestValidCNVDID(t *testing.T) {
+	yes := []string{"CNVD-2026-1234", "CNVD-2026-1234567", "CNVD-1999-0001"}
+	no := []string{"", "CNVD-2026", "CNVD-2026-123", "CNVD-20261-1234", "CNVD-2026-12345678", "CNVD-2026-12a4", "CVE-2026-1234"}
+	for _, id := range yes {
+		if !validCNVDID(id) {
+			t.Fatalf("validCNVDID(%q) = false, want true", id)
+		}
+	}
+	for _, id := range no {
+		if validCNVDID(id) {
+			t.Fatalf("validCNVDID(%q) = true, want false", id)
+		}
+	}
+}
+
 func TestArticleStripHTML(t *testing.T) {
 	cases := []struct {
 		name string

@@ -177,6 +177,13 @@ func (v *vulnSync) runOnce(ctx context.Context) {
 	} else {
 		totalPocs += p
 	}
+	// 9) CNVD 数据端点(可配置,见 vulndb_cnvd.go;未配置时静默跳过)。
+	// CNVD 编号情报的另一条路在文章源里(编号提取),此处是结构化数据端点。
+	if n, err := v.syncCNVDFeed(ctx); err != nil {
+		log.Printf("[vulndb-sync] CNVD 数据端点失败: %v", err)
+	} else {
+		totalNew += n
+	}
 
 	log.Printf("[vulndb-sync] 采集完成:新增 %d 更新 %d PoC %d,耗时 %s",
 		totalNew, totalUpd, totalPocs, time.Since(start).Round(time.Second))

@@ -1,14 +1,16 @@
 "use client";
 
-// CVE 情报:独立页面,只展示 CVE 类漏洞(有编号的公开漏洞)。
+// CVE&CNVD 情报:有编号的公开漏洞(CVE)与国家库收录的国内漏洞(CNVD)。
 // 数据由后台定时采集器从 NVD / GitHub Advisory / Exploit-DB / CISA KEV /
-// PocOrExp / nuclei 模板 / 安全社区文章等公开源持续拉取并自动发现 PoC。
+// PocOrExp / nuclei 模板 / 安全社区文章等公开源持续拉取并自动发现 PoC;
+// CNVD 编号经文章源提取入库(vulndb_articles.go),结构化数据可在系统设置配
+// vulndb_cnvd_url 数据端点接入(官方会员 API/自建镜像,见 vulndb_cnvd.go)。
 //
-// 页面形态(2026-09-26 按用户要求改版):所有操作按钮收进顶部工具栏,内容分
-// 「情报源」「CVE」两个页签,各自配齐 搜索/分类页签/筛选器/分页器 四件套:
+// 页面形态:所有操作按钮收进顶部工具栏,内容分「情报源」「CVE」「CNVD」三个
+// 页签,除情报源外各自配齐 搜索/分类页签/筛选器/分页器 四件套:
 //   - 情报源:各源实时状态 + 采集记录(源分类页签 + 状态筛选 + 搜索 + 分页)
-//   - CVE:严重度分类页签(带计数) + 搜索 + PoC/KEV 筛选 + 分页表格
-// 页签状态存 URL(?tab=sources|cve),刷新/后退一致。
+//   - CVE / CNVD:严重度分类页签(带计数) + 搜索 + PoC/KEV 筛选 + 分页表格
+// 页签状态存 URL(?tab=sources|cve|cnvd),刷新/后退一致。
 
 import * as React from "react";
 
@@ -61,6 +63,7 @@ const SOURCE_LABELS: Record<string, string> = {
   nuclei: "nuclei 模板",
   articles: "安全社区文章",
   nvd_backfill: "NVD 历史回填",
+  cnvd_feed: "CNVD 数据端点",
 };
 // 各源实时状态表的固定展示顺序;后端新增的未知源追加在尾部,不漏显。
 const SOURCE_ORDER = [
@@ -73,13 +76,14 @@ const SOURCE_ORDER = [
   "nuclei",
   "articles",
   "nvd_backfill",
+  "cnvd_feed",
 ];
 
 // 采集记录的源分类(情报源页签的分类页签):每类是一组 source 键,后端
 // source 参数支持逗号分隔多值。"全部"组不传 source。
 const SOURCE_GROUPS: { key: string; label: string; sources: string[] }[] = [
   { key: "all", label: "全部", sources: [] },
-  { key: "intel", label: "漏洞情报", sources: ["nvd", "github_advisory", "kev", "nvd_backfill"] },
+  { key: "intel", label: "漏洞情报", sources: ["nvd", "github_advisory", "kev", "nvd_backfill", "cnvd_feed"] },
   { key: "poc", label: "PoC 源", sources: ["exploitdb", "github_poc", "pocorexp_today", "nuclei"] },
   { key: "community", label: "社区文章", sources: ["articles"] },
 ];
@@ -129,14 +133,15 @@ function runStatusText(status: string): React.ReactNode {
 
 export default function CVEPage() {
   // 页签:URL ?tab= 初始化(SPA 静态导出下不依赖 useSearchParams/Suspense)。
-  const [tab, setTab] = React.useState<"sources" | "cve">(() => {
+  // cve/cnvd 两个数据页签共用同一套列表状态,切换时只换 category 重新加载。
+  const [tab, setTab] = React.useState<"sources" | "cve" | "cnvd">(() => {
     if (typeof window !== "undefined") {
       const t = new URLSearchParams(window.location.search).get("tab");
-      if (t === "sources" || t === "cve") return t;
+      if (t === "sources" || t === "cve" || t === "cnvd") return t;
     }
     return "cve";
   });
-  const switchTab = (t: "sources" | "cve") => {
+  const switchTab = (t: "sources" | "cve" | "cnvd") => {
     setTab(t);
     try {
       const u = new URL(window.location.href);
@@ -146,6 +151,8 @@ export default function CVEPage() {
       /* 隐私模式等 replaceState 失败不影响页签功能 */
     }
   };
+  // 数据页签当前加载的分类:CVE 页签=cve,CNVD 页签=cnvd(情报源页签不加载列表)。
+  const listCategory = tab === "cnvd" ? "cnvd" : "cve";
 
   // ---- CVE 列表状态 ----
   const [entries, setEntries] = React.useState<VulnEntry[]>([]);
@@ -209,11 +216,11 @@ export default function CVEPage() {
   const someSelected = !allSelected && entries.some((e) => checkedIds.has(e.id));
 
   const load = React.useCallback(
-    (q: string, sev: string, poc: string, kevf: string, srt: string, desc: boolean, p: number, size: number) => {
+    (cat: string, q: string, sev: string, poc: string, kevf: string, srt: string, desc: boolean, p: number, size: number) => {
       setLoading(true);
       api
         .vulnEntries({
-          category: "cve", // 固定 CVE 分类:本页只展示有编号的公开漏洞
+          category: cat, // cve / cnvd:由当前数据页签决定
           q,
           severity: sev === "all" ? "" : sev,
           hasPoc: poc === "all" ? "" : poc,
@@ -227,7 +234,7 @@ export default function CVEPage() {
           setTotal(r.total);
           setSevCounts(r.sevCounts);
         })
-        .catch((e) => toast.error(`加载 CVE 失败:${(e as Error).message}`))
+        .catch((e) => toast.error(`加载列表失败:${(e as Error).message}`))
         .finally(() => setLoading(false));
     },
     [],
@@ -274,9 +281,9 @@ export default function CVEPage() {
   }, []);
 
   React.useEffect(() => {
-    load(query, severity, hasPoc, kev, sort, sortDesc, page, pageSize);
+    load(listCategory, query, severity, hasPoc, kev, sort, sortDesc, page, pageSize);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [severity, hasPoc, kev, sort, sortDesc, page, pageSize]);
+  }, [listCategory, severity, hasPoc, kev, sort, sortDesc, page, pageSize]);
 
   React.useEffect(() => {
     loadMeta();
@@ -305,9 +312,9 @@ export default function CVEPage() {
 
   const search = () => {
     setPage(1);
-    load(query, severity, hasPoc, kev, sort, sortDesc, 1, pageSize);
+    load(listCategory, query, severity, hasPoc, kev, sort, sortDesc, 1, pageSize);
   };
-  const reload = () => load(query, severity, hasPoc, kev, sort, sortDesc, page, pageSize);
+  const reload = () => load(listCategory, query, severity, hasPoc, kev, sort, sortDesc, page, pageSize);
   const searchRuns = () => {
     setRunPage(1);
     setRunQueryApplied(runQuery);
@@ -456,10 +463,10 @@ export default function CVEPage() {
       {/* 顶部:标题 + 全部操作按钮(用户要求按钮统一放顶部)。 */}
       <div className="mb-4 flex flex-wrap items-start justify-between gap-2">
         <div>
-          <h1 className="font-semibold text-xl">CVE 情报</h1>
+          <h1 className="font-semibold text-xl">CVE&CNVD 情报</h1>
           <p className="text-muted-foreground text-sm">
-            有编号的公开漏洞;后台定时从 NVD / GitHub Advisory / Exploit-DB / CISA KEV / 安全社区文章等公开源持续搜集并自动发现
-            PoC
+            有编号的公开漏洞与国家库收录漏洞;后台定时从 NVD / GitHub Advisory / Exploit-DB / CISA KEV /
+            安全社区文章等公开源持续搜集并自动发现 PoC
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -505,13 +512,16 @@ export default function CVEPage() {
         </div>
       </div>
 
-      {/* 主页签:情报源 / CVE(可点,带计数;状态存 URL)。 */}
+      {/* 主页签:情报源 / CVE / CNVD(可点,带计数;状态存 URL)。 */}
       <div className="mb-3 flex items-center gap-2">
         <PillTab active={tab === "sources"} onClick={() => switchTab("sources")} count={latestRuns.length || undefined}>
           情报源
         </PillTab>
         <PillTab active={tab === "cve"} onClick={() => switchTab("cve")} count={syncMeta?.counts?.cve}>
           CVE
+        </PillTab>
+        <PillTab active={tab === "cnvd"} onClick={() => switchTab("cnvd")} count={syncMeta?.counts?.cnvd}>
+          CNVD
         </PillTab>
       </div>
 
@@ -694,8 +704,8 @@ export default function CVEPage() {
         </div>
       )}
 
-      {/* ===== CVE 页签 ===== */}
-      {tab === "cve" && (
+      {/* ===== CVE / CNVD 数据页签(共用同一套列表,仅 category 不同) ===== */}
+      {tab !== "sources" && (
         <Card>
           <CardContent className="px-0 pt-4">
             {/* 严重度分类页签(带实时计数)。 */}
@@ -780,7 +790,11 @@ export default function CVEPage() {
               <p className="text-muted-foreground py-16 text-center text-sm">加载中…</p>
             ) : entries.length === 0 ? (
               <p className="text-muted-foreground py-16 text-center text-sm">
-                {query ? "没有匹配的 CVE" : "还没有 CVE 数据。点「立即采集」从公开漏洞源拉取。"}
+                {query
+                  ? "没有匹配的条目"
+                  : listCategory === "cnvd"
+                    ? "还没有 CNVD 数据。CNVD 编号会随安全社区文章持续入库;配置 vulndb_cnvd_url 数据端点(官方会员 API/自建镜像)可获得官方全量数据。"
+                    : "还没有 CVE 数据。点「立即采集」从公开漏洞源拉取。"}
               </p>
             ) : (
               <>
@@ -824,7 +838,12 @@ export default function CVEPage() {
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {entries.map((e) => (
+                    {entries.map((e) => {
+                      // CNVD 条目没有 cve_id 列,编号在标题开头(入库格式「编号 描述」),
+                      // 提取出来展示并链到 CNVD 官网详情。
+                      const first = e.title.split(" ")[0] ?? "";
+                      const cnvdId = !e.cve_id && /^CNVD-\d{4}-\d{4,7}$/.test(first) ? first : "";
+                      return (
                       <TableRow key={e.id}>
                         <TableCell className="w-8" onClick={(e2) => e2.stopPropagation()}>
                           <Checkbox
@@ -843,6 +862,16 @@ export default function CVEPage() {
                               title={`在 NVD 查看 ${e.cve_id}`}
                             >
                               {e.cve_id}
+                            </a>
+                          ) : cnvdId ? (
+                            <a
+                              href={`https://www.cnvd.org.cn/flaw/show/${cnvdId}`}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="text-blue-600 hover:underline"
+                              title={`在 CNVD 查看 ${cnvdId}`}
+                            >
+                              {cnvdId}
                             </a>
                           ) : (
                             "—"
@@ -911,7 +940,8 @@ export default function CVEPage() {
                           </div>
                         </TableCell>
                       </TableRow>
-                    ))}
+                      );
+                    })}
                   </TableBody>
                 </Table>
                 <TablePagination

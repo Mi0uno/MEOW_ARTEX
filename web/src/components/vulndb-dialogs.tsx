@@ -135,6 +135,7 @@ export function VulnEntryDialog({
                     <SelectItem value="0day">0day</SelectItem>
                     <SelectItem value="nday">Nday</SelectItem>
                     <SelectItem value="cve">CVE</SelectItem>
+                    <SelectItem value="cnvd">CNVD</SelectItem>
                   </SelectGroup>
                 </SelectContent>
               </Select>
