@@ -157,7 +157,7 @@ func (s *Server) stagedAssetDecide(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, a := range assets {
 		if req.Action == "adopt" {
-			assetID, err := s.adoptStagedAsset(as, taskID, a)
+			assetID, err := s.adoptStagedAsset(as, taskID, a, 0)
 			if err != nil {
 				errs = append(errs, decideError{ID: a.ID, Value: a.Value, Error: err.Error()})
 				continue
@@ -193,7 +193,9 @@ func (s *Server) stagedAssetDecide(w http.ResponseWriter, r *http.Request) {
 
 // adoptStagedAsset 把一条暂存资产按类型映射进正式资产图。service 类型优先走
 // extra.url(http 服务,URL 内自动提取域名/端口/根域名),否则按 host:port 归其他服务。
-func (s *Server) adoptStagedAsset(as *db.AssetStore, taskID int64, a *db.StagedAsset) (int64, error) {
+// companyID>0 时给每个 Upsert*Req 强制归属该企业(跳过 ICP/范围自动认领,与资产
+// 导入 semantics 一致);=0 时行为与既有完全一致(契约 ASSET_EXTRACT_CONTRACTS.md §4)。
+func (s *Server) adoptStagedAsset(as *db.AssetStore, taskID int64, a *db.StagedAsset, companyID int64) (int64, error) {
 	extra := map[string]any{}
 	_ = json.Unmarshal(a.Extra, &extra)
 	extraStr := func(keys ...string) string {
@@ -206,24 +208,24 @@ func (s *Server) adoptStagedAsset(as *db.AssetStore, taskID int64, a *db.StagedA
 	}
 	switch a.Type {
 	case "root_domain":
-		return as.UpsertRootDomain(db.UpsertRootDomainReq{Domain: a.Value, TaskID: taskID})
+		return as.UpsertRootDomain(db.UpsertRootDomainReq{Domain: a.Value, TaskID: taskID, CompanyID: companyID})
 	case "domain":
-		return as.UpsertSubdomain(db.UpsertSubdomainReq{Domain: a.Value, TaskID: taskID})
+		return as.UpsertSubdomain(db.UpsertSubdomainReq{Domain: a.Value, TaskID: taskID, CompanyID: companyID})
 	case "ip":
 		var ports []db.PortService
 		if a.Port > 0 {
 			ports = append(ports, db.PortService{Port: a.Port, Service: extraStr("service", "service_name")})
 		}
-		return as.UpsertIP(db.UpsertIPReq{IP: a.Value, OpenPorts: ports, TaskID: taskID})
+		return as.UpsertIP(db.UpsertIPReq{IP: a.Value, OpenPorts: ports, TaskID: taskID, CompanyID: companyID})
 	case "service":
 		if u := extraStr("url"); u != "" {
 			ip := ""
 			if net.ParseIP(a.Value) != nil {
 				ip = a.Value
 			}
-			return as.UpsertHTTPService(db.UpsertHTTPServiceReq{URL: u, IP: ip, TaskID: taskID})
+			return as.UpsertHTTPService(db.UpsertHTTPServiceReq{URL: u, IP: ip, TaskID: taskID, CompanyID: companyID})
 		}
-		req := db.UpsertOtherServiceReq{Port: a.Port, ServiceName: extraStr("service", "service_name"), TaskID: taskID}
+		req := db.UpsertOtherServiceReq{Port: a.Port, ServiceName: extraStr("service", "service_name"), TaskID: taskID, CompanyID: companyID}
 		if net.ParseIP(a.Value) != nil {
 			req.IP = a.Value
 		} else {
@@ -235,14 +237,20 @@ func (s *Server) adoptStagedAsset(as *db.AssetStore, taskID int64, a *db.StagedA
 		if name == "" {
 			name = a.Value
 		}
-		return as.UpsertApp(db.UpsertAppReq{
+		appReq := db.UpsertAppReq{
 			Name:        name,
 			BundleID:    extraStr("bundle_id"),
 			Category:    extraStr("category"),
 			Description: extraStr("description"),
 			ICP:         extraStr("icp", "app_icp"),
 			TaskID:      taskID,
-		})
+		}
+		// UpsertAppReq 的 CompanyID 是 *int64(显式覆盖语义,与其他 Req 的零值=旧行为不同)。
+		if companyID > 0 {
+			id := companyID
+			appReq.CompanyID = &id
+		}
+		return as.UpsertApp(appReq)
 	}
 	return 0, fmt.Errorf("未知暂存类型 %q", a.Type)
 }

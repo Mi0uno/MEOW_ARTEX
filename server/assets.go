@@ -498,7 +498,11 @@ func (s *Server) insertAssets(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		TaskID int64 `json:"task_id"`
-		Assets []struct {
+		// 溯源(契约 ASSET_EXTRACT_CONTRACTS.md §7):空串回落既有 api 默认,
+		// 既有调用零变化;手动归档传 source=manual/source_summary=手动归档。
+		Source        string `json:"source"`
+		SourceSummary string `json:"source_summary"`
+		Assets        []struct {
 			Type string `json:"type"`
 			// root_domain / subdomain
 			Domain      string   `json:"domain"`
@@ -586,7 +590,16 @@ func (s *Server) insertAssets(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if req.TaskID > 0 {
-			_ = as.SetTaskAssetSource(req.TaskID, id, "api", "通过资产 API 登记", nil)
+			// 溯源(契约 §7):请求带 Source/SourceSummary 用请求值,空串回落既有默认。
+			src := strings.TrimSpace(req.Source)
+			if src == "" {
+				src = "api"
+			}
+			summary := strings.TrimSpace(req.SourceSummary)
+			if summary == "" {
+				summary = "通过资产 API 登记"
+			}
+			_ = as.SetTaskAssetSource(req.TaskID, id, src, summary, nil)
 		}
 		results = append(results, result{Index: i, ID: id, Type: a.Type})
 	}

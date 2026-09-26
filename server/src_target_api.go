@@ -416,7 +416,7 @@ func (s *Server) addSRCTargetAssets(w http.ResponseWriter, r *http.Request) {
 		found := map[int64]bool{}
 		for _, a := range rows {
 			found[a.ID] = true
-			assetID, err := s.adoptStagedAsset(as, a.TaskID, a)
+			assetID, err := s.adoptStagedAsset(as, a.TaskID, a, 0)
 			if err != nil {
 				errs = append(errs, fmt.Sprintf("暂存资产 #%d(%s):%s", a.ID, a.Value, err.Error()))
 				continue

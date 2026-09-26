@@ -204,6 +204,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 			releaseTaskVPSOnTerminal(taskID)
 			s.autoArchiveTaskReport(taskID)
 			s.maybeStartMemoryReflect(taskID) // AI 记忆库:终态复盘沉淀(契约 §5,自带门禁/骨架/串行)
+			s.maybeStartAssetExtract(taskID)  // 资产识别入库(契约 ASSET_EXTRACT_CONTRACTS.md §3.1,自带门禁/running 互斥)
 		}()
 	})
 	// 报告生成作业的路由层需要 Server 引用(POST /export-ai 等建任务入口);
@@ -879,6 +880,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tasks/{id}/collector-runs/{runId}/raw", s.taskCollectorRunRaw)
 	mux.HandleFunc("GET /api/tasks/{id}/staged-assets", s.taskStagedAssets)
 	mux.HandleFunc("POST /api/tasks/{id}/staged-assets/decide", s.stagedAssetDecide)
+	// ---- 任务资产识别入库(契约 ASSET_EXTRACT_CONTRACTS.md §5) ----
+	mux.HandleFunc("GET /api/tasks/{id}/asset-extract", s.taskAssetExtractGet)
+	mux.HandleFunc("POST /api/tasks/{id}/asset-extract", s.taskAssetExtractRun)
+	mux.HandleFunc("GET /api/asset-extract/config", s.assetExtractConfigGet)
+	mux.HandleFunc("PUT /api/asset-extract/config", s.assetExtractConfigPut)
 	mux.HandleFunc("POST /api/tasks/{id}/recon/rerun", s.rerunReconTaskHandler)
 	mux.HandleFunc("POST /api/recon/execute", s.reconExecute)
 	mux.HandleFunc("GET /api/recon/execute", s.reconExecuteList)
@@ -1869,7 +1875,7 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		CoverageEnabled: req.CoverageEnabled,
 		Stage:           req.Stage, Pipeline: req.Pipeline,
 		StepKey: req.StepKey, StepConfig: req.StepConfig,
-		SRCMode: req.SRCMode,
+		SRCMode:       req.SRCMode,
 		SRCPlatformID: req.SRCPlatformID, SRCTargetID: req.SRCTargetID,
 		// 出网方式(任务级覆盖):建任务时就定下来,agent 与流水线都按它取出口。
 		ProxyMode: req.ProxyMode, ProxyGroupID: req.ProxyGroupID,

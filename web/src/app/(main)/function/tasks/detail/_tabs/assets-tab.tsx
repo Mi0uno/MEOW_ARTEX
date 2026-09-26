@@ -12,6 +12,7 @@ import {
   type LucideIcon,
   NetworkIcon,
   PlusIcon,
+  RefreshCwIcon,
   SmartphoneIcon,
   Trash2Icon,
 } from "lucide-react";
@@ -19,6 +20,7 @@ import { toast } from "sonner";
 
 import { AssetDslSearch } from "@/components/asset-dsl-search";
 import { ScopeTextEditor } from "@/components/scope-text-editor";
+import { TaskAssetArchive } from "@/components/task-asset-archive";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -32,16 +34,18 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardFooter } from "@/components/ui/card";
+import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Sheet, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Spinner } from "@/components/ui/spinner";
+import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { api } from "@/lib/api";
 import { parseCompanyScopeText } from "@/lib/company-scope";
 import { taskAssetSourceLabel } from "@/lib/task-assets";
-import type { Asset, NewAssetType } from "@/lib/types";
+import type { Asset, AssetExtractRun, NewAssetType } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const PAGE_SIZES = [25, 50, 100, 200];
@@ -148,6 +152,52 @@ function SourceCell({ asset }: { asset: Asset }) {
           {asset.task_source_node_id ? (
             <span className="font-mono opacity-80">来源节点 #{asset.task_source_node_id}</span>
           ) : null}
+        </div>
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+// 识别轮状态徽标(契约 §8):无 run=灰点「未识别」;running=Spinner「识别中」;
+// done=绿「已入库 N」(tooltip 细分计数);partial/failed=黄/红(tooltip 错误原因)。
+function ExtractStatusBadge({ run }: { run: AssetExtractRun | null }) {
+  const status = run?.status ?? "";
+  const extracting = status === "running" || status === "pending";
+  let dotClass = "bg-muted-foreground/40";
+  let label = "未识别";
+  let tip: React.ReactNode = "该任务尚未运行过资产识别";
+  if (extracting) {
+    label = "识别中";
+    tip = "正在扫描任务过程数据并提取资产候选";
+  } else if (status === "done" && run) {
+    dotClass = "bg-emerald-500";
+    label = `已入库 ${run.adopted_count}`;
+    tip = `提取 ${run.deterministic_count} · AI 确认 ${run.ai_confirmed_count} · 新发现 ${run.ai_new_count}`;
+  } else if (status === "partial" && run) {
+    dotClass = "bg-amber-500";
+    label = "部分完成";
+    tip = run.error || "确定性提取完成，AI 识别段未执行或失败；候选保留在暂存区待人工采纳";
+  } else if (status === "failed" && run) {
+    dotClass = "bg-red-500";
+    label = "识别失败";
+    tip = run.error || "识别过程出现异常，可稍后重新识别";
+  }
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Badge variant="outline" className="gap-1.5 font-normal">
+          {extracting ? (
+            <Spinner className="size-3" />
+          ) : (
+            <span aria-hidden className={cn("size-1.5 rounded-full", dotClass)} />
+          )}
+          {label}
+        </Badge>
+      </TooltipTrigger>
+      <TooltipContent side="bottom" align="end" className="max-w-xs">
+        <div className="flex min-w-0 flex-col gap-1">
+          <span className="font-medium">{label}</span>
+          <span className="[overflow-wrap:anywhere]">{tip}</span>
         </div>
       </TooltipContent>
     </Tooltip>
@@ -352,8 +402,14 @@ export function AssetsTab({ taskId }: { taskId: string }) {
   const [dslError, setDslError] = React.useState("");
   const [refreshKey, setRefreshKey] = React.useState(0);
   const [addOpen, setAddOpen] = React.useState(false);
+  const [archiveOpen, setArchiveOpen] = React.useState(false);
   const [removeTarget, setRemoveTarget] = React.useState<Asset | null>(null);
   const [removing, setRemoving] = React.useState(false);
+  // 识别轮(契约 §8):run 初载一次,running 中 5s 轮询到终态;AI 开关一次加载。
+  const [extractRun, setExtractRun] = React.useState<AssetExtractRun | null>(null);
+  const [extractLoaded, setExtractLoaded] = React.useState(false);
+  const [extractStarting, setExtractStarting] = React.useState(false);
+  const [aiEnabled, setAiEnabled] = React.useState<boolean | null>(null);
   const assetsRequestRef = React.useRef(0);
   const dslMode = query.trim() !== "";
 
@@ -428,10 +484,115 @@ export function AssetsTab({ taskId }: { taskId: string }) {
     if (page > maxPage) setPage(maxPage);
   }, [page, size, total]);
 
+  // 识别轮初载:失败静默降级为「未识别」,不阻塞资产列表。
+  React.useEffect(() => {
+    let cancelled = false;
+    setExtractLoaded(false);
+    api
+      .taskAssetExtract(taskId)
+      .then((run) => {
+        if (!cancelled) setExtractRun(run);
+      })
+      .catch(() => {
+        // 识别轮加载失败静默降级为「未识别」,不阻塞资产列表。
+      })
+      .finally(() => {
+        if (!cancelled) setExtractLoaded(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [taskId]);
+
+  // AI 识别开关:全局配置,进页签加载一次。
+  React.useEffect(() => {
+    let cancelled = false;
+    api
+      .assetExtractConfig()
+      .then((config) => {
+        if (!cancelled) setAiEnabled(Boolean(config.ai_enabled));
+      })
+      .catch(() => {
+        if (!cancelled) setAiEnabled(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const refresh = React.useCallback(() => {
     setLoaded(false);
     setRefreshKey((current) => current + 1);
   }, []);
+
+  // 识别进行中每 5s 轮询,到终态(done/partial/failed)停表并刷新资产列表。
+  const extractActive = extractRun?.status === "running" || extractRun?.status === "pending";
+  React.useEffect(() => {
+    if (!extractActive) return;
+    const timer = setInterval(() => {
+      api
+        .taskAssetExtract(taskId)
+        .then((next) => {
+          setExtractRun(next);
+          if (next && next.status !== "running" && next.status !== "pending") refresh();
+        })
+        .catch(() => {
+          // 瞬时错误忽略,下个周期重试。
+        });
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [extractActive, refresh, taskId]);
+
+  const toggleAiExtract = async (next: boolean) => {
+    const previous = aiEnabled;
+    setAiEnabled(next); // 乐观更新,失败回滚 UI 态。
+    try {
+      await api.saveAssetExtractConfig({ ai_enabled: next });
+      toast.success(next ? "已开启 AI 识别" : "已关闭 AI 识别");
+    } catch (reason) {
+      setAiEnabled(previous ?? false);
+      toast.error(`保存 AI 识别开关失败：${String((reason as Error)?.message ?? reason)}`);
+    }
+  };
+
+  const startExtract = async () => {
+    if (extractStarting) return;
+    setExtractStarting(true);
+    try {
+      await api.runAssetExtract(taskId);
+      toast.success("已开始识别");
+      // 立即置本地 running 进入轮询;真实计数由轮询回填。
+      setExtractRun({
+        id: 0,
+        task_id: Number(taskId),
+        status: "running",
+        deterministic_count: 0,
+        ai_confirmed_count: 0,
+        ai_new_count: 0,
+        adopted_count: 0,
+        error: "",
+        created_at: "",
+        updated_at: "",
+      });
+    } catch (reason) {
+      const message = String((reason as Error)?.message ?? reason);
+      // running 中重复触发是 409(错误体可能带中文 message,按状态码文案兜底)。
+      if (message.includes("409")) {
+        toast.error("识别正在进行中");
+      } else {
+        toast.error(message);
+      }
+      // 无论成败都同步一次真实状态:409 时本地徽标可能已过期。
+      api
+        .taskAssetExtract(taskId)
+        .then((run) => setExtractRun(run))
+        .catch(() => {
+          // 同步失败忽略,下次触发或轮询会再取。
+        });
+    } finally {
+      setExtractStarting(false);
+    }
+  };
 
   const remove = async () => {
     if (!removeTarget) return;
@@ -480,10 +641,39 @@ export function AssetsTab({ taskId }: { taskId: string }) {
           <h2 className="font-medium text-sm">测试资产</h2>
           <p className="text-muted-foreground text-xs">当前任务共关联 {totalAll} 项资产</p>
         </div>
-        <Button size="sm" onClick={() => setAddOpen(true)}>
-          <PlusIcon data-icon="inline-start" />
-          新增测试资产
-        </Button>
+        <div className="flex flex-wrap items-center gap-2">
+          {extractLoaded ? <ExtractStatusBadge run={extractRun} /> : null}
+          <div className="flex items-center gap-1.5">
+            <Switch
+              id="task-asset-ai-extract"
+              size="sm"
+              checked={aiEnabled ?? false}
+              disabled={aiEnabled === null}
+              onCheckedChange={(value) => void toggleAiExtract(value)}
+              aria-label="AI 识别开关"
+            />
+            <Label htmlFor="task-asset-ai-extract" className="text-muted-foreground text-xs">
+              AI 识别
+            </Label>
+          </div>
+          <Button
+            variant="outline"
+            size="icon-sm"
+            disabled={extractStarting}
+            onClick={() => void startExtract()}
+            title="重新识别资产"
+            aria-label="重新识别资产"
+          >
+            {extractStarting ? <Spinner /> : <RefreshCwIcon />}
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => setArchiveOpen(true)}>
+            归档资产
+          </Button>
+          <Button size="sm" onClick={() => setAddOpen(true)}>
+            <PlusIcon data-icon="inline-start" />
+            新增测试资产
+          </Button>
+        </div>
       </div>
 
       <Tabs
@@ -676,6 +866,8 @@ export function AssetsTab({ taskId }: { taskId: string }) {
       </Tabs>
 
       <AddTaskAssetsSheet onAttached={refresh} onOpenChange={setAddOpen} open={addOpen} taskId={taskId} />
+
+      <TaskAssetArchive taskId={taskId} onArchived={refresh} open={archiveOpen} onOpenChange={setArchiveOpen} />
 
       <AlertDialog open={Boolean(removeTarget)} onOpenChange={(open) => !open && !removing && setRemoveTarget(null)}>
         <AlertDialogContent>
