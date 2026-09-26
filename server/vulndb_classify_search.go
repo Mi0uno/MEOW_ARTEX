@@ -498,5 +498,6 @@ func (s *Server) gatherClassifyEvidence(ctx context.Context, f *db.DBFinding) []
 	if len(out) > classifyMaxEvidence {
 		out = out[:classifyMaxEvidence]
 	}
+	log.Printf("[vulndb] 归类搜索取证(发现 %d): %d 条证据,查询词 %v", f.ID, len(out), queries)
 	return out
 }

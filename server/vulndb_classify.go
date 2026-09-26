@@ -254,10 +254,15 @@ func (s *Server) classifyFinding(ctx context.Context, f *db.DBFinding) classifyR
 	}
 
 	// ③ 兜底:AI 不可用/失败,命中已公开线索或保守默认,均归 nday。
-	res := classifyResult{Category: db.VulnCategoryNDay, Confidence: "low"}
-	if hint != "" {
+	// 搜集到的证据必须带上——否则 LLM 缺位的实例(演示库/断网)白搜一场,
+	// 条目上不留任何取证痕迹,人工没法复核。
+	res := classifyResult{Category: db.VulnCategoryNDay, Confidence: "low", Evidence: evidence}
+	switch {
+	case hint != "":
 		res.Reason = "证据含已公开线索:" + hint
-	} else {
+	case len(evidence) > 0:
+		res.Reason = fmt.Sprintf("检索到 %d 条公开情报,AI 不可用未综合判定,保守归 nday", len(evidence))
+	default:
 		res.Reason = "无确定线索,保守归 nday"
 	}
 	return res
