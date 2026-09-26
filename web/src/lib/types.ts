@@ -2444,12 +2444,18 @@ export type C2TransferStatus = "queued" | "running" | "done" | "error";
 export type C2LootKind = "credential" | "hash" | "file" | "screenshot" | "other";
 export type C2PayloadFormat = "ps1" | "bash" | "py" | "gosrc";
 export type C2PayloadTarget = "windows" | "linux" | "macos" | "cross";
+/** 三期传输协议(https 与 DNS 系四期)。 */
+export type C2Proto = "http" | "ws" | "tcp" | "kcp" | "oss";
+/** 载荷产物形态。 */
+export type C2PayloadArtifact = "script" | "exe" | "dll" | "shellcode" | "ebpf";
+/** 连接方向:reverse=beacon 连回平台;bind=beacon 监听、平台主动连。 */
+export type C2Direction = "reverse" | "bind";
 
-/** 监听器:beacon HTTP 回连入口。enc_key 永不出后端,这里没有该字段。 */
+/** 监听器:beacon 回连入口。enc_key/transport_config_enc 永不出后端。 */
 export interface C2Listener {
   id: number;
   name: string;
-  proto: "http";
+  proto: C2Proto;
   bind_host: string;
   /** 0 = 启动时自动分配;start 后以 runtime_addr 为准。 */
   port: number;
@@ -2472,6 +2478,8 @@ export interface C2Listener {
   remote_port: number;
   /** vps 载体机器名(JOIN 补齐,前端展示用)。 */
   vps_machine_name?: string;
+  /** oss 传输配置是否已设置(凭据永不回显,仅此布尔)。 */
+  transport_configured?: boolean;
 }
 
 export interface C2ListenerInput {
@@ -2506,15 +2514,17 @@ export interface C2Session {
   status: C2SessionStatus;
   labels: string;
   meta: Record<string, unknown>;
+  /** 承载传输(http/ws/tcp/kcp/oss;一期数据回填 http)。 */
+  transport: C2Proto;
   first_seen: string;
   last_seen: string;
 }
 
-/** 下发任务(命令/文件/采集)。actor 区分页面人工与 agent 工具。 */
+/** 下发任务(命令/文件/采集/插件运行)。actor 区分页面人工与 agent 工具。 */
 export interface C2Task {
   id: number;
   session_id: number;
-  kind: C2TaskKind;
+  kind: C2TaskKind | "plugin";
   input: string;
   output: string;
   /** 大输出落盘路径名(下载走 /api/c2/tasks/{id}/output)。 */
@@ -2576,6 +2586,40 @@ export interface C2Payload {
   evasion_profile_id: number;
   /** gosrc 是否已在本平台指派 VPS 上编译出二进制。 */
   built_on_vps: boolean;
+  /** 产物形态(三期):script|exe|dll|shellcode|ebpf。 */
+  artifact: C2PayloadArtifact;
+  /** 连接方向(三期):reverse|bind。 */
+  direction: C2Direction;
+  /** 是否 stage 模式(三期):产物为 stager。 */
+  staged: boolean;
+}
+
+/** C2 插件:可推送执行的能力包(三期,契约 §21)。 */
+export interface C2Plugin {
+  id: number;
+  name: string;
+  platform: C2PayloadTarget;
+  kind: "script" | "binary";
+  language: "ps1" | "sh" | "py";
+  /** 入口命令模板,{{param}} 占位按 params_schema 渲染。 */
+  entry: string;
+  content: string;
+  params_schema: Record<string, unknown>;
+  description: string;
+  builtin: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface C2PluginInput {
+  name: string;
+  platform?: C2PayloadTarget;
+  kind?: "script" | "binary";
+  language?: "ps1" | "sh" | "py";
+  entry?: string;
+  content?: string;
+  params_schema?: Record<string, unknown>;
+  description?: string;
 }
 
 // ── C2 二期:免杀工作台与异步作业(契约 §13/§14)──
@@ -2592,8 +2636,8 @@ export interface C2EvasionProfile {
   techniques: Record<string, unknown>;
   /** 附加指示(喂给 LLM)。 */
   instructions: string;
-  /** manual(手工)/llm(AI 生成)。 */
-  source: "manual" | "llm";
+  /** manual(手工)/llm(AI 生成)/builtin(三期知识库内置)。 */
+  source: "manual" | "llm" | "builtin";
   notes: string;
   created_at: string;
   updated_at: string;

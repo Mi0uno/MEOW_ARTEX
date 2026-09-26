@@ -305,3 +305,81 @@ api.ts 调用只准用主会话冻结的 `c2*` 区段；发现缺接口→报告
 1. vet 三包干净；`go test ./c2center/ ./db/`（5499）全绿；tsc 零错误；全量构建成功。
 2. 8799 冒烟：VPS 载体监听器创建/启停（无真机则以进程内 ssh server 的单测为准 + 真机如有则实测）；免杀 generate 在 LLM 无配置时走 error 路径、静态自测 API 直接可验；gosrc 只出源码 zip（无 VPS go 环境）；loot→finding 在绑定任务的会话上真实转换成功。
 3. 免杀工作台页/监听器载体 UI/payloads 新选项/loot 转发现按钮可用；一期六页无回归。
+
+---
+
+# 三期增量（v3，2026-09-26 冻结）
+
+## 17. 三期范围与所有权矩阵（v3）
+
+**范围（用户确认）**：① 传输协议 WS/TCP/KCP/OSS 四种（DNS/DoH/DoT 四期）② 载荷矩阵：EXE/DLL/Shellcode(sRDI)/Stage/Stageless/正向(bind)/DLL 正向/eBPF 轻量触发器 ③ 免杀知识库（全网搜集→内置档案种子+变形提示词注入）④ 插件板块（能力包插件库：脚本+二进制）。
+
+一期/二期全部硬约束沿用（禁 os/exec、包边界、json tag、nil 防御、密文纪律、测试连 5499、源码走 Write/Edit、禁改冻结文件）。**共享文件（schema/types/api/sidebar/go.mod 的 v3 段）主会话已改完，agents 只读**。本期开始**仓库在 main 线上多人共享工作树：提交必须显式 pathspec，绝不 `git add -A`，不动他人 WIP**。
+
+| 文件/目录 | 所有者 |
+|---|---|
+| 契约/schema/types/api/sidebar/go.mod | 主会话（冻结） |
+| `c2center/transport*.go`（新：传输框架）、`c2center/listener.go`（信道核心抽离传输载体）、`c2center/beacon.go`（模板扩展）、`c2center/protocol.go`（帧格式）、`server/c2_center.go`、`server/c2_api.go`、`db/c2.go`（监听器/会话 v3 列）、正向连接 API、对应测试 | **Agent T（传输）** |
+| `c2center/payload_matrix.go`（新：组合校验+stager 模板+sRDI 转换）、`server/c2_build.go`（构建矩阵扩展）、`server/c2_payload_api.go`（新：载荷 v3 路由拆出）、`db/c2_payload_v3.go`（新：载荷新列）、eBPF 触发器产物、对应测试 | **Agent P（载荷矩阵）** |
+| `c2center/evasion_kb.go`（新：知识库种子）、`server/c2_evasion_kb.go`（新：内置档案播种+提示词注入）、prompt 相关、对应测试 | **Agent E（免杀 KB）** |
+| `db/c2_plugin.go`（新）、`server/c2_plugin.go`（新：插件 CRUD+运行链路+种子）、插件前端页、`c2_plugin_run` agent 工具 | **Agent G（插件）** |
+| `web/src/app/(main)/function/c2/**` 其余 v3 增强（监听器协议/载荷矩阵 UI/正向连接入口）、`web/src/components/c2-*.tsx` | **Agent C（前端）** |
+
+**跨 agent 编译耦合（钉死）**：Agent P 调用 T 的 `c2center.NewOutboundConn`（§18 冻结签名）做正向；T 不碰 P 的任何文件；G 的插件路由自注册进 `registerC2EvasionRoutes` 同款模式——`func (s *Server) registerC2PluginRoutes(mux *http.ServeMux)`，由 **Agent T 在 registerC2Routes 尾部追加调用**（一行）。
+
+## 18. 传输框架与四传输（Agent T）
+
+**信封与帧**：信封 JSON 结构（t/sid/ts/nc/d + meta）**一字不改**，AES-GCM 密钥/防重放逻辑复用。帧格式按载体：
+- http（既有）/ws：body = base64(密文)，与一期逐字节兼容。
+- tcp/kcp：4 字节 big-endian 长度 + 裸密文（nonce‖ct，无 base64）。半包/粘包必须处理。
+- oss：无连接，对象即帧（§18.5）。
+
+**框架重构（不动一期对外行为）**：把 listener.go 的「解密→session 解析→分发(reg/poll/res/file)→加密」核心抽成传输无关的处理核，HTTP/ws 共享；TCP/kcp 每连接一个处理循环；所有传输产出的会话行加 `transport` 字段（c2_sessions 新列，schema 已加：http/ws/tcp/kcp/oss）。
+
+**四传输实现**：
+1. **ws**：独立监听器类型（proto=ws），`POST /<url_path>/e` 处 GET upgrade（路径保持 /e 便于伪装），升级后同一处理核；ping/pong 保活。
+2. **tcp**：`net.Listen` + 每连接帧循环；首帧必须是 reg。
+3. **kcp**：`github.com/xtaci/kcp-go/v5`（go.mod 已加），Listen/帧循环同 tcp；监听器可选预共享 key 混淆（transport_config）。
+4. **oss**：对象存储做双向队列——beacon 写 `<prefix>/<uid>/req` 拉取 `<prefix>/<uid>/resp`；平台侧每监听器一个 goroutine 定时 ListObjectsV2 轮询新会话/新请求（轮询间隔=sleep 语义）。**OSS REST 手写签名（OSS V1 HMAC-SHA1），不引 SDK**；endpoint/bucket/AK/SK 存 `c2_listeners.transport_config_enc`（secretbox 密封 JSON，接口永不回显，前端提交时写入）。callback 语义 = beacon 直连 OSS endpoint。
+- **beacon 模板支持矩阵（freeze，前端按此禁选）**：http: ps1/bash/py/gosrc 全支持；ws: 全支持（ps1 走 ClientWebSocket，py 手写握手，bash 借 python）；tcp: 全支持（长度前缀帧）；**kcp: 仅 py/gosrc（bash 借 python），ps1 不支持**；oss: 全支持（手写签名）。模板与一期同文件延续，防重放/退避/meta 语义不变。
+- **正向（bind）平台侧**：`POST /api/c2/sessions/connect` {listener_id, host, port} → 平台以该监听器的密钥/协议 **主动 dial** 目标（`c2center.NewOutboundConn(l *Listener, host, port string) (c2center.Conn, error)` 冻结签名，仅 tcp/kcp 支持）→ 走同一处理核建会话（transport=tcp/kcp，direction=bind 标注在会话 meta）。失败原样报错。正向 beacon 模板：启动即 Listen 目标端口等首帧 reg 握手。
+
+## 19. 载荷矩阵（Agent P）
+
+**产物维度**（c2_payloads 新列，schema 已加）：`artifact: script|exe|dll|shellcode|ebpf`、`direction: reverse|bind`、`staged bool`。**合法组合表（freeze，前后端同一份校验，后端 400 兜底）**：
+- script：ps1/bash/py × reverse|bind × stageless（script 不做 staged）。
+- exe：gosrc 编译 × reverse|bind × staged|stageless；staged exe = 小体积 stager 拉完整产物**落盘执行**（UI 标注 OPSEC 弱）。
+- dll：gosrc c-shared 编译 × reverse|bind × stageless（导出 `Run` 入口，用法注明 rundll32 或加载器调用）。
+- shellcode：dll 产物经 **sRDI 转换**（bootstrap shellcode 常量来自开源 sRDI 项目，BSD，文件头注明 attribution；Go 实现 patch 流程，指定调 `Run` 导出）× reverse|bind × staged|stageless；**staged shellcode = sRDI bootstrap 从信道拉 DLL stage 后反射加载**（一期交付核心）。
+- ebpf：仅 linux × bind——tc/XDP 魔法包触发器源码工程 + 配套 bind beacon；**标 stretch**：优先交付源码工程+VPS 编译（clang 探测，无则明确报错），时间不够交付源码+构建文档。
+- staging 通用机制：stager 与 stage 走同传输信道，信封协议加 `stage_get`/`stage_data` 消息对（t 扩两个值，协议向后兼容——旧 beacon 不发即不影响）；stage blob 投递复用 payload 文件存储。
+
+**构建管线扩展**（在 server/c2_build.go 基础上）：exe/dll = VPS `go build`（dll 加 `-buildmode=c-shared`，产物 .dll/.so）+ 本机源码 zip 照旧；shellcode = dll 产物本地 sRDI 转换（纯 Go，不 exec）；所有组合走 c2_jobs(kind=build) 异步。组合校验失败 400 带原因；UI 矩阵由前端按 §22 渲染。
+
+## 20. 免杀知识库（Agent E）
+
+1. **全网搜集（WebSearch/WebFetch，先于编码）**：目标覆盖——Windows Defender 当前检测面（行为/AMSI/ETW/云查杀）、360/火绒/腾讯管家 检测侧重与已知干扰面、AMSI bypass/ETW patch/direct syscall/unhooking/DLL 侧载/进程注入技术谱系、加载器形态（sRDI/进程挖空/回调源）、Go 二进制特征与对抗（garble/资源/熵）、脚本类混淆（Invoke-Obfuscate 思路）。来源取公开防御研究与开源项目文档，**不复制样本代码**，沉淀为技术条目（technique/适用 AV/对抗要点/风险）。
+2. **落地形态**：`c2center/evasion_kb.go` 内置知识条目 seeds（≥25 条，中英术语对照）+ 8 个内置免杀档案（source='builtin'，schema 枚举已扩）按 AV 分型（defender/360/huorong/generic × ps1/py/gosrc 主要组合）。`server/c2_evasion_kb.go`：启动幂等播种（照 SeedBuiltinToolsets 模式）+ **变形提示词注入**——按档案 target_av 拉对应知识条目摘要进系统提示（限长，避免撑爆上下文）。
+3. 单测：seeds 完整性（档案引用的 KB key 必须存在）、提示词注入截断逻辑。
+
+## 21. 插件板块（Agent G）
+
+- **数据**：`c2_plugins` 表（schema 已加）：name/platform(windows|linux|macos|cross)/kind(script|binary)/language(ps1|sh|py)/entry(入口命令模板,{{param}} 占位)/content(脚本正文)/blob_path(二进制)/params_schema JSONB/description/builtin。
+- **运行链路**：`POST /api/c2/sessions/{id}/plugins/{pid}/run` {params} → script：entry 模板按 params_schema 渲染（参数白名单校验，防注入——params 只允许进 {{param}} 占位）→ 建 c2_tasks(kind='plugin', input={plugin_id,params,command}) 走既有 shell 通道；binary：文件通道上传到目标临时目录→entry 执行（可带 after_clean 清理步骤）。运行记录即任务流水，actor 照旧 user/agent。
+- **路由**：`GET/POST /api/c2/plugins`、`PUT/DELETE /api/c2/plugins/{id}`、`registerC2PluginRoutes`（T 在 registerC2Routes 尾部调用，一行）。
+- **内置种子**（Go 播种，≥6 个跨平台教育性插件）：系统信息、进程列表、网络连接、计划任务枚举、持久化位置检查、安全软件进程探测（防御视角）。
+- **agent 工具**：`c2_plugin_run`（stage=post 门禁照一期 c2_exec 模式，过拦截 Match）。
+- **前端**（G 自带）：`/function/c2/plugins` 页（库管理四件套+内置徽标+新建/编辑 Dialog：平台/kind/语言/entry/content/params_schema）+ 会话详情新增「插件」Tab（选插件→参数表单（按 params_schema 渲染）→运行→结果进流水）。
+
+## 22. 前端 v3（Agent C）
+
+1. **监听器**：协议选择（http/ws/tcp/kcp/oss，kcp 标注「载荷仅 py/gosrc」）；oss 协议出现 endpoint/bucket/AK/SK 表单（提交后永不回显，编辑时显示「已配置」）；载体选择与协议组合校验（oss 无 bind_host）。
+2. **载荷页矩阵**：格式→产物→方向→staged 四级联动选择器（按 §19 合法组合表禁选非法组合并给原因 tooltip）；shellcode 产物说明文案（sRDI）；staged 落盘版警示；eBPF 触发器选项（linux+bind 锁定）。
+3. **会话**：列表/详情显示 transport 与 bind 方向徽标；详情头部「正向连接」按钮（弹窗 host/port→`c2ConnectBind`）。
+4. 插件页与插件 Tab 由 Agent G 交付，C 不做；G 与 C 的组件若冲突，以 G 的 c2-plugin-* 命名空间为准。
+
+## 23. 三期验收（集成阶段主会话执行）
+
+1. vet 四包干净；`go test ./c2center/ ./vpscenter/ ./db/` 全绿（含各新用例）；tsc 零错误；全量构建成功。
+2. 8799 冒烟：ws/tcp 监听器各起一个→对应 beacon 模板本机上线→shell 往返（TCP 帧解析实测）；kcp/oss 以单测+创建/启停 API 为准（无外部 OSS 凭据则验错误路径）；正向 connect API 对本机 bind beacon 实测建会话；shellcode 产物经 VPS 构建管线生成（有 go 环境则实测 sha256/大小合理，无则验 error 路径）；插件运行一个内置插件到真实会话拿回结果；免杀内置档案与 KB 注入可见。
+3. 前端：矩阵联动/协议选择/正向连接入口/插件页全部可用，一期二期页面零回归。

@@ -2355,3 +2355,64 @@ CREATE INDEX IF NOT EXISTS idx_c2_jobs_kind_status ON c2_jobs(kind, status, id D
 DROP TRIGGER IF EXISTS trg_c2_jobs_upd ON c2_jobs;
 CREATE TRIGGER trg_c2_jobs_upd BEFORE UPDATE ON c2_jobs
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ───────────────────────── C2 中心三期（契约 C2_CONTRACTS.md §17-§23）─────────────────────────
+-- 监听器传输协议扩展:http|ws|tcp|kcp|oss(https 与 DNS 系四期)。
+-- oss 载体的 endpoint/bucket/AK/SK 存 transport_config_enc(secretbox 密封 JSON,永不回显)。
+ALTER TABLE c2_listeners DROP CONSTRAINT IF EXISTS c2_listeners_proto_check;
+ALTER TABLE c2_listeners ADD CONSTRAINT c2_listeners_proto_check
+    CHECK (proto IN ('http','ws','tcp','kcp','oss'));
+ALTER TABLE c2_listeners ADD COLUMN IF NOT EXISTS transport_config_enc BYTEA;
+
+-- 会话承载传输标注(http/ws/tcp/kcp/oss;一期数据回填 http)。
+ALTER TABLE c2_sessions ADD COLUMN IF NOT EXISTS transport TEXT NOT NULL DEFAULT 'http';
+
+-- 载荷产物维度:artifact 产物形态 / direction 连接方向 / staged 是否 stage 模式。
+ALTER TABLE c2_payloads ADD COLUMN IF NOT EXISTS artifact TEXT NOT NULL DEFAULT 'script';
+ALTER TABLE c2_payloads ADD COLUMN IF NOT EXISTS direction TEXT NOT NULL DEFAULT 'reverse';
+ALTER TABLE c2_payloads ADD COLUMN IF NOT EXISTS staged BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE c2_payloads DROP CONSTRAINT IF EXISTS c2_payloads_artifact_check;
+ALTER TABLE c2_payloads ADD CONSTRAINT c2_payloads_artifact_check
+    CHECK (artifact IN ('script','exe','dll','shellcode','ebpf'));
+ALTER TABLE c2_payloads DROP CONSTRAINT IF EXISTS c2_payloads_direction_check;
+ALTER TABLE c2_payloads ADD CONSTRAINT c2_payloads_direction_check
+    CHECK (direction IN ('reverse','bind'));
+
+-- 下发任务 kind 扩 'plugin'(插件运行记录=任务流水,复用既有通道)。
+ALTER TABLE c2_tasks DROP CONSTRAINT IF EXISTS c2_tasks_kind_check;
+ALTER TABLE c2_tasks ADD CONSTRAINT c2_tasks_kind_check
+    CHECK (kind IN ('shell','files_list','upload','download','loot','info','plugin'));
+
+-- 免杀档案 source 扩 'builtin'(三期知识库内置档案)。
+ALTER TABLE c2_evasion_profiles DROP CONSTRAINT IF EXISTS c2_evasion_profiles_source_check;
+ALTER TABLE c2_evasion_profiles ADD CONSTRAINT c2_evasion_profiles_source_check
+    CHECK (source IN ('manual','llm','builtin'));
+
+-- C2 插件:可推送执行的能力包。script 直走命令通道(content+entry 渲染);binary 走
+-- 文件通道上传后执行(blob 落 <BaseDir>/c2/plugins/)。params_schema 是参数 JSON Schema
+-- (仅 {{param}} 占位注入,渲染前白名单校验防注入)。
+CREATE TABLE IF NOT EXISTS c2_plugins (
+    id            BIGSERIAL PRIMARY KEY,
+    name          TEXT NOT NULL,
+    -- windows/linux/macos/cross
+    platform      TEXT NOT NULL DEFAULT 'cross',
+    -- script(脚本,直走命令通道)/binary(二进制,走文件通道)
+    kind          TEXT NOT NULL DEFAULT 'script',
+    -- ps1/sh/py
+    language      TEXT NOT NULL DEFAULT 'sh',
+    entry         TEXT NOT NULL DEFAULT '',
+    content       TEXT NOT NULL DEFAULT '',
+    blob_path     TEXT NOT NULL DEFAULT '',
+    params_schema JSONB NOT NULL DEFAULT '{}',
+    description   TEXT NOT NULL DEFAULT '',
+    builtin       BOOLEAN NOT NULL DEFAULT false,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (platform IN ('windows','linux','macos','cross')),
+    CHECK (kind IN ('script','binary')),
+    CHECK (language IN ('ps1','sh','py'))
+);
+CREATE INDEX IF NOT EXISTS idx_c2_plugins_platform ON c2_plugins(platform);
+DROP TRIGGER IF EXISTS trg_c2_plugins_upd ON c2_plugins;
+CREATE TRIGGER trg_c2_plugins_upd BEFORE UPDATE ON c2_plugins
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();

@@ -73,6 +73,7 @@ import type {
   PromptVar,
   PromptVersion,
   ProxyCheckRun,
+  C2Direction,
   C2EvasionProfile,
   C2EvasionProfileInput,
   C2Job,
@@ -84,8 +85,11 @@ import type {
   C2LootKind,
   C2Overview,
   C2Payload,
+  C2PayloadArtifact,
   C2PayloadFormat,
   C2PayloadTarget,
+  C2Plugin,
+  C2PluginInput,
   C2Session,
   C2Task,
   C2Transfer,
@@ -2321,4 +2325,28 @@ export const api = {
   c2RetryJob: (id: number) => post<{ job_id: number }>(`/c2/jobs/${id}/retry`),
   // 战利品转发现(需会话已绑定任务;重复转换 409)。
   c2LootToFinding: (id: number) => post<{ finding_id: number }>(`/c2/loot/${id}/to-finding`),
+
+  // ── C2 三期(契约 §17-§23):正向连接 / 插件板块 ──
+  // 正向连接:平台主动 dial 目标(bind beacon 在监听),仅 tcp/kcp 传输。
+  c2ConnectBind: (input: { listener_id: number; host: string; port: number }) =>
+    post<{ session_id: number }>("/c2/sessions/connect", input),
+  // 插件库 CRUD(内置插件 builtin=true 不可改删)。
+  c2Plugins: (input?: { platform?: string; kind?: string; q?: string; limit?: number; offset?: number }) => {
+    const p = new URLSearchParams();
+    if (input?.platform) p.set("platform", input.platform);
+    if (input?.kind) p.set("kind", input.kind);
+    if (input?.q) p.set("q", input.q);
+    p.set("limit", String(input?.limit ?? 50));
+    p.set("offset", String(input?.offset ?? 0));
+    return get<{ plugins: C2Plugin[]; total: number }>(`/c2/plugins?${p.toString()}`).then((r) => ({
+      plugins: arr(r.plugins),
+      total: r.total,
+    }));
+  },
+  c2CreatePlugin: (input: C2PluginInput) => post<{ id: number }>("/c2/plugins", input),
+  c2UpdatePlugin: (id: number, input: Partial<C2PluginInput>) => put<C2Plugin>(`/c2/plugins/${id}`, input),
+  c2DeletePlugin: (id: number) => del<{ deleted: boolean }>(`/c2/plugins/${id}`),
+  // 会话内运行插件:script 直走命令通道,binary 走文件通道;结果进任务流水。
+  c2RunPlugin: (sessionId: number, pluginId: number, params: Record<string, string>) =>
+    post<{ task_id: number }>(`/c2/sessions/${sessionId}/plugins/${pluginId}/run`, { params }),
 };

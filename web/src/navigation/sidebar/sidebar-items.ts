@@ -23,6 +23,7 @@ import {
   Network,
   PackageOpen,
   Plug,
+  Puzzle,
   Radar,
   Radio,
   RadioTower,
@@ -239,6 +240,8 @@ export const sidebarItems: NavGroup[] = [
           { id: "c2-payloads", title: "载荷与免杀", url: "/function/c2/payloads", icon: PackageOpen },
           // 免杀工作台:免杀档案管理 + AI 变形生成 + 本地静态自测报告(二期)。
           { id: "c2-evasion", title: "免杀工作台", url: "/function/c2/evasion", icon: ShieldAlert },
+          // 插件:可推送执行的能力包库(脚本/二进制,三期)。
+          { id: "c2-plugins", title: "插件", url: "/function/c2/plugins", icon: Puzzle },
           // 战利品:凭据/哈希/文件归档(二期联动发现与报告)。
           { id: "c2-loot", title: "战利品", url: "/function/c2/loot", icon: Gem },
         ],
