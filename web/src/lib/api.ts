@@ -2401,4 +2401,86 @@ export const api = {
   // 会话内运行插件:script 直走命令通道,binary 走文件通道;结果进任务流水。
   c2RunPlugin: (sessionId: number, pluginId: number, params: Record<string, string>) =>
     post<{ task_id: number }>(`/c2/sessions/${sessionId}/plugins/${pluginId}/run`, { params }),
+
+  // ── AI 记忆库(契约 AI_MEMORY_CONTRACTS.md §4)──
+  // 有记忆数据的企业列表(企业选择器数据源,含 runs/facts 计数)。
+  memoryCompanies: () =>
+    get<{ companies: MemoryCompanyStat[] }>("/memory/companies").then((r) => ({
+      companies: arr(r.companies),
+    })),
+  memoryOverview: (companyId?: number) =>
+    get<MemoryOverview>(`/memory/overview${companyId ? `?company_id=${companyId}` : ""}`),
+  memoryFacts: (input: { companyId?: number; scopeKind?: string; kind?: string; q?: string; includeInvalid?: boolean; limit?: number; offset?: number }) => {
+    const p = new URLSearchParams();
+    if (input.companyId) p.set("company_id", String(input.companyId));
+    if (input.scopeKind) p.set("scope_kind", input.scopeKind);
+    if (input.kind) p.set("kind", input.kind);
+    if (input.q) p.set("q", input.q);
+    if (input.includeInvalid) p.set("include_invalid", "1");
+    p.set("limit", String(input.limit ?? 50));
+    p.set("offset", String(input.offset ?? 0));
+    return get<{ facts: MemoryFact[]; total: number }>(`/memory/facts?${p.toString()}`).then((r) => ({
+      facts: arr(r.facts),
+      total: r.total,
+    }));
+  },
+  memoryCreateFact: (input: MemoryFactInput) => post<{ id: number }>("/memory/facts", input),
+  memoryInvalidateFact: (id: number) => post<{ updated: boolean }>(`/memory/facts/${id}/invalidate`, {}),
+  memoryDeleteFact: (id: number) => del<{ deleted: boolean }>(`/memory/facts/${id}`),
+  memoryRuns: (input: { companyId?: number; taskId?: number; limit?: number; offset?: number }) => {
+    const p = new URLSearchParams();
+    if (input.companyId) p.set("company_id", String(input.companyId));
+    if (input.taskId) p.set("task_id", String(input.taskId));
+    p.set("limit", String(input.limit ?? 50));
+    p.set("offset", String(input.offset ?? 0));
+    return get<{ runs: MemoryRun[]; total: number }>(`/memory/runs?${p.toString()}`).then((r) => ({
+      runs: arr(r.runs),
+      total: r.total,
+    }));
+  },
+  memoryRun: (id: number) => get<MemoryRun>(`/memory/runs/${id}`),
+  // 对历史任务手动触发一次 LLM 复盘(202 异步;同任务复盘进行中 409)。
+  memoryRerunReflect: (id: number) => post<{ run_id: number }>(`/memory/runs/${id}/re-reflect`, {}),
+  // 任务记忆简报(任务详情「记忆简报」卡 + 完整对话框共用)。
+  memoryBriefing: (taskId: string) => get<MemoryBriefing>(`/memory/briefing?task_id=${taskId}`),
+  memoryConfig: () => get<{ ai_reflect: boolean }>("/memory/config"),
+  memorySetConfig: (input: { ai_reflect: boolean }) => put<{ saved: boolean }>("/memory/config", input),
+
+  // ── 自进化(契约 AI_MEMORY_CONTRACTS.md §4)──
+  evolveOverview: () => get<EvolveOverview>("/evolve/overview"),
+  evolveInsights: (input: { status?: string; kind?: string; category?: string; q?: string; companyId?: number; limit?: number; offset?: number }) => {
+    const p = new URLSearchParams();
+    if (input.status) p.set("status", input.status);
+    if (input.kind) p.set("kind", input.kind);
+    if (input.category) p.set("category", input.category);
+    if (input.q) p.set("q", input.q);
+    if (input.companyId) p.set("company_id", String(input.companyId));
+    p.set("limit", String(input.limit ?? 50));
+    p.set("offset", String(input.offset ?? 0));
+    return get<{ insights: EvolveInsight[]; total: number }>(`/evolve/insights?${p.toString()}`).then((r) => ({
+      insights: arr(r.insights),
+      total: r.total,
+    }));
+  },
+  evolveCreateInsight: (input: EvolveInsightInput) => post<{ id: number }>("/evolve/insights", input),
+  // 转正(active)/否决(rejected)/退役(retired)——分级信任的人工闸门。
+  evolveInsightStatus: (id: number, status: EvolveStatus) =>
+    post<{ updated: boolean }>(`/evolve/insights/${id}/status`, { status }),
+  evolveDeleteInsight: (id: number) => del<{ deleted: boolean }>(`/evolve/insights/${id}`),
+  evolvePlaybooks: (input: { status?: string; q?: string; companyId?: number; limit?: number; offset?: number }) => {
+    const p = new URLSearchParams();
+    if (input.status) p.set("status", input.status);
+    if (input.q) p.set("q", input.q);
+    if (input.companyId) p.set("company_id", String(input.companyId));
+    p.set("limit", String(input.limit ?? 50));
+    p.set("offset", String(input.offset ?? 0));
+    return get<{ playbooks: EvolvePlaybook[]; total: number }>(`/evolve/playbooks?${p.toString()}`).then((r) => ({
+      playbooks: arr(r.playbooks),
+      total: r.total,
+    }));
+  },
+  evolveCreatePlaybook: (input: EvolvePlaybookInput) => post<{ id: number }>("/evolve/playbooks", input),
+  evolvePlaybookStatus: (id: number, status: EvolveStatus) =>
+    post<{ updated: boolean }>(`/evolve/playbooks/${id}/status`, { status }),
+  evolveDeletePlaybook: (id: number) => del<{ deleted: boolean }>(`/evolve/playbooks/${id}`),
 };

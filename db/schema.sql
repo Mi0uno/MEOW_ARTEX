@@ -2420,3 +2420,129 @@ CREATE INDEX IF NOT EXISTS idx_c2_plugins_platform ON c2_plugins(platform);
 DROP TRIGGER IF EXISTS trg_c2_plugins_upd ON c2_plugins;
 CREATE TRIGGER trg_c2_plugins_upd BEFORE UPDATE ON c2_plugins
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ───────────────────────── AI 记忆库 + 自进化（契约 AI_MEMORY_CONTRACTS.md）─────────────────────────
+-- 记忆模型（2026-09-26）：
+--   memory_runs  = 情节记忆：每任务一份复盘摘要，与 tasks 1:1（唯一索引兜底）。
+--   memory_facts = 语义记忆：企业/SRC 目标维度的结构化事实，双时间戳失效制
+--                  （新事实使旧事实 valid_to=now()，不物理覆盖——漏洞会修、资产会变）。
+--   evolve_insights / evolve_playbooks = 程序性记忆（自进化）：经验洞察 + 攻击剧本，
+--                  分级信任：candidate 不注入任务，corroboration≥2 或人工「转正」才 active。
+-- 写入=任务终态一次 LLM 复盘（ADD/UPDATE/INVALIDATE 操作流）；读取=任务开始简报注入
+-- + 运行中 memory_recall 检索工具。全部注入内容只取 status='active' 的经验。
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+CREATE TABLE IF NOT EXISTS memory_runs (
+    id            BIGSERIAL PRIMARY KEY,
+    task_id       BIGINT NOT NULL,
+    stage         TEXT NOT NULL DEFAULT '',
+    scope_companies     BIGINT[] NOT NULL DEFAULT '{}',
+    scope_src_target_id BIGINT NOT NULL DEFAULT 0,
+    -- pending=LLM 复盘进行中 / done=完成 / failed=复盘失败(保留确定性骨架) / skipped=未复盘(LLM 未配置等)
+    status        TEXT NOT NULL DEFAULT 'pending',
+    -- ai=任务终态自动复盘 / backfill=开机对历史任务的确定性回填 / manual=人工触发重盘
+    source        TEXT NOT NULL DEFAULT 'ai',
+    summary       TEXT NOT NULL DEFAULT '',
+    highlights    JSONB NOT NULL DEFAULT '[]',
+    failures      JSONB NOT NULL DEFAULT '[]',
+    open_leads    JSONB NOT NULL DEFAULT '[]',
+    stats         JSONB NOT NULL DEFAULT '{}',
+    reflect_error TEXT NOT NULL DEFAULT '',
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (status IN ('pending','done','failed','skipped')),
+    CHECK (source IN ('ai','backfill','manual'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_runs_task ON memory_runs(task_id);
+CREATE INDEX IF NOT EXISTS idx_memory_runs_companies ON memory_runs USING GIN(scope_companies);
+CREATE INDEX IF NOT EXISTS idx_memory_runs_summary_trgm ON memory_runs USING GIN (summary gin_trgm_ops);
+DROP TRIGGER IF EXISTS trg_memory_runs_upd ON memory_runs;
+CREATE TRIGGER trg_memory_runs_upd BEFORE UPDATE ON memory_runs
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE TABLE IF NOT EXISTS memory_facts (
+    id          BIGSERIAL PRIMARY KEY,
+    -- company=按企业 / src_target=按 SRC 目标 / global=全局
+    scope_kind  TEXT NOT NULL DEFAULT 'company',
+    scope_id    BIGINT NOT NULL DEFAULT 0,
+    asset_id    BIGINT NOT NULL DEFAULT 0,
+    -- asset_note(资产备注)/tech_stack(技术栈)/path(可用路径/入口)/credential_ref(凭据线索指针,不存明文)/guard_note(防护观察)/other
+    kind        TEXT NOT NULL DEFAULT 'other',
+    subject     TEXT NOT NULL DEFAULT '',
+    content     TEXT NOT NULL,
+    source_task_id BIGINT,
+    -- ai=任务复盘提炼 / manual=人工 / recon=信息搜集流水线 / backfill=历史回填
+    source_kind TEXT NOT NULL DEFAULT 'ai',
+    confidence  REAL NOT NULL DEFAULT 0.5,
+    observed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    valid_from  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    valid_to    TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (scope_kind IN ('company','src_target','global')),
+    CHECK (source_kind IN ('ai','manual','recon','backfill'))
+);
+CREATE INDEX IF NOT EXISTS idx_memory_facts_scope ON memory_facts(scope_kind, scope_id) WHERE valid_to IS NULL;
+CREATE INDEX IF NOT EXISTS idx_memory_facts_trgm ON memory_facts USING GIN (content gin_trgm_ops);
+DROP TRIGGER IF EXISTS trg_memory_facts_upd ON memory_facts;
+CREATE TRIGGER trg_memory_facts_upd BEFORE UPDATE ON memory_facts
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE TABLE IF NOT EXISTS evolve_insights (
+    id          BIGSERIAL PRIMARY KEY,
+    -- global=跨企业通用经验 / company=企业内 / src_target=SRC 目标内
+    scope_kind  TEXT NOT NULL DEFAULT 'global',
+    scope_id    BIGINT NOT NULL DEFAULT 0,
+    stack_tags  TEXT[] NOT NULL DEFAULT '{}',
+    -- technique(手法)/tool(工具)/recon(搜集)/pitfall(坑)/evasion(免杀)/ops(工程)
+    category    TEXT NOT NULL DEFAULT 'technique',
+    -- positive=有效经验 / negative=失败教训(别再走的路)
+    kind        TEXT NOT NULL DEFAULT 'positive',
+    title       TEXT NOT NULL,
+    content     TEXT NOT NULL DEFAULT '',
+    -- candidate=待验证(不注入任务) / active=生效 / rejected=否决 / retired=退役
+    status      TEXT NOT NULL DEFAULT 'candidate',
+    corroboration INT NOT NULL DEFAULT 1,
+    source_task_ids BIGINT[] NOT NULL DEFAULT '{}',
+    confidence  REAL NOT NULL DEFAULT 0.5,
+    -- agent=复盘产出 / user=人工创建
+    created_by  TEXT NOT NULL DEFAULT 'agent',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (scope_kind IN ('global','company','src_target')),
+    CHECK (kind IN ('positive','negative')),
+    CHECK (status IN ('candidate','active','rejected','retired'))
+);
+CREATE INDEX IF NOT EXISTS idx_evolve_insights_status ON evolve_insights(status, id DESC);
+CREATE INDEX IF NOT EXISTS idx_evolve_insights_title_trgm ON evolve_insights USING GIN (title gin_trgm_ops);
+DROP TRIGGER IF EXISTS trg_evolve_insights_upd ON evolve_insights;
+CREATE TRIGGER trg_evolve_insights_upd BEFORE UPDATE ON evolve_insights
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE TABLE IF NOT EXISTS evolve_playbooks (
+    id          BIGSERIAL PRIMARY KEY,
+    title       TEXT NOT NULL,
+    summary     TEXT NOT NULL DEFAULT '',
+    scope_kind  TEXT NOT NULL DEFAULT 'global',
+    scope_id    BIGINT NOT NULL DEFAULT 0,
+    stack_tags  TEXT[] NOT NULL DEFAULT '{}',
+    preconditions JSONB NOT NULL DEFAULT '{}',
+    steps       JSONB NOT NULL DEFAULT '[]',
+    status      TEXT NOT NULL DEFAULT 'candidate',
+    success_count INT NOT NULL DEFAULT 0,
+    fail_count    INT NOT NULL DEFAULT 0,
+    avg_seconds   INT NOT NULL DEFAULT 0,
+    evidence_task_ids BIGINT[] NOT NULL DEFAULT '{}',
+    source_task_ids   BIGINT[] NOT NULL DEFAULT '{}',
+    corroboration INT NOT NULL DEFAULT 1,
+    created_by  TEXT NOT NULL DEFAULT 'agent',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (scope_kind IN ('global','company','src_target')),
+    CHECK (status IN ('candidate','active','rejected','retired'))
+);
+CREATE INDEX IF NOT EXISTS idx_evolve_playbooks_status ON evolve_playbooks(status, id DESC);
+CREATE INDEX IF NOT EXISTS idx_evolve_playbooks_title_trgm ON evolve_playbooks USING GIN (title gin_trgm_ops);
+DROP TRIGGER IF EXISTS trg_evolve_playbooks_upd ON evolve_playbooks;
+CREATE TRIGGER trg_evolve_playbooks_upd BEFORE UPDATE ON evolve_playbooks
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();

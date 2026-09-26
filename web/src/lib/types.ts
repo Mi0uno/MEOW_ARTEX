@@ -2736,3 +2736,178 @@ export interface C2Overview {
   recent_sessions: C2Session[];
   recent_tasks: C2Task[];
 }
+
+// ── AI 记忆库 + 自进化(契约 AI_MEMORY_CONTRACTS.md)──
+
+/** 记忆归属维度。 */
+export type MemoryScopeKind = "company" | "src_target" | "global";
+
+/** 事实分类：asset_note 资产备注 / tech_stack 技术栈 / path 可用路径 / credential_ref 凭据线索指针 / guard_note 防护观察 / other。 */
+export type MemoryFactKind = "asset_note" | "tech_stack" | "path" | "credential_ref" | "guard_note" | "other";
+
+/** 记忆事实来源：ai 任务复盘 / manual 人工 / recon 信息搜集 / backfill 历史回填。 */
+export type MemoryFactSource = "ai" | "manual" | "recon" | "backfill";
+
+/** 结构化记忆事实（双时间戳失效制：valid_to 非空 = 已被新事实取代）。 */
+export interface MemoryFact {
+  id: number;
+  scope_kind: MemoryScopeKind;
+  scope_id: number;
+  asset_id: number;
+  kind: MemoryFactKind;
+  subject: string;
+  content: string;
+  source_task_id: number;
+  source_kind: MemoryFactSource;
+  confidence: number;
+  observed_at: string;
+  valid_from: string;
+  valid_to: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MemoryFactInput {
+  scope_kind: MemoryScopeKind;
+  scope_id: number;
+  kind?: MemoryFactKind;
+  subject?: string;
+  content: string;
+  asset_id?: number;
+}
+
+/** 复盘里的一条失败/白费尝试（自进化最值钱的数据）。 */
+export interface MemoryRunFailure {
+  what: string;
+  root_cause: string;
+  cost_note?: string;
+}
+
+export type MemoryRunStatus = "pending" | "done" | "failed" | "skipped";
+export type MemoryRunSource = "ai" | "backfill" | "manual";
+
+/** 情节记忆：任务终态的一次复盘摘要（与任务 1:1）。 */
+export interface MemoryRun {
+  id: number;
+  task_id: number;
+  stage: string;
+  scope_companies: number[];
+  scope_src_target_id: number;
+  status: MemoryRunStatus;
+  source: MemoryRunSource;
+  summary: string;
+  highlights: string[];
+  failures: MemoryRunFailure[];
+  open_leads: string[];
+  stats: Record<string, unknown>;
+  reflect_error: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** 记忆库企业维度统计（企业选择器数据源）。 */
+export interface MemoryCompanyStat {
+  company_id: number;
+  company_name: string;
+  runs: number;
+  facts_active: number;
+  last_run_at: string | null;
+}
+
+/** 记忆简报（任务详情卡与完整对话框共用）。 */
+export interface MemoryBriefing {
+  task_id: string;
+  has_content: boolean;
+  text: string;
+  sections: { title: string; body: string }[];
+  generated_at: string;
+}
+
+export type EvolveStatus = "candidate" | "active" | "rejected" | "retired";
+export type EvolveScopeKind = "global" | "company" | "src_target";
+export type EvolveKind = "positive" | "negative";
+export type EvolveCategory = "technique" | "tool" | "recon" | "pitfall" | "evasion" | "ops";
+
+/** 经验洞察（ExpeL 式）：成功规律与失败教训。分级信任：candidate 不注入任务。 */
+export interface EvolveInsight {
+  id: number;
+  scope_kind: EvolveScopeKind;
+  scope_id: number;
+  stack_tags: string[];
+  category: EvolveCategory;
+  kind: EvolveKind;
+  title: string;
+  content: string;
+  status: EvolveStatus;
+  corroboration: number;
+  source_task_ids: number[];
+  confidence: number;
+  created_by: "agent" | "user";
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EvolveInsightInput {
+  title: string;
+  content?: string;
+  kind?: EvolveKind;
+  category?: EvolveCategory;
+  scope_kind?: EvolveScopeKind;
+  scope_id?: number;
+  stack_tags?: string[];
+}
+
+export interface EvolvePlaybookStep {
+  n: number;
+  action: string;
+  detail?: string;
+  notes?: string;
+}
+
+/** 攻击剧本：前置条件→步骤→成败计数→证据。人工可审计的结构化文本，不含可执行代码。 */
+export interface EvolvePlaybook {
+  id: number;
+  title: string;
+  summary: string;
+  scope_kind: EvolveScopeKind;
+  scope_id: number;
+  stack_tags: string[];
+  preconditions: Record<string, unknown>;
+  steps: EvolvePlaybookStep[];
+  status: EvolveStatus;
+  success_count: number;
+  fail_count: number;
+  avg_seconds: number;
+  evidence_task_ids: number[];
+  source_task_ids: number[];
+  corroboration: number;
+  created_by: "agent" | "user";
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EvolvePlaybookInput {
+  title: string;
+  summary?: string;
+  scope_kind?: EvolveScopeKind;
+  scope_id?: number;
+  stack_tags?: string[];
+  preconditions?: Record<string, unknown>;
+  steps?: EvolvePlaybookStep[];
+}
+
+/** 状态 → 条数（页签计数用，不受当前筛选影响）。 */
+export type EvolveStatusCounts = Record<EvolveStatus, number>;
+
+export interface EvolveOverview {
+  insights: EvolveStatusCounts;
+  playbooks: EvolveStatusCounts;
+}
+
+export interface MemoryOverview {
+  facts_total: number;
+  facts_active: number;
+  runs_total: number;
+  insights: EvolveStatusCounts;
+  playbooks: EvolveStatusCounts;
+}

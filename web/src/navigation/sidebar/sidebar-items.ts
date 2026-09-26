@@ -36,6 +36,7 @@ import {
   Sparkles,
   Target,
   Terminal,
+  TrendingUp,
   Wrench,
 } from "lucide-react";
 
@@ -163,6 +164,10 @@ export const sidebarItems: NavGroup[] = [
           { id: "agents", title: "Agent", url: "/system/agents", icon: Bot },
           { id: "mcp", title: "MCP", url: "/system/mcp", icon: Plug },
           { id: "skills", title: "Skill", url: "/system/skills", icon: Sparkles },
+          // 记忆库 = 按企业/SRC 目标聚合的跨任务记忆(事实+任务复盘),新任务自动注入简报防重复探索。
+          { id: "ai-memory", title: "记忆库", url: "/system/memory", icon: Database },
+          // 自进化 = 经验洞察 + 攻击剧本的沉淀与分级信任管理(candidate→active→retired)。
+          { id: "ai-evolve", title: "自进化", url: "/system/evolve", icon: TrendingUp },
           { id: "llm-records", title: "LLM 录制", url: "/function/llm-records", icon: Radio },
         ],
       },
