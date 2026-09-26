@@ -49,6 +49,42 @@ const (
 	reconMonitorProbeTimeout     = 6 * time.Second
 )
 
+// collectorIssueSummary 在收集器「成功但零产出」时,从其 stats 提取单目标错误摘要。
+// crt.sh 把每个域的查询错误吞进 stats.domains[].error(收集器状态仍 done),出网走
+// 死代理池/被限流时表现成「完成 0 产出」——这里把原因翻出来。返回空串=没有可报告
+// 的错误(域确实没有记录)。
+func collectorIssueSummary(result *recon.CollectorResult) string {
+	if result == nil || len(result.Stats) == 0 {
+		return ""
+	}
+	// crt.sh 口径:stats.domains = [{domain, found, error?}...](进程内直传,非 JSON 往返)。
+	if domains, ok := result.Stats["domains"].([]map[string]any); ok {
+		failed := 0
+		var msgs []string
+		for _, d := range domains {
+			if e, ok := d["error"].(string); ok && e != "" {
+				failed++
+				if len(msgs) < 2 {
+					msgs = append(msgs, e)
+				}
+			}
+		}
+		if failed == 0 {
+			return ""
+		}
+		summary := fmt.Sprintf("%d/%d 个域查询失败", failed, len(domains))
+		if len(msgs) > 0 {
+			summary += ": " + strings.Join(msgs, "; ")
+		}
+		return summary
+	}
+	// 通用兜底:stats.error。
+	if e, ok := result.Stats["error"].(string); ok && e != "" {
+		return e
+	}
+	return ""
+}
+
 // monitorCollectorStat 是单收集器在本轮的执行轨迹(recon_monitor_runs.collectors)。
 type monitorCollectorStat struct {
 	Key    string `json:"key"`
@@ -390,6 +426,18 @@ func (v *reconMonitor) runOneCompany(ctx context.Context, mc db.MonitorCompany, 
 			continue
 		}
 		stat.Found = len(result.Assets)
+		// 「成功但零产出」要二次甄别:crt.sh 把单域查询错误吞进 stats(状态仍 done),
+		// 出网走死代理池时表现成「完成 0 产出」,用户无从判断。有错误摘要就如实把
+		// 本收集器记 failed(域真没数据时 summary 为空,仍算 done)。
+		if stat.Found == 0 {
+			if issue := collectorIssueSummary(result); issue != "" {
+				stat.Status, stat.Error = "failed", issue
+				stats = append(stats, stat)
+				failedCollectors++
+				log.Printf("[recon-monitor] %s: 收集器 %s 零产出且目标查询失败: %s", mc.Name, step.Key, issue)
+				continue
+			}
+		}
 		stats = append(stats, stat)
 		doneCollectors++
 		collected = append(collected, result.Assets...)

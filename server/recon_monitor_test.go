@@ -6,8 +6,11 @@ package server
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/Autumn-27/artex/recon"
 )
 
 func monitorTestTime(t time.Time) *time.Time { return &t }
@@ -90,6 +93,37 @@ func TestParseMonitorIntervalHours(t *testing.T) {
 				t.Fatalf("raw %s 应报错, got (%v,%v,nil)", raw, interval, clear)
 			}
 		})
+	}
+}
+
+// 零产出甄别:crt.sh 把单域错误吞进 stats.domains[].error,收集器状态仍 done——
+// collectorIssueSummary 要能把原因翻出来;域真没数据(无 error 键)必须返回空串,
+// 否则正常「无记录」会被误判成失败。
+func TestCollectorIssueSummary(t *testing.T) {
+	crtshAllFailed := &recon.CollectorResult{Stats: map[string]any{
+		"domains": []map[string]any{
+			{"domain": "a.com", "found": 0, "error": "crt.sh 限流(429),稍后重试"},
+		},
+		"total": 0,
+	}}
+	if got := collectorIssueSummary(crtshAllFailed); got == "" || !strings.Contains(got, "1/1 个域查询失败") || !strings.Contains(got, "429") {
+		t.Fatalf("全失败应返回含计数与原因的摘要, got %q", got)
+	}
+	noError := &recon.CollectorResult{Stats: map[string]any{
+		"domains": []map[string]any{{"domain": "a.com", "found": 0}},
+		"total":   0,
+	}}
+	if got := collectorIssueSummary(noError); got != "" {
+		t.Fatalf("无 error 键(真无数据)应返回空串, got %q", got)
+	}
+	partial := &recon.CollectorResult{Stats: map[string]any{
+		"domains": []map[string]any{{"domain": "a.com", "found": 3}, {"domain": "b.com", "found": 0, "error": "x"}},
+	}}
+	if got := collectorIssueSummary(partial); got == "" || !strings.Contains(got, "1/2") {
+		t.Fatalf("部分失败应返回计数摘要, got %q", got)
+	}
+	if got := collectorIssueSummary(nil); got != "" {
+		t.Fatalf("nil result 应返回空串, got %q", got)
 	}
 }
 
