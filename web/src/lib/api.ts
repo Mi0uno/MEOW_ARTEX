@@ -80,6 +80,7 @@ import type {
   C2JobKind,
   C2JobStatus,
   C2Listener,
+  C2ListenerCheck,
   C2ListenerInput,
   C2Loot,
   C2LootKind,
@@ -2330,6 +2331,9 @@ export const api = {
   // 正向连接:平台主动 dial 目标(bind beacon 在监听),仅 tcp/kcp 传输。
   c2ConnectBind: (input: { listener_id: number; host: string; port: number }) =>
     post<{ session_id: number }>("/c2/sessions/connect", input),
+  // 监听器测活(契约 §24B):local 探端口/vps 探转发链/oss 验桶/kcp 进程级。
+  c2CheckListener: (id: number) =>
+    post<C2ListenerCheck>(`/c2/listeners/${id}/check`),
   // 插件库 CRUD(内置插件 builtin=true 不可改删)。
   c2Plugins: (input?: { platform?: string; kind?: string; q?: string; limit?: number; offset?: number }) => {
     const p = new URLSearchParams();

@@ -2504,6 +2504,13 @@ export interface C2ListenerInput {
   };
 }
 
+/** 监听器测活结果(契约 §24B)。checks 为逐项检查;latency_ms 仅网络探活成功时有值。 */
+export interface C2ListenerCheck {
+  ok: boolean;
+  latency_ms: number | null;
+  checks: { item: string; ok: boolean; detail: string }[];
+}
+
 /** 上线主机。sid 是 beacon 令牌;listener_id+beacon_uid 幂等复活。 */
 export interface C2Session {
   id: number;

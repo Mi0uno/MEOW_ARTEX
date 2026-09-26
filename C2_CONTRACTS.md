@@ -383,3 +383,31 @@ api.ts 调用只准用主会话冻结的 `c2*` 区段；发现缺接口→报告
 1. vet 四包干净；`go test ./c2center/ ./vpscenter/ ./db/` 全绿（含各新用例）；tsc 零错误；全量构建成功。
 2. 8799 冒烟：ws/tcp 监听器各起一个→对应 beacon 模板本机上线→shell 往返（TCP 帧解析实测）；kcp/oss 以单测+创建/启停 API 为准（无外部 OSS 凭据则验错误路径）；正向 connect API 对本机 bind beacon 实测建会话；shellcode 产物经 VPS 构建管线生成（有 go 环境则实测 sha256/大小合理，无则验 error 路径）；插件运行一个内置插件到真实会话拿回结果；免杀内置档案与 KB 注入可见。
 3. 前端：矩阵联动/协议选择/正向连接入口/插件页全部可用，一期二期页面零回归。
+
+---
+
+# 三期补丁 A（v3.1，2026-09-26 冻结）：载荷↔免杀联动 + 监听器测活
+
+## 24A. 载荷生成联动免杀（缺口：三期的 createC2Payload 不处理 evasion_profile_id）
+
+- **后端**：`POST /api/c2/payloads` 收到 `evasion_profile_id>0` 时：
+  - artifact=script（ps1/bash/py）：**不走直出渲染**，改走免杀变形作业管线（与 `/api/c2/evasion/generate` 完全同一条链路：建 c2_jobs(kind=evasion) + stage=post 监看任务 + LLM 变形 + 静态自测），实现为共享 helper（两个端点共用，防两份逻辑漂移）；同档案+监听器已有 running job → 409。响应 `{job_id}`（前端已有轮询 UI）。
+  - artifact=exe/dll/shellcode/ebpf：400 明确提示「编译型产物暂不支持档案变形（后续走 garble/构建混淆），请改选 script 或到免杀工作台处理脚本载荷」。
+  - 档案校验：存在性 + `payload_format` 与请求 format 一致（不一致 400）。
+- **前端**（payloads 页）：生成表单加「免杀档案」下拉（默认「不使用（直出）」；可选档案按当前 format 过滤，来源徽标 builtin/manual/llm）；选中档案且产物=script 时提交携带 evasion_profile_id，响应带 job_id 时复用既有 3s 作业轮询进度条；选中档案且产物≠script 时前端预先禁用提交并提示原因（与后端 400 文案同义）。
+
+## 24B. 监听器测活
+
+- **后端**：`POST /api/c2/listeners/{id}/check` → `{ok: bool, latency_ms: number|null, checks:[{item, ok, detail}]}`：
+  - local 载体：TCP dial bind 地址（运行中才有意义；未运行 → ok=false detail=「监听器未运行」）；http/ws 协议追加一次 `GET /<url_path>/e`（任何 HTTP 响应=通，包括 400/404/426——探测的是端口与服务活性，不是合法信封）。
+  - vps 载体：dial `vps机器公网host:remote_port`（端到端验证 SSH 转发链）+ SSH 连接健康；失败 detail 区分「SSH 断开/转发端口拒绝/超时」。
+  - oss：签名 GetBucket 探测（验证 endpoint/bucket/AK/SK 全链）；未配置 → ok=false。
+  - kcp：进程级检查（监听器 goroutine 存活 + UDP 本地端口绑定），detail 注明「UDP 无连接，进程级探活」。
+  - 全部检查限时 5s/项，永不阻塞；结果只返回不落库。
+- **前端**（listeners 页）：行操作加「测活」按钮（运行中才可点；未运行置灰）→ 结果 Dialog/内联：总 ok 徽标 + latency + 逐项 checks 列表（ok 绿/detail 红字）；测活期间按钮转圈。
+
+## 24C. 验收
+
+1. 载荷页选档案生成 script 载荷 → 作业出现 →（配 LLM 的实例）产出带 evasion_profile_id 的载荷行；不选档案行为与三期完全一致。
+2. 监听器测活：local/vps 载体实测通断与延迟；kcp/oss 给出对应级别的检查结果；未运行监听器给明确提示。
+3. tsc 零错误；vet 四包干净；既有测试零回归。
