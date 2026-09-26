@@ -204,7 +204,28 @@ func (v *vulnSync) syncPocOrExpToday(ctx context.Context) (pocs int, err error) 
 	sections := parsePocOrExpMD(string(body))
 	log.Printf("[vulndb-sync] PocOrExp Today 解析出 %d 个 CVE", len(sections))
 	pocs, err = pocorexpAttachSections(ctx, v.s.m.PG(), sections)
-	return pocs, err
+	if err != nil {
+		return pocs, err
+	}
+	// 补挂当年文件:Today.md 只含「今天新建仓库」的 CVE——发布几天后才出现 PoC
+	// 仓库的 CVE,在仓库出现那天条目可能还没入库,之后就再也不会被 Today.md
+	// 覆盖,造成「最新 CVE 都没 PoC」(2026-09-26 用户报障的根因之一)。当年
+	// README.md 约 200KB,每轮重挂一次(幂等)即可堵住这个缺口。
+	year := time.Now().UTC().Year()
+	ybody, yerr := pocorexpFetchText(ctx, fmt.Sprintf("%s/%d/README.md", pocorexpBaseURL, year), nil)
+	if yerr != nil {
+		var httpErr *pocorexpHTTPError
+		if !errors.As(yerr, &httpErr) || httpErr.Status != http.StatusNotFound {
+			log.Printf("[vulndb-sync] PocOrExp %d 年文件补挂失败: %v", year, yerr)
+		}
+		return pocs, nil // Today.md 已挂完,当年文件失败不作为整轮错误
+	}
+	yAttached, aerr := pocorexpAttachSections(ctx, v.s.m.PG(), parsePocOrExpMD(string(ybody)))
+	if aerr != nil {
+		return pocs, aerr
+	}
+	pocs += yAttached
+	return pocs, nil
 }
 
 // backfillPocOrExpYears 拉取 PocOrExp_in_Github 逐年历史 README(startYear..endYear

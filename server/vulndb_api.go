@@ -45,7 +45,21 @@ func (s *Server) listVulnEntries(w http.ResponseWriter, r *http.Request) {
 	if items == nil {
 		items = []*db.VulnEntry{}
 	}
-	writeJSON(w, 200, map[string]any{"entries": items, "total": total, "counts": counts})
+	// 严重度分类计数(CVE 页严重度页签):受除严重度外其它筛选影响。
+	sevCounts, err := s.m.PG().CountVulnEntriesBySeverity(db.VulnEntryFilter{
+		Category: strings.TrimSpace(q.Get("category")),
+		Categories: cats,
+		Status:   strings.TrimSpace(q.Get("status")),
+		Source:   strings.TrimSpace(q.Get("source")),
+		Q:        strings.TrimSpace(q.Get("q")),
+		TaskID:   taskID,
+		HasPoc:   strings.TrimSpace(q.Get("has_poc")),
+		Kev:      strings.TrimSpace(q.Get("kev")),
+	})
+	if err != nil {
+		sevCounts = map[string]int{}
+	}
+	writeJSON(w, 200, map[string]any{"entries": items, "total": total, "counts": counts, "sev_counts": sevCounts})
 }
 
 // getVulnEntry GET /api/vulndb/entries/{id} — 条目全文 + 其 PoC 列表(含正文)。
@@ -249,9 +263,24 @@ func (s *Server) deleteVulnPoc(w http.ResponseWriter, r *http.Request) {
 
 // ---- 采集状态 ----
 
-// vulnDBSyncStatus GET /api/vulndb/sync — 采集运行记录 + 各分类计数 + 开关状态。
+// vulnDBSyncStatus GET /api/vulndb/sync — 采集运行记录(分页/筛选) + 各源最新状态 + 开关。
+// 参数:source=&status=&q=&limit=&offset=。响应:
+//
+//	runs:         本页记录(默认最新 20 条)
+//	total:        筛选后总数
+//	status_counts:状态计数(不受状态自身筛选影响,页签用)
+//	latest:       每个采集源最近一轮(情报源页签实时状态表)
+//	counts/total_entries: 漏洞分类计数与条目总数(页签徽标用)
 func (s *Server) vulnDBSyncStatus(w http.ResponseWriter, r *http.Request) {
-	runs, err := s.m.PG().ListVulnSyncRuns(20)
+	q := r.URL.Query()
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	offset, _ := strconv.Atoi(q.Get("offset"))
+	runs, total, statusCounts, err := s.m.PG().ListVulnSyncRunsPage(db.VulnSyncRunFilter{
+		Source: strings.TrimSpace(q.Get("source")),
+		Status: strings.TrimSpace(q.Get("status")),
+		Q:      strings.TrimSpace(q.Get("q")),
+		Limit:  limit, Offset: offset,
+	})
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -259,7 +288,11 @@ func (s *Server) vulnDBSyncStatus(w http.ResponseWriter, r *http.Request) {
 	if runs == nil {
 		runs = []*db.VulnSyncRun{}
 	}
-	counts, total, err := s.m.PG().CountVulnEntriesByCategory()
+	latest, err := s.m.PG().LatestVulnSyncRuns()
+	if err != nil {
+		latest = []*db.VulnSyncRun{}
+	}
+	counts, totalEntries, err := s.m.PG().CountVulnEntriesByCategory()
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -277,7 +310,8 @@ func (s *Server) vulnDBSyncStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, 200, map[string]any{
-		"runs": runs, "counts": counts, "total": total,
+		"runs": runs, "total": total, "status_counts": statusCounts, "latest": latest,
+		"counts": counts, "total_entries": totalEntries,
 		"enabled": enabled, "interval_hours": intervalH,
 	})
 }

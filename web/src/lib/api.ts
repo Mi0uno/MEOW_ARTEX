@@ -1087,9 +1087,9 @@ export const api = {
     if (input?.sort) p.set("sort", input.sort);
     p.set("limit", String(input?.limit ?? 50));
     p.set("offset", String(input?.offset ?? 0));
-    return get<{ entries: VulnEntry[]; total: number; counts: Record<string, number> }>(
+    return get<{ entries: VulnEntry[]; total: number; counts: Record<string, number>; sev_counts?: Record<string, number> }>(
       `/vulndb/entries?${p.toString()}`,
-    ).then((r) => ({ entries: arr(r.entries), total: r.total, counts: r.counts ?? {} }));
+    ).then((r) => ({ entries: arr(r.entries), total: r.total, counts: r.counts ?? {}, sevCounts: r.sev_counts ?? {} }));
   },
   vulnEntry: (id: number) =>
     get<{ entry: VulnEntry; pocs: VulnPoc[] }>(`/vulndb/entries/${id}`).then((r) => ({
@@ -1104,14 +1104,33 @@ export const api = {
     post<{ poc: VulnPoc }>(`/vulndb/entries/${entryId}/pocs`, input),
   updateVulnPoc: (id: number, input: Partial<VulnPoc>) => put<{ ok: boolean }>(`/vulndb/pocs/${id}`, input),
   deleteVulnPoc: (id: number) => del<{ deleted: boolean }>(`/vulndb/pocs/${id}`),
-  vulnSyncStatus: () =>
-    get<{
+  vulnSyncStatus: (input?: { source?: string; status?: string; q?: string; limit?: number; offset?: number }) => {
+    const p = new URLSearchParams();
+    if (input?.source) p.set("source", input.source);
+    if (input?.status && input.status !== "all") p.set("status", input.status);
+    if (input?.q) p.set("q", input.q);
+    if (input?.limit) p.set("limit", String(input.limit));
+    if (input?.offset) p.set("offset", String(input.offset));
+    return get<{
       runs: VulnSyncRun[];
-      counts: Record<string, number>;
       total: number;
+      status_counts: Record<string, number>;
+      latest: VulnSyncRun[];
+      counts: Record<string, number>;
+      total_entries: number;
       enabled: boolean;
       interval_hours: number;
-    }>("/vulndb/sync").then((r) => ({ ...r, runs: arr(r.runs), counts: r.counts ?? {} })),
+    }>(`/vulndb/sync?${p.toString()}`).then((r) => ({
+      runs: arr(r.runs),
+      total: r.total ?? 0,
+      status_counts: r.status_counts ?? {},
+      latest: arr(r.latest),
+      counts: r.counts ?? {},
+      total_entries: r.total_entries ?? 0,
+      enabled: r.enabled,
+      interval_hours: r.interval_hours,
+    }));
+  },
   triggerVulnSync: () => post<{ status: string }>("/vulndb/sync", {}),
   setVulnSyncConfig: (input: { enabled?: boolean; interval_hours?: number }) =>
     put<{ ok: boolean }>("/vulndb/sync/config", input),

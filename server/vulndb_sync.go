@@ -614,8 +614,10 @@ func (v *vulnSync) syncGitHubPoCs(ctx context.Context) (pocs int, err error) {
 		_ = v.s.m.PG().FinishVulnSyncRun(runID, status, 0, 0, 0, pocs, errMsg)
 	}()
 
-	// 取最近的高危 CVE 条目(无 token 时最多 5 条避免触发 GitHub 限速;
+	// 定向取「最新且还没有 PoC」的条目(无 token 时最多 5 条避免触发 GitHub 限速;
 	// 配置了 vulndb_github_token 则放大到 60 条,搜索配额 30 次/分钟)。
+	// 按 created 倒序 = 最新发布的优先;HasPoc="0" 保证配额花在没有 PoC 的条目上,
+	// 而不是被「最近刚被其它源更新过」的条目占掉(2026-09-26 用户报「最新 CVE 都没 PoC」)。
 	token := ""
 	if val, _, err := v.s.m.PG().GetSetting(settingVulnGitHubToken); err == nil {
 		token = strings.TrimSpace(val)
@@ -625,7 +627,7 @@ func (v *vulnSync) syncGitHubPoCs(ctx context.Context) (pocs int, err error) {
 		sample = 60
 	}
 	items, _, _, err := v.s.m.PG().ListVulnEntries(db.VulnEntryFilter{
-		Category: db.VulnCategoryCVE, Sort: "updated", Limit: sample,
+		Category: db.VulnCategoryCVE, HasPoc: "0", Sort: "created", Limit: sample,
 	})
 	if err != nil {
 		return 0, err

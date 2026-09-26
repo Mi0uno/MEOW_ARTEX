@@ -116,15 +116,10 @@ type VulnEntryFilter struct {
 	Offset     int
 }
 
-// ListVulnEntries 分页检索漏洞库条目,并返回分类计数(受 Q 与其它筛选影响,
-// 不受 Category 影响,供分类页签展示)。
-func (d *DB) ListVulnEntries(f VulnEntryFilter) ([]*VulnEntry, int, map[string]int, error) {
-	if f.Limit <= 0 || f.Limit > 200 {
-		f.Limit = 50
-	}
-	if f.Offset < 0 {
-		f.Offset = 0
-	}
+// vulnEntryFilterWhere 拼装条目列表的公共 WHERE(不含分类条件:分类由调用方按
+// 「计数不受分类影响、列表受分类影响」的约定追加)。skipSeverity 供严重度分类
+// 计数用——与分类计数同一约定:受其它筛选影响,不受该分类维度自身影响。
+func vulnEntryFilterWhere(f VulnEntryFilter, skipSeverity bool) (string, []any) {
 	where := []string{"1=1"}
 	args := []any{}
 	add := func(cond string, v any) {
@@ -139,7 +134,7 @@ func (d *DB) ListVulnEntries(f VulnEntryFilter) ([]*VulnEntry, int, map[string]i
 			len(args)+1, len(args)+1, len(args)+1, len(args)+1, len(args)+1, len(args)+1, len(args)+1))
 		args = append(args, "%"+f.Q+"%")
 	}
-	if f.Severity != "" {
+	if f.Severity != "" && !skipSeverity {
 		add("severity = $%d", f.Severity)
 	}
 	if f.Status != "" {
@@ -161,7 +156,19 @@ func (d *DB) ListVulnEntries(f VulnEntryFilter) ([]*VulnEntry, int, map[string]i
 	} else if f.Kev == "0" {
 		where = append(where, "NOT kev")
 	}
-	kw := strings.Join(where, " AND ")
+	return strings.Join(where, " AND "), args
+}
+
+// ListVulnEntries 分页检索漏洞库条目,并返回分类计数(受 Q 与其它筛选影响,
+// 不受 Category 影响,供分类页签展示)。
+func (d *DB) ListVulnEntries(f VulnEntryFilter) ([]*VulnEntry, int, map[string]int, error) {
+	if f.Limit <= 0 || f.Limit > 200 {
+		f.Limit = 50
+	}
+	if f.Offset < 0 {
+		f.Offset = 0
+	}
+	kw, args := vulnEntryFilterWhere(f, false)
 
 	// 分类计数:只受 Q/其它筛选影响,不受 Category 影响(页签要显示各类总数)。
 	counts := map[string]int{}
@@ -682,4 +689,179 @@ func (d *DB) MergeVulnTags(entryID int64, tags []string) error {
 		FROM jsonb_array_elements(tags || $2::jsonb) AS x
 	), updated_at=now() WHERE id=$1`, entryID, incoming)
 	return err
+}
+
+// CountVulnEntriesBySeverity 各严重度条目数(CVE 页严重度分类页签用)。
+// 与分类计数同一约定:受除严重度外的其它筛选影响,不受严重度自身影响;
+// Category/Categories 是固定范围(不是页签维度),必须照常生效——否则 CVE 页
+// 的严重度计数会混入 nday/0day(2026-09-26 冒烟抓到:全部页签比实际多 9)。
+func (d *DB) CountVulnEntriesBySeverity(f VulnEntryFilter) (map[string]int, error) {
+	kw, args := vulnEntryFilterWhere(f, true)
+	cats := f.Categories
+	if len(cats) == 0 && f.Category != "" {
+		cats = []string{f.Category}
+	}
+	if len(cats) > 0 {
+		ph := make([]string, 0, len(cats))
+		for _, c := range cats {
+			args = append(args, c)
+			ph = append(ph, fmt.Sprintf("$%d", len(args)))
+		}
+		kw += " AND category IN (" + strings.Join(ph, ",") + ")"
+	}
+	rows, err := d.Query(`SELECT severity, COUNT(*) FROM vulndb_entries WHERE `+kw+` GROUP BY severity`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var s string
+		var n int
+		if err := rows.Scan(&s, &n); err != nil {
+			return nil, err
+		}
+		// 保留空严重度键:Exploit-DB 反向建档的老洞没有 CVSS,前端「全部」
+		// 页签的计数要靠对全值求和得到,漏掉空键会数不对。
+		out[s] = n
+	}
+	return out, rows.Err()
+}
+
+// ---- 采集记录分页检索(情报源页签) ----
+
+// VulnSyncRunFilter 是采集记录的筛选条件。空值 = 不限。
+type VulnSyncRunFilter struct {
+	Source string // 精确匹配 source 键(nvd/exploitdb/…,空=全部)
+	Status string // running / done / failed(空=全部)
+	Q      string // 匹配 source 键或错误信息
+	Limit  int
+	Offset int
+}
+
+// vulnSyncRunFilterWhere 拼装采集记录的公共 WHERE。skipStatus 供状态计数用
+// (计数受其它筛选影响、不受状态自身影响)。
+func vulnSyncRunFilterWhere(f VulnSyncRunFilter, skipStatus bool) (string, []any) {
+	where := []string{"1=1"}
+	args := []any{}
+	add := func(cond string, v any) {
+		where = append(where, fmt.Sprintf(cond, len(args)+1))
+		args = append(args, v)
+	}
+	if f.Source != "" {
+		// 支持逗号分隔多值(情报源页签的源分类:漏洞情报/PoC 源/社区文章 各含多个 source 键)。
+		srcs := make([]string, 0, 4)
+		for _, s := range strings.Split(f.Source, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				srcs = append(srcs, s)
+			}
+		}
+		if len(srcs) == 1 {
+			add("source = $%d", srcs[0])
+		} else if len(srcs) > 1 {
+			ph := make([]string, 0, len(srcs))
+			for _, s := range srcs {
+				args = append(args, s)
+				ph = append(ph, fmt.Sprintf("$%d", len(args)))
+			}
+			where = append(where, "source IN ("+strings.Join(ph, ",")+")")
+		}
+	}
+	if f.Status != "" && !skipStatus {
+		add("status = $%d", f.Status)
+	}
+	if f.Q != "" {
+		add(`(source ILIKE $%d OR error ILIKE $%d)`, "%"+f.Q+"%")
+	}
+	return strings.Join(where, " AND "), args
+}
+
+// ListVulnSyncRunsPage 分页检索采集记录,返回总数与状态计数
+// (计数受除状态外其它筛选影响,供状态筛选页签展示)。
+func (d *DB) ListVulnSyncRunsPage(f VulnSyncRunFilter) ([]*VulnSyncRun, int, map[string]int, error) {
+	if f.Limit <= 0 || f.Limit > 200 {
+		f.Limit = 20
+	}
+	if f.Offset < 0 {
+		f.Offset = 0
+	}
+	kw, args := vulnSyncRunFilterWhere(f, false)
+
+	// 状态计数(页签用):不受状态自身影响。
+	skw, sargs := vulnSyncRunFilterWhere(f, true)
+	counts := map[string]int{}
+	crows, err := d.Query(`SELECT status, COUNT(*) FROM vulndb_sync_runs WHERE `+skw+` GROUP BY status`, sargs...)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	for crows.Next() {
+		var s string
+		var n int
+		if err := crows.Scan(&s, &n); err != nil {
+			crows.Close()
+			return nil, 0, nil, err
+		}
+		counts[s] = n
+	}
+	crows.Close()
+	if err := crows.Err(); err != nil {
+		return nil, 0, nil, err
+	}
+
+	var total int
+	if err := d.QueryRow(`SELECT COUNT(*) FROM vulndb_sync_runs WHERE `+kw, args...).Scan(&total); err != nil {
+		return nil, 0, nil, err
+	}
+
+	q := `SELECT id, source, status, fetched, inserted, updated, pocs_found, error, started_at, finished_at
+		FROM vulndb_sync_runs WHERE ` + kw + ` ORDER BY id DESC` +
+		fmt.Sprintf(` LIMIT $%d OFFSET $%d`, len(args)+1, len(args)+2)
+	args = append(args, f.Limit, f.Offset)
+	rows, err := d.Query(q, args...)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	defer rows.Close()
+	out := []*VulnSyncRun{}
+	for rows.Next() {
+		var r VulnSyncRun
+		var fin sql.NullTime
+		if err := rows.Scan(&r.ID, &r.Source, &r.Status, &r.Fetched, &r.Inserted, &r.Updated,
+			&r.PocsFound, &r.Error, &r.StartedAt, &fin); err != nil {
+			return nil, 0, nil, err
+		}
+		if fin.Valid {
+			t := fin.Time
+			r.FinishedAt = &t
+		}
+		out = append(out, &r)
+	}
+	return out, total, counts, rows.Err()
+}
+
+// LatestVulnSyncRuns 每个采集源最近一轮运行(DISTINCT ON),供情报源页签的
+// 实时状态表:分页后的 runs 只能看到切片,各源最新状态必须单独取。
+func (d *DB) LatestVulnSyncRuns() ([]*VulnSyncRun, error) {
+	rows, err := d.Query(`SELECT DISTINCT ON (source)
+		id, source, status, fetched, inserted, updated, pocs_found, error, started_at, finished_at
+		FROM vulndb_sync_runs ORDER BY source, id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*VulnSyncRun{}
+	for rows.Next() {
+		var r VulnSyncRun
+		var fin sql.NullTime
+		if err := rows.Scan(&r.ID, &r.Source, &r.Status, &r.Fetched, &r.Inserted, &r.Updated,
+			&r.PocsFound, &r.Error, &r.StartedAt, &fin); err != nil {
+			return nil, err
+		}
+		if fin.Valid {
+			t := fin.Time
+			r.FinishedAt = &t
+		}
+		out = append(out, &r)
+	}
+	return out, rows.Err()
 }
