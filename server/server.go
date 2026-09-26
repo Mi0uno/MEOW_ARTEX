@@ -172,6 +172,14 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	go s.vulnBackfillWorker(s.ctx)
 	// 代理中心:本地代理池监听器 + 源站拉取 + 自动测活。恢复上次的出网模式,
 	// 并把出网地址接进 Manager.ProxyAddr(裸网 ⇄ 代理池的切换落点)。
+	// 凭据加密盒必须在各中心 init 之前就绪:C2 监听器开机恢复会解封 enc_key、
+	// VPS 测活要解机器凭据——曾经它排在 initC2 之后,boot 恢复偶发「加密盒未初始化」
+	// (2026-09-26 二期冒烟实锤的 init 竞态)。
+	if box, err := newAPISecretBox(m.dir); err != nil {
+		log.Printf("[external-apis] 凭据加密盒初始化失败: %v", err)
+	} else {
+		s.apiSecret = box
+	}
 	s.initProxyCenter()
 	// VPS 中心:机器池/终端/工具集/流水。播种内置工具集 + 开机对账 + 测活循环。
 	s.initVPS()
@@ -193,11 +201,6 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	// 报告生成作业的路由层需要 Server 引用(POST /export-ai 等建任务入口);
 	// New 里无条件绑定,消除「启动后未跑过任何报告任务就发导出请求」的时序缺口。
 	bindReportRouteServer(s)
-	if box, err := newAPISecretBox(m.dir); err != nil {
-		log.Printf("[external-apis] 凭据加密盒初始化失败: %v", err)
-	} else {
-		s.apiSecret = box
-	}
 	s.initSideQuestions()
 	// 熔断阈值/冷却是失败路径上的热参数，启动时把全局重试策略推给 Registry 一次；
 	// 之后每次保存策略再推一次（saveLLMRetryPolicy）。
