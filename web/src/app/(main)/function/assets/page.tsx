@@ -97,6 +97,21 @@ function statusTone(code: number) {
   return "text-muted-foreground";
 }
 
+function fmtTime(iso?: string): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString();
+}
+
+// 列表列用的紧凑时间(MM-DD HH:mm),完整时间放单元格 title,省列宽。
+function fmtTimeShort(iso?: string): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
 const PAGE_SIZES = [25, 50, 100, 200];
 
 const TABS: { key: string; label: string; icon: LucideIcon }[] = [
@@ -124,6 +139,13 @@ export default function AssetsPage() {
   const [refreshKey, setRefreshKey] = React.useState(0);
   const assetsRequestRef = React.useRef(0);
   const [rowsTab, setRowsTab] = React.useState("");
+
+  // 「新发现」筛选(仅根域名/子域名/服务三个数据页签):all=常规列表;
+  // "1"/"7"=近 N 天首次发现(created_at),走 assetsNewer 替代原列表请求。
+  const [newer, setNewer] = React.useState<"all" | "1" | "7">("all");
+  const [newerCompany, setNewerCompany] = React.useState("all");
+  const newerDays = newer === "all" ? 0 : Number(newer);
+  const newerCompanyId = Number(newerCompany);
 
   // asset selection & delete
   const [selected, setSelected] = React.useState<Set<number>>(new Set());
@@ -242,21 +264,29 @@ export default function AssetsPage() {
   }, [tab]);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: these controls intentionally reset server pagination.
-  React.useEffect(() => setPage(0), [tab, size, query]);
+  React.useEffect(() => setPage(0), [tab, size, query, newer, newerCompany]);
 
   const dslMode = query.trim() !== "";
 
   // Server-side paginated page loader for the active data tab (company tab excluded).
+  // 「新发现」筛选开启时改走 assetsNewer(按 created_at 近 N 天),DSL 搜索在该模式下不生效。
   // biome-ignore lint/correctness/useExhaustiveDependencies: refreshKey is an explicit manual-reload trigger.
   React.useEffect(() => {
     if (tab === "company") return;
     const request = ++assetsRequestRef.current;
-    const dsl = query.trim();
+    const dsl = newerDays === 0 ? query.trim() : "";
     setLoading(true);
     const offset = page * size;
     const run = async () => {
       try {
-        const r = dsl ? await api.searchAssets(dsl, tab, size, offset) : await api.assets(tab, size, offset);
+        let r: { assets: Asset[]; total: number };
+        if (newerDays > 0) {
+          r = await api.assetsNewer(newerDays, tab, size, offset, newerCompanyId > 0 ? newerCompanyId : undefined);
+        } else if (dsl) {
+          r = await api.searchAssets(dsl, tab, size, offset);
+        } else {
+          r = await api.assets(tab, size, offset);
+        }
         if (assetsRequestRef.current !== request) return;
         setRows(r.assets);
         setRowsTab(tab);
@@ -280,7 +310,7 @@ export default function AssetsPage() {
       clearTimeout(tid);
       if (assetsRequestRef.current === request) assetsRequestRef.current++;
     };
-  }, [tab, page, size, query, refreshKey]);
+  }, [tab, page, size, query, newerDays, newerCompanyId, refreshKey]);
 
   React.useEffect(() => {
     if (tab === "company") return;
@@ -312,6 +342,59 @@ export default function AssetsPage() {
       error={dslError}
       count={dslMode ? total : undefined}
     />
+  );
+
+  // 「新发现」筛选工具栏(仅根域名/子域名/服务三个数据页签):开启时替代 DSL 搜索框。
+  // Radix Select 不允许空字符串 value,用 "all" 表示不过滤。
+  const newerSelect = (
+    <Select
+      value={newer}
+      onValueChange={(v) => {
+        setNewer(v as "all" | "1" | "7");
+        setPage(0);
+      }}
+    >
+      <SelectTrigger className="w-44">
+        <SelectValue placeholder="新发现" />
+      </SelectTrigger>
+      <SelectContent>
+        <SelectGroup>
+          <SelectItem value="all">全部资产</SelectItem>
+          <SelectItem value="1">新发现 · 近 24 小时</SelectItem>
+          <SelectItem value="7">新发现 · 近 7 天</SelectItem>
+        </SelectGroup>
+      </SelectContent>
+    </Select>
+  );
+  const newerCompanySelect = (
+    <Select
+      value={newerCompany}
+      onValueChange={(v) => {
+        setNewerCompany(v);
+        setPage(0);
+      }}
+    >
+      <SelectTrigger className="w-40">
+        <SelectValue placeholder="企业" />
+      </SelectTrigger>
+      <SelectContent>
+        <SelectGroup>
+          <SelectItem value="all">全部企业</SelectItem>
+          {companies.map((c) => (
+            <SelectItem key={c.id} value={String(c.id)}>
+              {c.name}
+            </SelectItem>
+          ))}
+        </SelectGroup>
+      </SelectContent>
+    </Select>
+  );
+  const newerToolbar = (
+    <div className="flex flex-wrap items-center gap-2">
+      {newerSelect}
+      {newerCompanySelect}
+      <span className="text-muted-foreground text-xs">按首次发现时间筛选近 {newerDays} 天入库的资产;DSL 搜索在该模式下不生效</span>
+    </div>
   );
 
   return (
@@ -427,9 +510,9 @@ export default function AssetsPage() {
 
         {/* 根域名 */}
         <TabsContent value="root_domain" className="mt-0 flex min-h-0 flex-1 flex-col gap-2">
-          {searchBox}
+          {newerDays > 0 ? newerToolbar : searchBox}
           <AssetCard
-            cols={["", "域名", "ICP 备案", "归属企业", ""]}
+            cols={["", "域名", "ICP 备案", "归属企业", "首次发现", ""]}
             loaded={loaded}
             total={total}
             page={page}
@@ -449,6 +532,9 @@ export default function AssetsPage() {
                 <TableCell className="text-xs">{a.icp || "—"}</TableCell>
                 <TableCell className="text-xs">
                   {companyName(a.company_id) || <span className="text-muted-foreground">未归属</span>}
+                </TableCell>
+                <TableCell className="text-muted-foreground text-xs whitespace-nowrap" title={fmtTime(a.created_at)}>
+                  {fmtTimeShort(a.created_at)}
                 </TableCell>
                 <TableCell className="w-8 pl-0">
                   <Button
@@ -515,9 +601,9 @@ export default function AssetsPage() {
 
         {/* 子域名 */}
         <TabsContent value="subdomain" className="mt-0 flex min-h-0 flex-1 flex-col gap-2">
-          {searchBox}
+          {newerDays > 0 ? newerToolbar : searchBox}
           <AssetCard
-            cols={["", "域名", "根域名", "解析类型", "解析值", ""]}
+            cols={["", "域名", "根域名", "解析类型", "解析值", "首次发现", ""]}
             loaded={loaded}
             total={total}
             page={page}
@@ -538,6 +624,9 @@ export default function AssetsPage() {
                 <TableCell className="text-xs">{a.record_type || "—"}</TableCell>
                 <TableCell className="max-w-xs truncate font-mono text-xs">
                   {(Array.isArray(a.record_value) ? a.record_value.join(", ") : a.record_value) || "—"}
+                </TableCell>
+                <TableCell className="text-muted-foreground text-xs whitespace-nowrap" title={fmtTime(a.created_at)}>
+                  {fmtTimeShort(a.created_at)}
                 </TableCell>
                 <TableCell className="w-8 pl-0">
                   <Button
@@ -597,9 +686,9 @@ export default function AssetsPage() {
 
         {/* 服务 */}
         <TabsContent value="service" className="mt-0 flex min-h-0 flex-1 flex-col gap-2">
-          {searchBox}
+          {newerDays > 0 ? newerToolbar : searchBox}
           <AssetCard
-            cols={["", "服务", "域名", "IP", "端口", "状态码", "标题", "指纹", "认证", ""]}
+            cols={["", "服务", "域名", "IP", "端口", "状态码", "标题", "指纹", "认证", "首次发现", ""]}
             loaded={loaded}
             total={total}
             page={page}
@@ -673,6 +762,9 @@ export default function AssetsPage() {
                         );
                       })
                     )}
+                  </TableCell>
+                  <TableCell className="text-muted-foreground text-xs whitespace-nowrap" title={fmtTime(a.created_at)}>
+                    {fmtTimeShort(a.created_at)}
                   </TableCell>
                   <TableCell className="w-8 pl-0">
                     <Button

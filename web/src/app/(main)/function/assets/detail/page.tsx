@@ -343,6 +343,9 @@ function CompanyDetailInner({ companyId }: { companyId: number }) {
                         <TableHead className="w-24">类型</TableHead>
                         <TableHead>值</TableHead>
                         <TableHead className="w-40">说明</TableHead>
+                        <TableHead className="w-40" title="资产首次入库(created_at)时间">
+                          首次发现
+                        </TableHead>
                         <TableHead className="w-40">最近活跃</TableHead>
                         <TableHead className="w-10" />
                       </TableRow>
@@ -365,6 +368,9 @@ function CompanyDetailInner({ companyId }: { companyId: number }) {
                           <TableCell className="font-mono text-xs">{assetValue(a)}</TableCell>
                           <TableCell className="text-muted-foreground max-w-[240px] truncate text-xs">
                             {a.page_title || a.service_name || a.service_type || a.icp || "—"}
+                          </TableCell>
+                          <TableCell className="text-muted-foreground text-xs" title={fmtTime(a.created_at)}>
+                            {fmtTime(a.created_at)}
                           </TableCell>
                           <TableCell className="text-muted-foreground text-xs">{fmtTime(a.last_seen)}</TableCell>
                           <TableCell className="w-10 pl-0 text-right">

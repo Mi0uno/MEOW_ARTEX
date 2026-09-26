@@ -362,6 +362,12 @@ func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
 	// beyond the last row can return an empty page without an expensive scan.
 	total := 0
 
+	// newer_than_days=N(资产监控配套的「新发现」筛选):created_at >= now()-N days。
+	// >0 才生效;生效时非 DSL 路径统一走 QueryAssets(company_id/task_id/type 全部
+	// 透传;无企业无任务且无 type 时保持既有「缺省 root_domain」语义)。DSL 路径
+	// 不生效(契约)。=0/缺省时走下面的既有路径,行为不变。
+	newerDays, _ := strconv.Atoi(q.Get("newer_than_days"))
+
 	if dsl := q.Get("dsl"); dsl != "" {
 		if err := db.ValidateDSL(dsl); err != nil {
 			writeErr(w, http.StatusBadRequest, err.Error())
@@ -373,6 +379,23 @@ func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
 		total, err = as.CountDSL(dsl, typ, taskID)
 		if err == nil && offset < total {
 			assets, err = as.QueryDSL(dsl, typ, taskID, limit, offset)
+		}
+	} else if newerDays > 0 {
+		companyID, _ := strconv.ParseInt(q.Get("company_id"), 10, 64)
+		taskID, _ := strconv.ParseInt(q.Get("task_id"), 10, 64)
+		if companyID <= 0 && taskID <= 0 && typ == "" {
+			typ = "root_domain"
+		}
+		assets, total, err = as.QueryAssets(db.AssetListFilter{
+			CompanyID:     companyID,
+			TaskID:        taskID,
+			Type:          typ,
+			NewerThanDays: newerDays,
+			Limit:         limit,
+			Offset:        offset,
+		})
+		if assets == nil {
+			assets = []*db.Asset{}
 		}
 	} else {
 		companyID, _ := strconv.ParseInt(q.Get("company_id"), 10, 64)

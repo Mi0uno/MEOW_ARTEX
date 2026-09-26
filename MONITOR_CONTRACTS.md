@@ -55,6 +55,7 @@
 | **recon/liveness_test.go（新）** | **Agent B** | 不碰 collectors*.go / runner.go |
 | **server/recon_monitor.go（新）** | **Agent C** | 调度器 + 单轮执行 |
 | **server/recon_monitor_api.go（新）** | **Agent C** | 路由 handlers + registerReconMonitorRoutes |
+| **server/assets.go（仅 listAssets 函数体）** | **Agent C** | 解析 `newer_than_days` 并在 >0 时走 QueryAssets（其余路径行为不变） |
 | **server/server.go（三处接线）** | **Agent C** | ① Server struct 加 `reconMonitor *reconMonitor`（vulnSync 字段旁，~:53）② New() 里 vulnSync 启动两行后加 `s.reconMonitor = newReconMonitor(s)` + `go s.reconMonitor.run(s.ctx)`（~:170）③ 路由区 `POST /api/recon/plan` 行后加 `s.registerReconMonitorRoutes(mux)`（~:812） |
 | **web/src/app/(main)/function/recon/monitor/page.tsx（新）** | **Agent D** | 监控页（可拆 components/recon-monitor-*.tsx） |
 | **web/src/app/(main)/function/assets/page.tsx（指定行区）** | **Agent D** | 根域名/子域名/service 页签加「首次发现」列 + 「新发现」筛选 |
@@ -129,7 +130,7 @@ CREATE INDEX IF NOT EXISTS idx_av2_type_created ON assets(type, created_at DESC)
 
 ### PUT /api/recon/monitor/config　body `{ "enabled"?: boolean, "interval_hours"?: number }` → 返回更新后的 config 对象。interval 越界 400；开启时顺带 wake。
 
-### PUT /api/recon/monitor/targets/{companyID}　body `{ "enabled"?: boolean, "interval_hours"?: number|null }` → 返回更新后的 target 对象（同 targets[] 元素形状）。企业不存在 400；interval_hours≤0 400；null=清除覆盖。
+### PUT /api/recon/monitor/targets/{companyID}　body `{ "enabled"?: boolean, "interval_hours"?: number|null }` → 返回更新后的 target 对象（同 targets[] 元素形状）。企业不存在 400；**interval_hours 三态**：数值=设置覆盖、`null`=清除覆盖回全局、字段缺省=不动（后端用 json.RawMessage 解析区分；前端始终显式传 number|null）。
 
 ### POST /api/recon/monitor/trigger　body `{ "company_id"?: number }` → `{ "started": boolean }`。
 - 带 company_id：把该企业水位清零（last_run_at/last_run_id 置 NULL）后 wake——**绕过全局开关**（便于试跑一家）。
@@ -245,3 +246,62 @@ triggerReconMonitor / reconMonitorRuns / reconMonitorRun / assetsNewer`（签名
   `go test ./recon/ ./db/`（db 需 5499）新增用例全绿；`cd web && npx tsc --noEmit` 零错误。
 - 8799 冒烟（主会话负责）：开监控 → 试跑一家 → 轮次 done、新增清单可见 → 资产页「新发现」
   筛选命中 → 关开关后循环空转。
+
+## 补充冻结：Agent 间接口精确签名（A 实现、C 调用，逐字对齐）
+
+```go
+// db/recon_monitor.go（Agent A）
+type MonitorTarget struct {
+    CompanyID     int64      `json:"company_id"`
+    Enabled       bool       `json:"enabled"`
+    IntervalHours *int       `json:"interval_hours"`
+    LastRunAt     *time.Time `json:"last_run_at"`
+    LastRunID     *int64     `json:"last_run_id"`
+    CreatedAt     time.Time  `json:"created_at"`
+    UpdatedAt     time.Time  `json:"updated_at"`
+}
+func (d *DB) UpsertMonitorTarget(companyID int64, enabled *bool, intervalHours *int, clearInterval bool) (*MonitorTarget, error)
+func (d *DB) GetMonitorTarget(companyID int64) (*MonitorTarget, error) // nil=无行
+func (d *DB) ListMonitorTargets() ([]MonitorTarget, error)
+func (d *DB) ResetMonitorTargetRun(companyID int64) error // last_run_at/last_run_id 置 NULL
+type MonitorCompany struct {
+    ID          int64    `json:"id"`
+    Name        string   `json:"name"`
+    DomainCount int      `json:"domain_count"`
+    Domains     []string `json:"domains"`
+}
+func (d *DB) ListMonitorCandidateCompanies() ([]MonitorCompany, error) // 有 kind=domain 范围的企业
+func (d *DB) StartMonitorRun(companyID int64, companyName, trigger string) (int64, error)
+func (d *DB) FinishMonitorRun(runID, companyID int64, status string, collectors json.RawMessage,
+    totalFound, newCount int, newDomains json.RawMessage, newTruncated bool,
+    probeOK, probeFailed int, errMsg string) error // 事务内回写 targets 水位（无行则插）
+type MonitorRunFilter struct { CompanyID int64; Status string; Limit, Offset int }
+func (d *DB) ListMonitorRuns(f MonitorRunFilter) ([]MonitorRun, int, error) // 列表不含 new_domains
+func (d *DB) GetMonitorRun(id int64) (*MonitorRun, error)                  // 含 new_domains
+func (d *DB) MonitorRunsByIDs(ids []int64) (map[int64]*MonitorRun, error)
+func (d *DB) LatestMonitorRoundAt() (*time.Time, error) // MAX(finished_at)，无行返回 nil,nil
+// MonitorRun JSON tag 对齐本文 wire；Collectors/NewDomains 用 json.RawMessage，空值一律 "[]"/"[]"。
+```
+
+```go
+// recon/liveness.go（Agent B，C 按此调用）
+type ProbeResult struct {
+    Domain string; IPs []string; Alive bool; URL string
+    StatusCode int; Title string; ContentLength int64
+    Technologies []string; Err string
+}
+type ProbeOptions struct {
+    Concurrency int           // 缺省 8
+    Timeout     time.Duration // 单次 HTTP 尝试，缺省 6s
+    InsecureTLS bool          // x509 错误时降级重试一次
+    Client      *http.Client  // nil=内部 newHTTPClient(ctx, timeout)
+    Resolve     func(ctx context.Context, host string) ([]net.IP, error) // nil=系统 resolver
+}
+func ProbeDomains(ctx context.Context, domains []string, opts ProbeOptions) []ProbeResult
+```
+
+## 纪律（全体 agent）
+
+- **不运行任何 git 命令**（不 add/commit/stash/pull）——主会话统一集成提交。
+- 源码一律走 Write/Edit 工具（Bash 直写会被拦）；**源码禁 os/exec**；raw SQL 字符串内禁 `//` 注释。
+- 中文测试数据走 UTF-8 文件 + `--data-binary @file`（如需 curl 验证）。

@@ -54,6 +54,7 @@ type Asset struct {
 	Params []map[string]any `json:"params,omitempty"`
 	// meta
 	Extra             map[string]any `json:"extra,omitempty"`
+	CreatedAt         string         `json:"created_at,omitempty"`
 	LastSeen          string         `json:"last_seen"`
 	TaskSource        string         `json:"task_source,omitempty"`
 	TaskSourceSummary string         `json:"task_source_summary,omitempty"`
@@ -1112,7 +1113,7 @@ SELECT id, type, company_id, array_to_json(task_ids)::text,
        COALESCE(url,''), COALESCE(service_type,''), COALESCE(service_name,''),
        COALESCE(favicon_mmh3,''), status_code, content_length,
        COALESCE(page_title,''), array_to_json(technologies)::text, array_to_json(auth)::text,
-       COALESCE(method,''), array_to_json(params)::text, extra, last_seen::text
+       COALESCE(method,''), array_to_json(params)::text, extra, COALESCE(created_at::text,''), last_seen::text
 FROM assets
 WHERE type = $1
 ORDER BY last_seen DESC, id DESC
@@ -1143,7 +1144,7 @@ func (s *AssetStore) QueryByCompany(companyID int64, typ string, limit, offset i
        COALESCE(url,''), COALESCE(service_type,''), COALESCE(service_name,''),
        COALESCE(favicon_mmh3,''), status_code, content_length,
        COALESCE(page_title,''), array_to_json(technologies)::text, array_to_json(auth)::text,
-       COALESCE(method,''), array_to_json(params)::text, extra, last_seen::text
+       COALESCE(method,''), array_to_json(params)::text, extra, COALESCE(created_at::text,''), last_seen::text
 FROM assets WHERE company_id = $1`
 	args := []any{companyID}
 	if typ != "" {
@@ -1195,7 +1196,7 @@ func (s *AssetStore) QueryByTask(taskID int64, typ string, limit, offset int) ([
        COALESCE(url,''), COALESCE(service_type,''), COALESCE(service_name,''),
        COALESCE(favicon_mmh3,''), status_code, content_length,
        COALESCE(page_title,''), array_to_json(technologies)::text, array_to_json(auth)::text,
-       COALESCE(method,''), array_to_json(params)::text, extra, last_seen::text
+       COALESCE(method,''), array_to_json(params)::text, extra, COALESCE(created_at::text,''), last_seen::text
 FROM assets WHERE $1 = ANY(task_ids)`
 	args := []any{taskID}
 	if typ != "" {
@@ -1393,7 +1394,7 @@ const assetSelectCols = `SELECT id, type, company_id, array_to_json(task_ids)::t
        COALESCE(url,''), COALESCE(service_type,''), COALESCE(service_name,''),
        COALESCE(favicon_mmh3,''), status_code, content_length,
        COALESCE(page_title,''), array_to_json(technologies)::text, array_to_json(auth)::text,
-       COALESCE(method,''), array_to_json(params)::text, extra, last_seen::text
+       COALESCE(method,''), array_to_json(params)::text, extra, COALESCE(created_at::text,''), last_seen::text
 FROM assets`
 
 // GetByIDs returns assets with the given ids (order preserved by id array order).
@@ -1516,7 +1517,7 @@ func scanAssets(rows *sql.Rows) ([]*Asset, error) {
 			&a.URL, &a.ServiceType, &a.ServiceName,
 			&a.FaviconMMH3, &statusCode, &contentLength,
 			&a.PageTitle, &techsRaw, &authRaw,
-			&a.Method, &paramsRaw, &extraRaw, &a.LastSeen,
+			&a.Method, &paramsRaw, &extraRaw, &a.CreatedAt, &a.LastSeen,
 		); err != nil {
 			return nil, err
 		}
@@ -1564,4 +1565,125 @@ func scanAssets(rows *sql.Rows) ([]*Asset, error) {
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+// AssetListFilter 是资产列表的组合筛选条件。零值字段 = 不限。
+type AssetListFilter struct {
+	CompanyID     int64  // company_id 精确归属(0=不限)
+	TaskID        int64  // task_ids 命中(0=不限)
+	Type          string // 资产类型(空=不限)
+	NewerThanDays int    // 只看最近 N 天新发现(created_at,>0 生效)
+	Limit, Offset int
+}
+
+// QueryAssets 按 company_id/task_id/type/newer_than_days 组合筛选资产,
+// 返回当前页数据与**过滤后**的 total(分页铁律:total 在 WHERE 过滤之后算),
+// 按首次发现时间倒序。供资产页「新发现」筛选与监控 feed 走同一入口。
+func (s *AssetStore) QueryAssets(f AssetListFilter) ([]*Asset, int, error) {
+	where := []string{"1=1"}
+	args := []any{}
+	add := func(cond string, v any) {
+		where = append(where, fmt.Sprintf(cond, len(args)+1))
+		args = append(args, v)
+	}
+	if f.CompanyID > 0 {
+		add("company_id = $%d", f.CompanyID)
+	}
+	if f.TaskID > 0 {
+		add("$%d = ANY(task_ids)", f.TaskID)
+	}
+	if f.Type != "" {
+		add("type = $%d", f.Type)
+	}
+	if f.NewerThanDays > 0 {
+		// 天数用参数传(以字符串喂给 ::text——pgx 无法把 Go int 编进 text 参数),
+		// 不拼接数字进 SQL。
+		add("created_at >= now() - ($%d::text || ' days')::interval", fmt.Sprintf("%d", f.NewerThanDays))
+	}
+	kw := strings.Join(where, " AND ")
+
+	var total int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM assets WHERE `+kw, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	if f.Limit <= 0 {
+		f.Limit = 50
+	}
+	if f.Offset < 0 {
+		f.Offset = 0
+	}
+	q := assetSelectCols + ` WHERE ` + kw +
+		fmt.Sprintf(` ORDER BY created_at DESC, id DESC LIMIT $%d OFFSET $%d`, len(args)+1, len(args)+2)
+	args = append(args, f.Limit, f.Offset)
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	page, err := scanAssets(rows)
+	if err != nil {
+		return nil, 0, err
+	}
+	return page, total, nil
+}
+
+// ExistingValues 批量查询某类资产中已存在的值集合(返回值 → 是否存在)。
+// 监控轮用它做「新发现」判定:轮内只读快照,差集即 new。类型 → 存储(行类型,列)
+// 映射:domain → (subdomain, domain 列)、root_domain → (root_domain, domain 列)、
+// ip → (ip, ip 列)、service → (service, url 列);其它类型不支持。
+// 注意:比对按列原值精确匹配,调用方须先按入库归一化规则(域名小写、URL 规范化)
+// 处理入参。values 按 500 一批做 IN 查询;空入参直接返回空集合。
+func (s *AssetStore) ExistingValues(typ string, values []string) (map[string]bool, error) {
+	out := map[string]bool{}
+	if len(values) == 0 {
+		return out, nil
+	}
+	var col, rowType string
+	switch typ {
+	case "domain":
+		rowType, col = "subdomain", "domain"
+	case "root_domain":
+		rowType, col = "root_domain", "domain"
+	case "ip":
+		rowType, col = "ip", "ip"
+	case "service":
+		rowType, col = "service", "url"
+	default:
+		return nil, fmt.Errorf("ExistingValues: 不支持的资产类型 %q", typ)
+	}
+	const batchSize = 500
+	for start := 0; start < len(values); start += batchSize {
+		end := start + batchSize
+		if end > len(values) {
+			end = len(values)
+		}
+		batch := values[start:end]
+		args := make([]any, 0, len(batch)+1)
+		args = append(args, rowType)
+		placeholders := make([]string, len(batch))
+		for i, v := range batch {
+			args = append(args, v)
+			placeholders[i] = fmt.Sprintf("$%d", i+2)
+		}
+		rows, err := s.db.Query(`SELECT `+col+` FROM assets
+WHERE type = $1 AND `+col+` IN (`+strings.Join(placeholders, ",")+")", args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var v string
+			if err := rows.Scan(&v); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			out[v] = true
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+	return out, nil
 }

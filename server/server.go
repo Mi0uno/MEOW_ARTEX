@@ -51,6 +51,9 @@ type Server struct {
 	templateMu sync.Mutex
 	// vulnSync 是 CVE 定时采集器(定时从公开漏洞源拉取情报 + 自动发现 PoC)。
 	vulnSync *vulnSync
+	// reconMonitor 是资产监控调度器(有域名范围的企业按间隔持续被动子域测绘 +
+	// 新子域探活,直写资产图;实现在 recon_monitor.go)。
+	reconMonitor *reconMonitor
 	// apiSecret 外部接口凭据的 AES-GCM 加解密盒(密钥在 dataDir 下)。
 	apiSecret *apiSecretBox
 
@@ -168,6 +171,10 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	// Exploit-DB/GitHub PoC),默认 6 小时一轮,可在漏洞库页开关与调整。
 	s.vulnSync = newVulnSync(s)
 	go s.vulnSync.run(s.ctx)
+	// 资产监控调度器:全局开关(缺省关)打开后,对有域名范围的企业按间隔持续
+	// 被动测绘 + 新子域探活,产出直写资产图(轮次轨迹在 recon_monitor_runs)。
+	s.reconMonitor = newReconMonitor(s)
+	go s.reconMonitor.run(s.ctx)
 	// VULNDB_V2(A): NVD 历史回填 worker——光标未完成时 30 秒后自动续跑(实现在 vulndb_backfill.go)。
 	go s.vulnBackfillWorker(s.ctx)
 	// 代理中心:本地代理池监听器 + 源站拉取 + 自动测活。恢复上次的出网模式,
@@ -809,6 +816,8 @@ func (s *Server) Handler() http.Handler {
 	// ---- 三阶段平台:信息搜集(stage=recon)执行面 ----
 	mux.HandleFunc("GET /api/recon/collectors", s.reconCollectorMeta)
 	mux.HandleFunc("POST /api/recon/plan", s.reconPlanHandler)
+	// ---- 资产监控(定时子域测绘,实现在 recon_monitor.go / recon_monitor_api.go) ----
+	s.registerReconMonitorRoutes(mux)
 	// ---- 漏洞库 ----
 	mux.HandleFunc("GET /api/vulndb/entries", s.listVulnEntries)
 	mux.HandleFunc("POST /api/vulndb/entries", s.createVulnEntry)
