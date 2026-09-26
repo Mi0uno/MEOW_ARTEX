@@ -186,7 +186,11 @@ export default function CVEPage() {
     interval_hours: number;
     counts: Record<string, number>;
     latest: VulnSyncRun[];
+    cnvd_url: string;
   } | null>(null);
+  // CNVD 数据端点输入框状态(与已保存值分离,点保存才提交)。
+  const [cnvdUrlInput, setCnvdUrlInput] = React.useState("");
+  const [cnvdUrlSaving, setCnvdUrlSaving] = React.useState(false);
   const [runs, setRuns] = React.useState<VulnSyncRun[]>([]);
   const [runsTotal, setRunsTotal] = React.useState(0);
   const [runStatusCounts, setRunStatusCounts] = React.useState<Record<string, number>>({});
@@ -244,11 +248,30 @@ export default function CVEPage() {
   const loadMeta = React.useCallback(() => {
     api
       .vulnSyncStatus()
-      .then((r) =>
-        setSyncMeta({ enabled: r.enabled, interval_hours: r.interval_hours, counts: r.counts, latest: r.latest }),
-      )
+      .then((r) => {
+        setSyncMeta({
+          enabled: r.enabled,
+          interval_hours: r.interval_hours,
+          counts: r.counts,
+          latest: r.latest,
+          cnvd_url: r.cnvd_url,
+        });
+        setCnvdUrlInput((prev) => (prev === "" ? r.cnvd_url : prev));
+      })
       .catch(() => undefined);
   }, []);
+
+  const saveCnvdUrl = () => {
+    setCnvdUrlSaving(true);
+    api
+      .setVulnSyncConfig({ cnvd_url: cnvdUrlInput.trim() })
+      .then(() => {
+        toast.success(cnvdUrlInput.trim() ? "已保存 CNVD 数据端点,下轮采集生效" : "已停用 CNVD 数据端点");
+        loadMeta();
+      })
+      .catch((e) => toast.error(`保存失败:${(e as Error).message}`))
+      .finally(() => setCnvdUrlSaving(false));
+  };
 
   const loadRuns = React.useCallback(
     (group: string, status: string, qApplied: string, p: number, size: number) => {
@@ -529,6 +552,20 @@ export default function CVEPage() {
       {/* ===== 情报源页签 ===== */}
       {tab === "sources" && (
         <div className="space-y-3">
+          {/* CNVD 数据端点配置:指向采集代理(tools/cnvd_fetch.py)或官方会员 API 的 JSON 地址。 */}
+          <div className="flex flex-wrap items-center gap-2 rounded-lg border px-4 py-2.5">
+            <span className="text-sm font-medium">CNVD 数据端点</span>
+            <Input
+              value={cnvdUrlInput}
+              onChange={(e) => setCnvdUrlInput(e.target.value)}
+              placeholder="http://127.0.0.1:8930/cnvd.json(采集代理 tools/cnvd_fetch.py;留空=未启用)"
+              className="h-8 min-w-0 flex-1 basis-64 text-xs"
+            />
+            <Button variant="outline" size="sm" disabled={cnvdUrlSaving} onClick={() => void saveCnvdUrl()}>
+              保存
+            </Button>
+          </div>
+
           {/* 回填状态一行(启动/取消按钮在顶部工具栏):运行中显示推进窗口,空闲时给入口提示。 */}
           {backfill && (backfill.running || backfill.done || backfill.start_year > 0 || backfill.error) && (
             <div className="flex flex-wrap items-center gap-2 rounded-lg border px-4 py-2.5 text-sm">

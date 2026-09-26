@@ -1120,6 +1120,7 @@ export const api = {
       total_entries: number;
       enabled: boolean;
       interval_hours: number;
+      cnvd_url?: string;
     }>(`/vulndb/sync?${p.toString()}`).then((r) => ({
       runs: arr(r.runs),
       total: r.total ?? 0,
@@ -1129,10 +1130,11 @@ export const api = {
       total_entries: r.total_entries ?? 0,
       enabled: r.enabled,
       interval_hours: r.interval_hours,
+      cnvd_url: r.cnvd_url ?? "",
     }));
   },
   triggerVulnSync: () => post<{ status: string }>("/vulndb/sync", {}),
-  setVulnSyncConfig: (input: { enabled?: boolean; interval_hours?: number }) =>
+  setVulnSyncConfig: (input: { enabled?: boolean; interval_hours?: number; cnvd_url?: string }) =>
     put<{ ok: boolean }>("/vulndb/sync/config", input),
   // NVD 历史回填:启动/进度/取消(断点续跑,进度存 settings)。
   vulnBackfillStatus: () =>

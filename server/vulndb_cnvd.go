@@ -15,15 +15,49 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Autumn-27/artex/db"
 )
 
 // settingVulnCNVDFeedURL CNVD 数据端点地址(系统设置;空 = 未启用)。
 const settingVulnCNVDFeedURL = "vulndb_cnvd_url"
+
+// cnvdFeedFetch 拉取数据端点。与通用 fetchJSON 的差异:**不做 SSRF 公网校验**——
+// 本端点是管理员在设置里显式配置的可信地址,典型部署形态恰恰是本机/内网的采集
+// 代理(tools/cnvd_fetch.py),必须允许环回与内网地址;其余约束(超时、响应体
+// 上限、429/状态码检查)与通用实现同等强度。仅限此处,勿扩散。
+func cnvdFeedFetch(ctx context.Context, rawURL string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", "ARTEX-VulnDB/1.0")
+	req.Header.Set("Accept", "application/json")
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return fmt.Errorf("上游限流(429)")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("上游返回 HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(body, out)
+}
 
 // cnvdFeedEntry 是数据端点 JSON 数组的一个元素。字段全部宽容解析:
 // severity 支持中文(高/中/低)与英文,cnvd/title 必填,其余可选。
@@ -61,7 +95,7 @@ func (v *vulnSync) syncCNVDFeed(ctx context.Context) (created int, err error) {
 	}()
 
 	var entries []cnvdFeedEntry
-	if err = fetchJSON(ctx, feedURL, nil, &entries); err != nil {
+	if err = cnvdFeedFetch(ctx, feedURL, &entries); err != nil {
 		return 0, fmt.Errorf("拉取 CNVD 数据端点失败: %w", err)
 	}
 	log.Printf("[vulndb-sync] CNVD 数据端点返回 %d 条", len(entries))

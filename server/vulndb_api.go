@@ -309,10 +309,12 @@ func (s *Server) vulnDBSyncStatus(w http.ResponseWriter, r *http.Request) {
 			intervalH = n
 		}
 	}
+	cnvdURL, _, _ := s.m.PG().GetSetting(settingVulnCNVDFeedURL)
 	writeJSON(w, 200, map[string]any{
 		"runs": runs, "total": total, "status_counts": statusCounts, "latest": latest,
 		"counts": counts, "total_entries": totalEntries,
 		"enabled": enabled, "interval_hours": intervalH,
+		"cnvd_url": cnvdURL,
 	})
 }
 
@@ -329,11 +331,12 @@ func (s *Server) triggerVulnDBSync(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 202, map[string]any{"status": "started"})
 }
 
-// setVulnDBSyncConfig PUT /api/vulndb/sync/config — 开关与间隔。
+// setVulnDBSyncConfig PUT /api/vulndb/sync/config — 开关、间隔与 CNVD 数据端点。
 func (s *Server) setVulnDBSyncConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Enabled       *bool `json:"enabled"`
-		IntervalHours *int  `json:"interval_hours"`
+		Enabled       *bool   `json:"enabled"`
+		IntervalHours *int    `json:"interval_hours"`
+		CNVDURL       *string `json:"cnvd_url"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
 		writeErr(w, 400, "invalid JSON: "+err.Error())
@@ -351,6 +354,13 @@ func (s *Server) setVulnDBSyncConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.IntervalHours != nil && *req.IntervalHours > 0 {
 		if err := s.m.PG().SetSetting(settingVulnDBSyncInterval, strconv.Itoa(*req.IntervalHours)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.CNVDURL != nil {
+		// 允许置空 = 停用 CNVD 数据端点。
+		if err := s.m.PG().SetSetting(settingVulnCNVDFeedURL, strings.TrimSpace(*req.CNVDURL)); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
