@@ -76,6 +76,9 @@ type Task struct {
 	// GuardRuleIDs 非空=本任务只用这些规则;空=用全部已启用规则(注意:空不等于"不启用")。
 	GuardMode    string  `json:"guard_mode"`
 	GuardRuleIDs []int64 `json:"guard_rule_ids"`
+	// 奖励标准文本:创建任务时由 AI 识别拆分(SRC 模式)或人工填写,创建后只读;
+	// 空串=无。列是 ALTER 追加的,SELECT/Scan 一律放行尾(与列的物理顺序一致)。
+	RewardNote string `json:"reward_note"`
 }
 
 // 任务级出网模式取值(与 settings 的全局模式同一套语义,外加 ”=跟随全局)。
@@ -295,6 +298,8 @@ type TaskCreateOptions struct {
 	// 挑空闲在线机。指派失败不阻断建任务(任务照常按本机模式跑,只记 warning)。
 	VPSMachineID int64
 	VPSAuto      bool
+	// 奖励标准文本(SRC 任务的奖励依据):随任务行原子落库,创建后只读;空串=无。
+	RewardNote string
 }
 
 // CreateTaskWithOptions creates an exploration, task, direct source relations,
@@ -402,6 +407,7 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 		SRCPlatformID: opts.SRCPlatformID, SRCTargetID: opts.SRCTargetID,
 		ProxyMode: opts.ProxyMode, ProxyGroupID: opts.ProxyGroupID,
 		GuardMode: opts.GuardMode, GuardRuleIDs: append([]int64(nil), opts.GuardRuleIDs...),
+		RewardNote: opts.RewardNote,
 	}
 	// 可空外键的 0 值必须写成 NULL 而不是 0:这些列上有外键约束,写 0 会因
 	// 「引用的行不存在」直接报错,而「未关联」在语义上也确实是 NULL。
@@ -410,9 +416,9 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 	srcTargetID := nullableID(opts.SRCTargetID)
 	proxyGroupID := nullableID(opts.ProxyGroupID)
 	if err := tx.QueryRow(`
-INSERT INTO tasks(name, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled, stage, kind, pipeline, step_key, step_config, src_mode, src_profile_id, src_platform_id, src_target_id, proxy_mode, proxy_group_id, guard_mode, guard_rule_ids)
-VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
-RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled, opts.Stage, opts.Kind, opts.Pipeline, opts.StepKey, opts.StepConfig, opts.SRCMode, srcProfileID, srcPlatformID, srcTargetID, opts.ProxyMode, proxyGroupID, opts.GuardMode, guardRuleIDs).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
+INSERT INTO tasks(name, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled, stage, kind, pipeline, step_key, step_config, src_mode, src_profile_id, src_platform_id, src_target_id, proxy_mode, proxy_group_id, guard_mode, guard_rule_ids, reward_note)
+VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
+RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled, opts.Stage, opts.Kind, opts.Pipeline, opts.StepKey, opts.StepConfig, opts.SRCMode, srcProfileID, srcPlatformID, srcTargetID, opts.ProxyMode, proxyGroupID, opts.GuardMode, guardRuleIDs, opts.RewardNote).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
 		return nil, err
 	}
 	if err := insertTaskRelations(tx, t.ID, opts.SourceTaskIDs); err != nil {
@@ -525,7 +531,7 @@ func insertTaskLLMProfiles(tx *sql.Tx, taskID int64, profileIDs []int64) error {
 
 const taskCols = `id, COALESCE(name,''), category_id,
 COALESCE((SELECT category.name FROM task_categories category WHERE category.id=tasks.category_id),''),
-description, goal, exploration_id, status, paused, queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), first_run_at, deadline_at, COALESCE(stage,'exploit'), COALESCE(kind,'agent'), pipeline, COALESCE(step_key,''), step_config, COALESCE(src_mode,false), COALESCE(src_profile_id,0), COALESCE(src_platform_id,0), COALESCE(src_target_id,0), COALESCE(proxy_mode,''), COALESCE(proxy_group_id,0), COALESCE(guard_mode,''), guard_rule_ids`
+description, goal, exploration_id, status, paused, queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), first_run_at, deadline_at, COALESCE(stage,'exploit'), COALESCE(kind,'agent'), pipeline, COALESCE(step_key,''), step_config, COALESCE(src_mode,false), COALESCE(src_profile_id,0), COALESCE(src_platform_id,0), COALESCE(src_target_id,0), COALESCE(proxy_mode,''), COALESCE(proxy_group_id,0), COALESCE(guard_mode,''), guard_rule_ids, COALESCE(reward_note,'')`
 
 func scanTask(sc interface{ Scan(...any) error }) (*Task, error) {
 	var t Task
@@ -534,7 +540,7 @@ func scanTask(sc interface{ Scan(...any) error }) (*Task, error) {
 	// guard_rule_ids 是 JSONB(NOT NULL DEFAULT '[]'):同样走 []byte 中转再解成 []int64,
 	// 老库刚迁移完/手工写坏时的空值与非法值都退回 nil(=不限定规则,用全部已启用规则)。
 	var guardRuleIDs []byte
-	if err := sc.Scan(&t.ID, &t.Name, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.FirstRunAt, &t.DeadlineAt, &t.Stage, &t.Kind, &pipeline, &t.StepKey, &stepConfig, &t.SRCMode, &t.SRCProfileID, &t.SRCPlatformID, &t.SRCTargetID, &t.ProxyMode, &t.ProxyGroupID, &t.GuardMode, &guardRuleIDs); err != nil {
+	if err := sc.Scan(&t.ID, &t.Name, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.FirstRunAt, &t.DeadlineAt, &t.Stage, &t.Kind, &pipeline, &t.StepKey, &stepConfig, &t.SRCMode, &t.SRCProfileID, &t.SRCPlatformID, &t.SRCTargetID, &t.ProxyMode, &t.ProxyGroupID, &t.GuardMode, &guardRuleIDs, &t.RewardNote); err != nil {
 		return nil, err
 	}
 	if len(pipeline) > 0 {

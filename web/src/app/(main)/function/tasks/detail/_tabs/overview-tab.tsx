@@ -12,6 +12,7 @@ import {
   ChevronDownIcon,
   ClockIcon,
   CoinsIcon,
+  GiftIcon,
   GlobeIcon,
   ListChecksIcon,
   PencilIcon,
@@ -541,6 +542,19 @@ export function OverviewTab({ taskId }: { taskId: string }) {
           </div>
         </CardContent>
       </Card>
+      {/* 奖励标准:创建时 AI 识别拆分或人工填写、随任务保存的文本;没有内容整块不渲染(不占位)。 */}
+      {task?.reward_note?.trim() ? (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <GiftIcon className="size-4 text-primary" /> 奖励标准
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <p className="text-sm whitespace-pre-wrap break-words">{task.reward_note}</p>
+          </CardContent>
+        </Card>
+      ) : null}
       {/* 监管门限:任务级覆盖全局监管姿态。放在描述/目标之后、目标管理之前,
           让它在"这个任务是什么"与"这个任务要做什么"之间保持显眼——它是安全闸门,
           被折叠或下移到页尾就等于用户不知道自己的任务是不是在无人看守地跑。 */}

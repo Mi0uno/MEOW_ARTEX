@@ -57,8 +57,17 @@ import { type ProxyEgressMode, ProxyEgressSelect } from "@/components/proxy-egre
 import { CreateSRCTaskDialog } from "@/components/src-create-task-dialog";
 import { StatusBadge } from "@/components/status-badge";
 import { TablePagination } from "@/components/table-pagination";
+import { TaskConstraintsEditor } from "@/components/task-constraints-editor";
+import { TaskIntakeAI } from "@/components/task-intake-ai";
 import { TaskLLMProfileChain } from "@/components/task-llm-profile-chain";
 import { TaskTemplateControls } from "@/components/task-template-controls";
+import {
+  VpsExecSelect,
+  vpsAutoForSubmit,
+  vpsMachineIdForSubmit,
+  VPS_MACHINE_PICK,
+  type VpsExecMode,
+} from "@/components/vps-exec-select";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
   AlertDialog,
@@ -143,9 +152,10 @@ import type {
   TaskArchive,
   TaskArchiveState,
   TaskCategory,
+  TaskConstraintInput,
+  TaskInputParse,
   TaskStage,
   TaskStatus,
-  VpsMachine,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -3398,19 +3408,14 @@ function CreateTaskSheet({
   const [guardMode, setGuardMode] = React.useState("");
 
   // 执行环境(高级设置):"local"=平台本机(默认) / "machine"=指定机器 / "auto"=自动分配。
-  // 指定机器的下拉只列「在线且空闲」的机器(online 且未被任务占用),打开抽屉时按需拉取。
-  const [vpsMode, setVpsMode] = React.useState<"local" | "machine" | "auto">("local");
-  const [vpsMachineID, setVpsMachineID] = React.useState("__pick__");
-  const [vpsMachines, setVpsMachines] = React.useState<VpsMachine[]>([]);
+  // 在线空闲机器的拉取与哨兵处理都在共享 VpsExecSelect 内部(与 SRC 对话框/批量页共用)。
+  const [vpsMode, setVpsMode] = React.useState<VpsExecMode>("local");
+  const [vpsMachineID, setVpsMachineID] = React.useState(VPS_MACHINE_PICK);
 
-  // 选了「指定机器」才拉候选;接口 404/500(VPS 服务未就绪)静默降级为空下拉。
-  React.useEffect(() => {
-    if (!open || vpsMode !== "machine") return;
-    api
-      .vpsMachines({ status: "online", limit: 200 })
-      .then((r) => setVpsMachines((r.machines ?? []).filter((m) => m.assigned_task_id === 0)))
-      .catch(() => setVpsMachines([]));
-  }, [open, vpsMode]);
+  // 操作约束(可选):手填或「AI 识别拆分」落进来,随创建请求写入 task_constraints。
+  const [constraints, setConstraints] = React.useState<TaskConstraintInput[]>([]);
+  // AI 识别出目标但目标框已有不同内容时不覆盖,先挂个「采用」按钮,点击才覆盖(契约规则 2)。
+  const [aiGoalSuggestion, setAiGoalSuggestion] = React.useState("");
 
   // load LLM profiles once for the create-task profile picker.
   React.useEffect(() => {
@@ -3452,6 +3457,18 @@ function CreateTaskSheet({
     }
   }
 
+  // 「AI 识别拆分」的落表单规则(契约 §2,与 SRC 对话框共用同一套语义):
+  // 1) 整理后的描述非空 → 替换描述;2) 目标框为空 → 直填,已有内容且不同 → 不覆盖,
+  // 挂「采用 AI 识别的目标」按钮;3) 约束非空 → 整体替换约束编辑器。
+  function applyParse(r: TaskInputParse) {
+    if (r.description.trim()) setDescription(r.description);
+    if (r.goal.trim()) {
+      if (!goal.trim()) setGoal(r.goal);
+      else if (r.goal !== goal) setAiGoalSuggestion(r.goal);
+    }
+    if (r.constraints.length > 0) setConstraints(r.constraints);
+  }
+
   async function createTask() {
     if (!description.trim() || !goal.trim()) {
       toast.error("请填写描述与目标");
@@ -3484,12 +3501,15 @@ function CreateTaskSheet({
         // 监管门限:默认跟随全局;guard_rule_ids 留空 = 用全部已启用规则。
         guardMode,
         guardRuleIds: [],
+        // 操作约束:空文本行不提交;单条 trim 与后端「text 非空」校验对齐。
+        constraints: constraints
+          .filter((c) => c.text.trim().length > 0)
+          .map((c) => ({ kind: c.kind, text: c.text.trim() })),
         // 执行环境(创建即指派):vps 字段随创建请求一起提交,指派发生在任务启动之前,
         // 消除「先建任务再补指派」的竞态。指派失败后端不阻断建任务(任务照常本机跑,
         // 可在任务详情「执行环境」tab 重新指派)。
-        vpsMachineId:
-          vpsMode === "machine" && vpsMachineID !== "__pick__" ? Number(vpsMachineID) : undefined,
-        vpsAuto: vpsMode === "auto",
+        vpsMachineId: vpsMachineIdForSubmit({ mode: vpsMode, machineId: vpsMachineID }),
+        vpsAuto: vpsAutoForSubmit({ mode: vpsMode, machineId: vpsMachineID }),
       });
       toast.success("任务已创建");
       setName("");
@@ -3507,8 +3527,10 @@ function CreateTaskSheet({
       setProxyMode("");
       setProxyGroupID(0);
       setGuardMode("");
+      setConstraints([]);
+      setAiGoalSuggestion("");
       setVpsMode("local");
-      setVpsMachineID("__pick__");
+      setVpsMachineID(VPS_MACHINE_PICK);
       setUploadCount(0);
       draftIdRef.current = "";
       setOpen(false);
@@ -3574,7 +3596,18 @@ function CreateTaskSheet({
               <FieldDescription>可选，单个分类；用于任务列表筛选和归档，不影响 Agent 执行。</FieldDescription>
             </Field>
             <div className="grid gap-2">
-              <Label htmlFor="description">描述</Label>
+              {/* 描述 label 行放 AI 识别拆分区块:自动触发(失焦+内容判重)与手动按钮都在里面。 */}
+              <div className="flex items-start justify-between gap-2">
+                <Label htmlFor="description" className="pt-1.5">
+                  描述
+                </Label>
+                <TaskIntakeAI
+                  description={description}
+                  goal={goal}
+                  onApply={applyParse}
+                  disabled={creating}
+                />
+              </div>
               <Textarea
                 id="description"
                 className="min-h-32"
@@ -3610,6 +3643,21 @@ function CreateTaskSheet({
             </div>
             <div className="grid gap-2">
               <Label htmlFor="goal">目标</Label>
+              {/* AI 拆出了目标但目标框已有不同内容时不自动覆盖(契约规则 2),点了才覆盖。 */}
+              {aiGoalSuggestion.trim() && aiGoalSuggestion !== goal ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="w-fit"
+                  onClick={() => {
+                    setGoal(aiGoalSuggestion);
+                    setAiGoalSuggestion("");
+                  }}
+                >
+                  采用 AI 识别的目标
+                </Button>
+              ) : null}
               <Textarea
                 id="goal"
                 className="min-h-32"
@@ -3618,6 +3666,8 @@ function CreateTaskSheet({
                 onChange={(e) => setGoal(e.target.value)}
               />
             </div>
+            {/* 操作约束:目标下方,可手填也可由 AI 识别拆分整体替换(可再手改)。 */}
+            <TaskConstraintsEditor value={constraints} onChange={setConstraints} disabled={creating} />
             <Field>
               <FieldLabel htmlFor="source-tasks">关联任务</FieldLabel>
               <SourceTaskPicker
@@ -3734,57 +3784,16 @@ function CreateTaskSheet({
                   }}
                 />
                 {/* 执行环境:任务的 Bash 命令在哪跑。默认平台本机;可指定一台在线空闲机器
-                    或让平台自动分配。指派发生在任务创建成功之后(契约 §6),失败不阻断建任务。 */}
-                <div className="grid gap-2">
-                  <Label htmlFor="vps-mode">执行环境</Label>
-                  <Select
-                    value={vpsMode}
-                    onValueChange={(v) => {
-                      setVpsMode(v === "machine" ? "machine" : v === "auto" ? "auto" : "local");
-                      if (v !== "machine") setVpsMachineID("__pick__");
-                    }}
-                  >
-                    <SelectTrigger id="vps-mode" className="w-full">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectGroup>
-                        <SelectItem value="local">平台本机（默认）</SelectItem>
-                        <SelectItem value="machine">指定机器</SelectItem>
-                        <SelectItem value="auto">自动分配</SelectItem>
-                      </SelectGroup>
-                    </SelectContent>
-                  </Select>
-                  {vpsMode === "machine" ? (
-                    <Select value={vpsMachineID} onValueChange={setVpsMachineID}>
-                      <SelectTrigger className="w-full">
-                        <SelectValue placeholder={vpsMachines.length === 0 ? "暂无在线空闲机器" : "选择执行机器"} />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectGroup>
-                          <SelectItem value="__pick__" disabled>
-                            请选择机器…
-                          </SelectItem>
-                          {vpsMachines.map((m) => (
-                            <SelectItem key={m.id} value={String(m.id)}>
-                              {m.name} · {m.host}
-                            </SelectItem>
-                          ))}
-                        </SelectGroup>
-                      </SelectContent>
-                    </Select>
-                  ) : null}
-                  {vpsMode === "machine" && vpsMachines.length === 0 ? (
-                    <p className="text-amber-600 text-xs dark:text-amber-400">
-                      没有可指派的机器。请先到「VPS 中心 → 机器池」录入并测活通过(状态=在线空闲)。
-                    </p>
-                  ) : null}
-                  <p className="text-muted-foreground text-xs">
-                    「指定机器 / 自动分配」只影响 Bash 命令的执行位置:命令将在该 Linux 机器的独立 shell
-                    里跑、工作目录固定为远程任务工作区;Read/Write
-                    等文件工具仍操作平台本地工作区。创建成功后才会实际指派, 失败时任务照常在本机执行。
-                  </p>
-                </div>
+                    或让平台自动分配。指派发生在任务创建成功之后(契约 §6),失败不阻断建任务。
+                    与 SRC 对话框 / 批量建任务共用同一组件,机器下拉与说明文案保持一致。 */}
+                <VpsExecSelect
+                  mode={vpsMode}
+                  machineId={vpsMachineID}
+                  onChange={(v) => {
+                    setVpsMode(v.mode);
+                    setVpsMachineID(v.machineId);
+                  }}
+                />
                 {/* 监管门限:AI 监管是否管这个任务。默认跟随全局,可单独覆盖。 */}
                 <div className="grid gap-2">
                   <Label htmlFor="guard-mode">监管门限</Label>

@@ -75,6 +75,9 @@ export function SpecTab({
   const [expanded, setExpanded] = React.useState<Set<number>>(new Set());
   // AI 识别中按钮 spinner+禁用;期间不做取消(后端无对应端点),只能等——文案里写明。
   const [aiBusy, setAiBusy] = React.useState(false);
+  // aiBusy 的 ref 镜像:上传完成回调要判断「此刻是否已有识别在途」,而 state 在
+  // await 之后读到的是发起上传那一帧的旧值,ref 才是实时真相。
+  const aiBusyRef = React.useRef(false);
   // aiNote 是 LLM 返回的识别依据说明(用了哪些附件/置信提示),展示给用户参考。
   const [aiNote, setAiNote] = React.useState("");
   // 勾选的附件 id:空集 = 用全部附件(契约缺省语义),非空 = 只识别勾选的。
@@ -99,14 +102,31 @@ export function SpecTab({
   }, [loadFiles]);
 
   // upload 是唯一的上传入口:类别固定 'other',先收文件再归类。
+  // 上传解析成功后自动对该文件触发一次 AI 识别——旧流程要用户再手动点
+  // 「AI 识别并填入」,多数人会漏掉这一步,规范其实没生效。
   const upload = async (file: File) => {
     setUploading(true);
     try {
       const r = await api.uploadSRCPlatformFile(platformId, file, "other");
       // 解析结果决定这份规范是否真的注入 AI,必须在提示里说清楚而不是只报「上传成功」。
-      const meta = parseStatusMeta(r.file?.parse_status ?? "");
-      toast.success(`「${file.name}」已上传：${meta.label}`);
+      const f = r.file;
+      const meta = parseStatusMeta(f?.parse_status ?? "");
       loadFiles();
+      // 解析失败或没解析出正文:自动识别也无从识别,保持原提示即可,不触发。
+      if (!f || f.parse_status === "failed" || !f.content_text.trim()) {
+        toast.success(`「${file.name}」已上传：${meta.label}`);
+        return;
+      }
+      // 已有识别在途:不并发叠请求(共用一个 aiBusy,叠加只会互相覆盖结果),
+      // 提示用户稍后手动补一次;新文件已入列表,勾选或全量识别都能覆盖到它。
+      if (aiBusyRef.current) {
+        toast.success(`「${file.name}」已上传：${meta.label}`);
+        toast.info("已有识别在进行，可稍后手动点「AI 识别并填入」");
+        return;
+      }
+      toast.success(`「${file.name}」已上传，正在自动识别…（${meta.label}）`);
+      // 只识别这一份新文件,不动用户的勾选集;识别中/结果提示与手动路径共用。
+      void aiFill([f.id]);
     } catch (e) {
       toast.error(`上传失败:${(e as Error).message}`);
     } finally {
@@ -167,10 +187,13 @@ export function SpecTab({
   // 不走 api.aiFillPlatformSpec:它经 http() 的 60s 默认超时,而 LLM 识别常要 1-2 分钟。
   // 直接用 http 并传 180s AbortSignal(http 见到调用方 signal 就不再叠加默认超时),
   // 与 batch 页直连 POST /tasks 是同一种「标准封装不适合长请求」的处理。
-  const aiFill = async () => {
+  // overrideIds 可选:上传成功后的自动触发传「新文件 id」绕过勾选集;
+  // 手动按钮不传,保持「缺省=全部 / 勾选=只识别勾选」的既有语义。
+  const aiFill = async (overrideIds?: number[]) => {
     // 勾选集与当前列表求交:勾选可能残留已删除文件的 id,交一下最稳。
-    const picked = files.filter((f) => pickedIds.has(f.id)).map((f) => f.id);
+    const picked = overrideIds ?? files.filter((f) => pickedIds.has(f.id)).map((f) => f.id);
     setAiBusy(true);
+    aiBusyRef.current = true;
     setAiNote("");
     try {
       const r = await http<{ suggestion: SPECAIFillSuggestion }>(`/src/platforms/${platformId}/spec/ai-fill`, {
@@ -203,6 +226,7 @@ export function SpecTab({
       toast.error(`AI 识别失败:${(e as Error).message}`);
     } finally {
       setAiBusy(false);
+      aiBusyRef.current = false;
     }
   };
 

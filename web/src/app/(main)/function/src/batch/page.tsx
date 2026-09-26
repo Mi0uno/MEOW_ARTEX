@@ -22,6 +22,13 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { ProxyEgressSelect, proxyGroupIdForSubmit, type ProxyEgressValue } from "@/components/proxy-egress-select";
+import {
+  VpsExecSelect,
+  vpsAutoForSubmit,
+  vpsMachineIdForSubmit,
+  VPS_MACHINE_PICK,
+  type VpsExecValue,
+} from "@/components/vps-exec-select";
 import { api, http } from "@/lib/api";
 import type { SRCPlatform, SRCTarget, Task } from "@/lib/types";
 
@@ -47,10 +54,10 @@ function keyOf(platformId: number, targetId: number): string {
  * 字段名与其余默认值照抄 api.createTask 的实现,保证与其它建任务入口行为一致——
  * 尤其 src_mode 必须为 true,否则后端不会注入平台规范与授权范围约束。
  *
- * 出网方式由调用方传入:批量建任务同样要给「走代理池」这个选项,否则只能拿到
- * 跟随全局,SRC 场景下(公网靶标、需隐藏来源)用户就没有选择权。
+ * 出网方式与执行环境由调用方传入:批量建任务同样要给「走代理池」「指定/自动分配机器」
+ * 这些选项,否则只能拿到跟随全局/本机执行,SRC 场景下(公网靶标、需隐藏来源)用户就没有选择权。
  */
-function createSRCTask(platform: SRCPlatform, target: SRCTarget, egress: ProxyEgressValue): Promise<Task> {
+function createSRCTask(platform: SRCPlatform, target: SRCTarget, egress: ProxyEgressValue, vps: VpsExecValue): Promise<Task> {
   return http<Task>("/tasks", {
     method: "POST",
     body: JSON.stringify({
@@ -72,6 +79,9 @@ function createSRCTask(platform: SRCPlatform, target: SRCTarget, egress: ProxyEg
       src_target_id: target.id,
       proxy_mode: egress.mode,
       proxy_group_id: proxyGroupIdForSubmit(egress),
+      // 执行环境:与 api.createTask 同一归一(0/false = 不指派,任务本机跑)。
+      vps_machine_id: vpsMachineIdForSubmit(vps) ?? 0,
+      vps_auto: vpsAutoForSubmit(vps),
       guard_mode: "",
       guard_rule_ids: [],
     }),
@@ -89,6 +99,8 @@ export default function SRCBatchPage() {
   const [creating, setCreating] = React.useState(false);
   // 出网方式:批量建的每条任务都用这一套设置(逐条设不现实,一次勾几十个目标)。
   const [egress, setEgress] = React.useState<ProxyEgressValue>({ mode: "", groupId: 0 });
+  // 执行环境:同上,批量共用一套(默认本机,可指定/自动分配机器)。
+  const [vps, setVps] = React.useState<VpsExecValue>({ mode: "local", machineId: VPS_MACHINE_PICK });
 
   const load = React.useCallback(async () => {
     setLoading(true);
@@ -184,7 +196,7 @@ export default function SRCBatchPage() {
     const failed: string[] = [];
     for (const { platform, target } of pairs) {
       try {
-        const t = await createSRCTask(platform, target, egress);
+        const t = await createSRCTask(platform, target, egress, vps);
         created.push(t.id);
       } catch (e) {
         failed.push(`${platform.name} / ${target.name}(${(e as Error).message})`);
@@ -261,15 +273,16 @@ export default function SRCBatchPage() {
             </span>
           </div>
 
-          {/* 出网方式:批量建的每条任务共用这一套。放在列表之前——先定出口再挑目标,
-              用户勾选时就知道这批任务会从哪出网。 */}
-          <div className="mx-4 mb-3 max-w-md rounded-lg border p-3 lg:mx-6">
+          {/* 出网方式 + 执行环境:批量建的每条任务共用这一套。放在列表之前——先定出口
+              和执行机器再挑目标,用户勾选时就知道这批任务从哪出网、在哪台机器上跑。 */}
+          <div className="mx-4 mb-3 max-w-md space-y-4 rounded-lg border p-3 lg:mx-6">
             <ProxyEgressSelect
               mode={egress.mode}
               groupId={egress.groupId}
               onChange={setEgress}
               disabled={creating}
             />
+            <VpsExecSelect mode={vps.mode} machineId={vps.machineId} onChange={setVps} disabled={creating} />
           </div>
 
           {loading ? (

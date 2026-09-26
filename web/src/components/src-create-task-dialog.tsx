@@ -37,8 +37,17 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { ProxyEgressSelect, proxyGroupIdForSubmit, type ProxyEgressMode } from "@/components/proxy-egress-select";
+import { TaskConstraintsEditor } from "@/components/task-constraints-editor";
+import { TaskIntakeAI } from "@/components/task-intake-ai";
+import {
+  VpsExecSelect,
+  vpsAutoForSubmit,
+  vpsMachineIdForSubmit,
+  VPS_MACHINE_PICK,
+  type VpsExecMode,
+} from "@/components/vps-exec-select";
 import { api } from "@/lib/api";
-import type { SRCPlatform, SRCTarget } from "@/lib/types";
+import type { SRCPlatform, SRCTarget, TaskConstraintInput, TaskInputParse } from "@/lib/types";
 
 /** 默认任务描述/目标:让用户不必从零写,但仍可改。 */
 function defaultName(platform: SRCPlatform, target: SRCTarget): string {
@@ -81,6 +90,15 @@ export function CreateSRCTaskDialog({
   // 所以这里必须能选代理池——早先这个对话框漏了它,用户只能拿到「跟随全局」。
   const [proxyMode, setProxyMode] = React.useState<ProxyEgressMode>("");
   const [proxyGroupID, setProxyGroupID] = React.useState(0);
+  // 执行环境(任务级覆盖):命令跑在本机还是某台在线空闲机器(共享组件拉机器列表)。
+  const [vpsMode, setVpsMode] = React.useState<VpsExecMode>("local");
+  const [vpsMachineID, setVpsMachineID] = React.useState(VPS_MACHINE_PICK);
+  // 奖励标准(可选):AI 识别或手填,随创建请求存到任务上,详情总览有内容才展示。
+  const [rewardNote, setRewardNote] = React.useState("");
+  // 操作约束(可选):手填或「AI 识别拆分」落进来,随创建请求写入 task_constraints。
+  const [constraints, setConstraints] = React.useState<TaskConstraintInput[]>([]);
+  // AI 拆出了目标但目标框已有不同内容时不覆盖,先挂「采用」按钮,点击才覆盖(契约规则 2)。
+  const [aiGoalSuggestion, setAiGoalSuggestion] = React.useState("");
 
   // 锁定模式:详情页给了 platform/target,用户不需要也不能改(改了就换了授权边界)。
   const locked = !!platform && !!target;
@@ -140,6 +158,12 @@ export function CreateSRCTaskDialog({
     if (!open) return;
     setProxyMode("");
     setProxyGroupID(0);
+    // 执行环境/奖励/约束同样每次打开归零:残留会让下一个任务意外继承上一条的语义。
+    setVpsMode("local");
+    setVpsMachineID(VPS_MACHINE_PICK);
+    setRewardNote("");
+    setConstraints([]);
+    setAiGoalSuggestion("");
     if (!locked) {
       setName("");
       setGoal("");
@@ -159,6 +183,22 @@ export function CreateSRCTaskDialog({
     setGoal(defaultGoal(pickedPlatform, pickedTarget));
     setDescription(`SRC 模式任务 · ${pickedPlatform.name} · ${pickedTarget.name}`);
   }, [open, locked, pickedPlatform, pickedTarget]);
+
+  // 「AI 识别拆分」的落表单规则(契约 §2,与通用任务抽屉共用同一套语义):
+  // 1) 整理后的描述非空 → 替换描述;2) 目标框为空 → 直填,已有内容且不同 → 不覆盖,
+  // 挂「采用 AI 识别的目标」按钮;3) 约束非空 → 整体替换约束编辑器;
+  // 4) 奖励标准非空(仅 SRC 识别)→ 填入奖励 textarea。
+  // 平台/目标 id 锁定模式取 props,快速创建模式取当前下拉选中项——两种模式都要传,
+  // 服务端要按它们注入平台规范与授权范围做识别依据。
+  function applyParse(r: TaskInputParse) {
+    if (r.description.trim()) setDescription(r.description);
+    if (r.goal.trim()) {
+      if (!goal.trim()) setGoal(r.goal);
+      else if (r.goal !== goal) setAiGoalSuggestion(r.goal);
+    }
+    if (r.constraints.length > 0) setConstraints(r.constraints);
+    if (r.rewards.trim()) setRewardNote(r.rewards);
+  }
 
   const submit = async () => {
     const n = name.trim();
@@ -186,6 +226,14 @@ export function CreateSRCTaskDialog({
         // 出网方式:默认跟随全局;选「走代理池」才带组 id。
         proxyMode,
         proxyGroupId: proxyGroupIdForSubmit({ mode: proxyMode, groupId: proxyGroupID }),
+        // 执行环境:默认本机;指定机器/自动分配随创建请求一起提交(创建即指派,先于启动)。
+        vpsMachineId: vpsMachineIdForSubmit({ mode: vpsMode, machineId: vpsMachineID }),
+        vpsAuto: vpsAutoForSubmit({ mode: vpsMode, machineId: vpsMachineID }),
+        // 奖励标准与操作约束:识别/手填的文本随任务保存;空文本约束行不提交。
+        rewardNote: rewardNote.trim(),
+        constraints: constraints
+          .filter((c) => c.text.trim().length > 0)
+          .map((c) => ({ kind: c.kind, text: c.text.trim() })),
       });
       toast.success("SRC 任务已创建,平台规范与授权范围已注入");
       onOpenChange(false);
@@ -314,6 +362,21 @@ export function CreateSRCTaskDialog({
 
           <div className="space-y-1.5">
             <Label className="font-medium text-muted-foreground text-xs uppercase tracking-wide">任务目标</Label>
+            {/* AI 拆出了目标但目标框已有不同内容时不自动覆盖(契约规则 2),点了才覆盖。 */}
+            {aiGoalSuggestion.trim() && aiGoalSuggestion !== goal ? (
+              <Button
+                type="button"
+                variant="outline"
+                size="xs"
+                className="w-fit"
+                onClick={() => {
+                  setGoal(aiGoalSuggestion);
+                  setAiGoalSuggestion("");
+                }}
+              >
+                采用 AI 识别的目标
+              </Button>
+            ) : null}
             <Textarea
               value={goal}
               onChange={(e) => setGoal(e.target.value)}
@@ -323,13 +386,41 @@ export function CreateSRCTaskDialog({
           </div>
 
           <div className="space-y-1.5">
-            <Label className="font-medium text-muted-foreground text-xs uppercase tracking-wide">描述(可选)</Label>
-            <Input
+            {/* 描述换 Textarea:识别拆分要整段粘贴原文,单行 Input 装不下。
+                label 行放 AI 识别拆分区块;默认模板文本很短(<60 字),不会误触发自动识别。 */}
+            <div className="flex items-start justify-between gap-2">
+              <Label className="font-medium text-muted-foreground text-xs uppercase tracking-wide">描述(可选)</Label>
+              <TaskIntakeAI
+                description={description}
+                goal={goal}
+                srcMode
+                srcPlatformId={pickedPlatform?.id ?? 0}
+                srcTargetId={pickedTarget?.id ?? 0}
+                disabled={busy}
+                onApply={applyParse}
+              />
+            </div>
+            <Textarea
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              placeholder="补充说明"
+              rows={4}
+              placeholder="补充说明(可粘贴大段原文,AI 可自动拆分出目标/约束/奖励)"
             />
           </div>
+
+          {/* 奖励标准(可选):AI 识别或手填,随任务保存,详情总览有内容才展示。 */}
+          <div className="space-y-1.5">
+            <Label className="font-medium text-muted-foreground text-xs uppercase tracking-wide">奖励标准(可选)</Label>
+            <Textarea
+              value={rewardNote}
+              onChange={(e) => setRewardNote(e.target.value)}
+              rows={4}
+              placeholder="如：严重 5000-10000 元 / 高危 1000-3000 元 / 中危 300-800 元。会随任务保存并在任务详情总览展示，AI 识别拆分也可自动整理。"
+            />
+          </div>
+
+          {/* 操作约束:可手填也可由 AI 识别拆分整体替换(可再手改),随创建请求写入 task_constraints。 */}
+          <TaskConstraintsEditor value={constraints} onChange={setConstraints} disabled={busy} />
 
           {/* 出网方式:与通用建任务抽屉同一组件,保证四个建任务入口选项一致。 */}
           <ProxyEgressSelect
@@ -338,6 +429,17 @@ export function CreateSRCTaskDialog({
             onChange={(v) => {
               setProxyMode(v.mode);
               setProxyGroupID(v.groupId);
+            }}
+          />
+
+          {/* 执行环境:出网方式之下,命令跑在本机还是某台在线空闲机器。与通用任务抽屉/
+              批量建任务共用同一组件,机器下拉与说明文案保持一致。 */}
+          <VpsExecSelect
+            mode={vpsMode}
+            machineId={vpsMachineID}
+            onChange={(v) => {
+              setVpsMode(v.mode);
+              setVpsMachineID(v.machineId);
             }}
           />
         </div>

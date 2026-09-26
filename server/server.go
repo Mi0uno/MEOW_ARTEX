@@ -753,6 +753,9 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /api/tasks", s.listTasks)
 	mux.HandleFunc("POST /api/tasks", s.createTask)
+	// AI 识别拆分任务描述(建表单的「AI 识别拆分」按钮/失焦自动触发)。
+	// 放在 POST /api/tasks 旁:更具体的模式(Go 1.22 ServeMux)优先匹配,互不干扰。
+	mux.HandleFunc("POST /api/tasks/parse-input", s.parseTaskInput)
 	mux.HandleFunc("GET /api/task-categories", s.pgListTaskCategories)
 	mux.HandleFunc("POST /api/task-categories", s.pgCreateTaskCategory)
 	mux.HandleFunc("PATCH /api/task-categories/{id}", s.pgRenameTaskCategory)
@@ -1734,6 +1737,11 @@ type createTaskReq struct {
 	// 空闲在线机。指派发生在任务进入 running 之前;失败不阻断建任务(本机模式 + warning)。
 	VPSMachineID int64 `json:"vps_machine_id,omitempty"`
 	VPSAuto      bool  `json:"vps_auto,omitempty"`
+	// 创建时随任务写入的操作约束(AI 识别拆分/手填共用落点):与 applySRCConstraints
+	// 同一机制,写 task_constraints(origin=user),注入 Planner/Worker 系统提示。
+	Constraints []taskConstraintInput `json:"constraints,omitempty"`
+	// 奖励标准文本(SRC 任务识别奖励的落点):随任务行落库,任务详情总览有内容才展示。
+	RewardNote string `json:"reward_note,omitempty"`
 }
 
 func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
@@ -1833,6 +1841,13 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.CompanyIDs = companyIDs
+	// 操作约束:用户显式提交,非法/超限必须报 400 而不是静默截断——创建出来的任务
+	// 少一条用户以为存在的边界,比多一次报错危险得多。
+	constraints, err := validateTaskConstraintInputs(req.Constraints)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	t, err := s.m.CreateTaskWithOptions(req.Description, req.Goal, db.TaskCreateOptions{
 		Name: strings.TrimSpace(req.Name), CategoryID: req.CategoryID,
 		SourceTaskIDs: sourceIDs, CompanyIDs: req.CompanyIDs, LLMProfileIDs: req.LLMProfileIDs,
@@ -1848,6 +1863,8 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		GuardMode: req.GuardMode, GuardRuleIDs: req.GuardRuleIDs,
 		// VPS 执行环境(创建即指派):指派在 CreateTaskWithOptions 内、任务启动前完成。
 		VPSMachineID: req.VPSMachineID, VPSAuto: req.VPSAuto,
+		// 奖励标准文本:随任务行原子落库,详情总览有内容才渲染。
+		RewardNote: strings.TrimSpace(req.RewardNote),
 	})
 	if err != nil {
 		if errors.Is(err, db.ErrTaskCategoryInvalid) || errors.Is(err, db.ErrTaskCategoryNotFound) {
@@ -1876,6 +1893,21 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		s.applySRCConstraints(t, req.SRCPlatformID, req.SRCTargetID)
 		// 目标下整理的资产同步挂为任务的测试资产,让 AI 的测试范围与清单一致。
 		s.attachSRCTargetAssets(t, req.SRCPlatformID, req.SRCTargetID)
+	}
+	// 用户显式提交的操作约束:与 SRC 规范约束同一机制写 task_constraints(origin=user),
+	// 同样必须在 launchTask 之前写——约束要赶在首轮 Planner 之前就位。任务行已提交,
+	// 单条写失败只能 log-and-continue(回滚重建任务反而把已成功的创建变成 500)。
+	if len(constraints) > 0 {
+		store := s.m.PG().Exploration(t.ExpID)
+		written := 0
+		for _, c := range constraints {
+			if _, err := store.AddConstraint(c.Kind, c.Text, "user"); err != nil {
+				log.Printf("[task] 任务 %s 写入操作约束(%s)失败: %v", t.ID, c.Kind, err)
+				continue
+			}
+			written++
+		}
+		log.Printf("[task] 任务 %s 已写入用户操作约束 %d/%d 条", t.ID, written, len(constraints))
 	}
 	// 共享的建后流程(seed + 种子意图 + 后台目标分解 + engine.Run),与 spawn_task 复用同一段。
 	// launchTask 内部异步,不阻塞 UI —— 目标分解在后台可见地进行。

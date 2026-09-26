@@ -431,7 +431,7 @@ export const api = {
     input: { description: string; goal?: string; srcMode?: boolean; srcPlatformId?: number; srcTargetId?: number },
     signal?: AbortSignal,
   ) =>
-    http<TaskInputParse>("/tasks/parse-input", {
+    http<{ result: TaskInputParse }>("/tasks/parse-input", {
       method: "POST",
       body: JSON.stringify({
         description: input.description,
@@ -442,7 +442,9 @@ export const api = {
       }),
       // 调用方不传 signal 时给 320s 兜底,而不是 http() 的默认 60s——LLM 拆长文实测 1-2 分钟。
       signal: signal ?? AbortSignal.timeout(320_000),
-    }),
+      // 后端包了一层 {result: ...} 信封(server/task_parse.go),在这里拆掉,
+      // 调用方拿到的就是 TaskInputParse 本体。
+    }).then((r) => r.result),
   taskCategories: () => get<{ categories: TaskCategory[] }>("/task-categories").then((r) => arr(r.categories)),
   // ---- 信息搜集(stage=recon)执行面 ----
   reconCollectors: () => get<{ collectors: ReconCollectorDesc[] }>("/recon/collectors").then((r) => arr(r.collectors)),

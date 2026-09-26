@@ -17,6 +17,7 @@ import {
 import { Bar, BarChart, CartesianGrid, Tooltip as RechartsTooltip, XAxis, YAxis } from "recharts";
 
 import { StatusBadge } from "@/components/status-badge";
+import { TablePagination } from "@/components/table-pagination";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { type ChartConfig, ChartContainer, ChartTooltip, ChartTooltipContent } from "@/components/ui/chart";
@@ -127,6 +128,46 @@ function SectionTitle({
   );
 }
 
+// 卡片内列表共用的客户端分页状态。分页只是视图切片：数据照常轮询刷新，页码 /
+// 每页条数独立维护；数据更新导致总页数变少时当前页钳制回最后一页，不会白页。
+function useListPageState(total: number, defaultPageSize: number) {
+  const [page, setPage] = React.useState(1);
+  const [pageSize, setPageSize] = React.useState(defaultPageSize);
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const safePage = Math.min(Math.max(1, page), totalPages);
+  React.useEffect(() => {
+    if (page !== safePage) setPage(safePage);
+  }, [page, safePage]);
+  const pager: React.ComponentProps<typeof TablePagination> = {
+    page: safePage,
+    pageSize,
+    total,
+    onPageChange: setPage,
+    onPageSizeChange: (s: number) => {
+      setPageSize(s);
+      setPage(1);
+    },
+  };
+  const slice = React.useCallback(
+    <T,>(items: T[]): T[] => items.slice((safePage - 1) * pageSize, safePage * pageSize),
+    [safePage, pageSize],
+  );
+  return { pager, slice };
+}
+
+// 四个列表共用的卡片内分页控件：复用 TablePagination，仅用 child 选择器覆盖其
+// 自带的 border-t/px-4/py-2（lg:px-6），边框与内边距由各卡片布局自己贴合，交互保持一致。
+function DashboardPager({
+  className,
+  ...props
+}: React.ComponentProps<typeof TablePagination> & { className?: string }) {
+  return (
+    <div className={cn("border-t [&>div]:border-t-0 [&>div]:px-0 [&>div]:py-2", className)}>
+      <TablePagination {...props} />
+    </div>
+  );
+}
+
 // ── page ─────────────────────────────────────────────────────────────────────
 
 export default function DashboardPage() {
@@ -192,7 +233,7 @@ export default function DashboardPage() {
           api.stats(),
           api.settings(),
           api.interceptPending(),
-          api.activity(undefined, { limit: 30 }),
+          api.activity(undefined, { limit: 200 }),
           api.tokenStats(),
           api.conversationTokens(),
         ]);
@@ -224,7 +265,7 @@ export default function DashboardPage() {
     const load = async () => {
       try {
         const [traf, counts, agentList, mcpList, skillList, toolList, profileList, usage] = await Promise.all([
-          api.traffic(0, 50),
+          api.traffic(0, 200),
           api.assetCounts(),
           api.agents(),
           api.mcpServers(),
@@ -272,23 +313,19 @@ export default function DashboardPage() {
 
   const sortedTasks = React.useMemo(
     () =>
-      [...tasks]
-        .sort((a, b) => (b.last_activity_unix ?? b.created_unix ?? 0) - (a.last_activity_unix ?? a.created_unix ?? 0))
-        .slice(0, 5),
+      [...tasks].sort(
+        (a, b) => (b.last_activity_unix ?? b.created_unix ?? 0) - (a.last_activity_unix ?? a.created_unix ?? 0),
+      ),
     [tasks],
   );
 
   const recentFindings = React.useMemo(
-    () => [...findings].sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts)).slice(0, 8),
+    () => [...findings].sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts)),
     [findings],
   );
 
   const recentActivity = React.useMemo(
-    () =>
-      [...activity]
-        .filter((a) => a.kind !== "usage")
-        .sort((a, b) => b.seq - a.seq)
-        .slice(0, 6),
+    () => [...activity].filter((a) => a.kind !== "usage").sort((a, b) => b.seq - a.seq),
     [activity],
   );
 
@@ -317,7 +354,17 @@ export default function DashboardPage() {
   }, [traffic]);
 
   const trafficMax = Math.max(...trafficByCodes.map((x) => x.n), 1);
-  const recentTraffic = [...traffic].sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts)).slice(0, 5);
+  const recentTraffic = React.useMemo(() => [...traffic].sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts)), [traffic]);
+
+  // ── 分页状态：四个列表统一的客户端视图切片（排序/过滤后的完整结果再按页截取）──
+  const taskPager = useListPageState(sortedTasks.length, 10);
+  const activityPager = useListPageState(recentActivity.length, 8);
+  const findingPager = useListPageState(recentFindings.length, 8);
+  const trafficPager = useListPageState(recentTraffic.length, 5);
+  const taskPageItems = taskPager.slice(sortedTasks);
+  const activityPageItems = activityPager.slice(recentActivity);
+  const findingPageItems = findingPager.slice(recentFindings);
+  const trafficPageItems = trafficPager.slice(recentTraffic);
 
   // system
   const activeProfile = llmProfiles.find((p) => p.is_default);
@@ -854,9 +901,7 @@ export default function DashboardPage() {
               活动流
             </div>
             <div className="flex items-center gap-2">
-              <span className="text-[10px] text-muted-foreground">
-                {activity.filter((a) => a.kind !== "usage").length} 条事件
-              </span>
+              <span className="text-[10px] text-muted-foreground">{recentActivity.length} 条事件</span>
               <Link
                 href="/function/tasks"
                 className="flex items-center gap-0.5 text-[10px] text-muted-foreground hover:text-foreground"
@@ -882,7 +927,7 @@ export default function DashboardPage() {
             {recentActivity.length === 0 ? (
               <div className="py-4 text-center text-xs text-muted-foreground">暂无活动记录</div>
             ) : (
-              recentActivity.map((a) => (
+              activityPageItems.map((a) => (
                 <div key={a.seq} className="flex gap-2.5 py-2">
                   <span
                     className={cn(
@@ -906,6 +951,14 @@ export default function DashboardPage() {
               ))
             )}
           </div>
+
+          {recentActivity.length > 0 && (
+            <DashboardPager
+              {...activityPager.pager}
+              pageSizeOptions={[6, 8, 12, 24]}
+              className="-mx-4 -mb-4 px-4 pb-2.5"
+            />
+          )}
         </Card>
 
         {/* 发现 */}
@@ -915,19 +968,22 @@ export default function DashboardPage() {
               <BugIcon className="size-3.5 text-muted-foreground" />
               发现
             </div>
-            <Link
-              href="/function/findings"
-              className="flex items-center gap-0.5 text-[10px] text-muted-foreground hover:text-foreground"
-            >
-              全部 <ArrowUpRightIcon className="size-3" />
-            </Link>
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] text-muted-foreground">{recentFindings.length} 条</span>
+              <Link
+                href="/function/findings"
+                className="flex items-center gap-0.5 text-[10px] text-muted-foreground hover:text-foreground"
+              >
+                全部 <ArrowUpRightIcon className="size-3" />
+              </Link>
+            </div>
           </div>
 
           <div className="divide-y">
             {recentFindings.length === 0 ? (
               <div className="py-4 text-center text-xs text-muted-foreground">暂无发现</div>
             ) : (
-              recentFindings.map((f) => (
+              findingPageItems.map((f) => (
                 <div key={f.id} className="flex items-start gap-2 py-2">
                   <StatusBadge
                     domain="severity"
@@ -950,6 +1006,14 @@ export default function DashboardPage() {
               ))
             )}
           </div>
+
+          {recentFindings.length > 0 && (
+            <DashboardPager
+              {...findingPager.pager}
+              pageSizeOptions={[8, 16, 32]}
+              className="-mx-4 -mb-4 px-4 pb-2.5"
+            />
+          )}
         </Card>
       </div>
 
@@ -961,7 +1025,7 @@ export default function DashboardPage() {
             任务
           </div>
           <div className="flex items-center gap-2">
-            <span className="text-[10px] text-muted-foreground">{tasks.length} 个任务</span>
+            <span className="text-[10px] text-muted-foreground">{sortedTasks.length} 个任务</span>
             <Link
               href="/function/tasks"
               className="flex items-center gap-0.5 text-[10px] text-muted-foreground hover:text-foreground"
@@ -970,75 +1034,78 @@ export default function DashboardPage() {
             </Link>
           </div>
         </div>
-        <table className="w-full border-collapse text-xs">
-          <thead>
-            <tr className="border-b">
-              {["任务", "状态", "引擎", "目标进度", "在途", "最近活动"].map((h) => (
-                <th
-                  key={h}
-                  className="px-4 py-2 text-left text-[9px] font-semibold uppercase tracking-widest text-muted-foreground first:pl-4"
-                >
-                  {h}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {sortedTasks.length === 0 ? (
-              <tr>
-                <td colSpan={6} className="px-4 py-6 text-center text-xs text-muted-foreground">
-                  暂无任务
-                </td>
+        <div>
+          <table className="w-full border-collapse text-xs">
+            <thead>
+              <tr className="border-b">
+                {["任务", "状态", "引擎", "目标进度", "在途", "最近活动"].map((h) => (
+                  <th
+                    key={h}
+                    className="px-4 py-2 text-left text-[9px] font-semibold uppercase tracking-widest text-muted-foreground first:pl-4"
+                  >
+                    {h}
+                  </th>
+                ))}
               </tr>
-            ) : (
-              sortedTasks.map((t) => {
-                const goalsPct = t.goals_total ? Math.round(((t.goals_met ?? 0) / t.goals_total) * 100) : null;
-                return (
-                  <tr key={t.id} className="border-b last:border-0 transition-colors hover:bg-muted/30">
-                    <td className="max-w-xs px-4 py-3">
-                      <Link href={`/function/tasks/detail?id=${t.id}`} className="group flex flex-col">
-                        <span className="truncate font-medium group-hover:underline">{t.description}</span>
-                        <span className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground">{t.id}</span>
-                      </Link>
-                    </td>
-                    <td className="px-4 py-3">
-                      <StatusBadge domain="task" value={t.status} dot className="px-1.5 py-0 text-[10px]" />
-                    </td>
-                    <td className="px-4 py-3">
-                      <StatusBadge
-                        domain="engine"
-                        value={t.engine_mode ?? "idle"}
-                        className="px-1.5 py-0 text-[10px]"
-                      />
-                    </td>
-                    <td className="px-4 py-3">
-                      {goalsPct !== null ? (
-                        <div className="flex items-center gap-2">
-                          <Progress value={goalsPct} className="h-1 w-14" />
-                          <span className="tabular-nums text-muted-foreground">
-                            {t.goals_met ?? 0}/{t.goals_total}
-                          </span>
-                        </div>
-                      ) : (
-                        <span className="text-muted-foreground">—</span>
-                      )}
-                    </td>
-                    <td className="px-4 py-3 tabular-nums">
-                      {(t.in_flight ?? 0) > 0 ? (
-                        <span className="font-semibold">{t.in_flight}</span>
-                      ) : (
-                        <span className="text-muted-foreground">—</span>
-                      )}
-                    </td>
-                    <td className="px-4 py-3 tabular-nums text-muted-foreground">
-                      {fmtRel(t.last_activity_unix ?? t.created_unix)}
-                    </td>
-                  </tr>
-                );
-              })
-            )}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {sortedTasks.length === 0 ? (
+                <tr>
+                  <td colSpan={6} className="px-4 py-6 text-center text-xs text-muted-foreground">
+                    暂无任务
+                  </td>
+                </tr>
+              ) : (
+                taskPageItems.map((t) => {
+                  const goalsPct = t.goals_total ? Math.round(((t.goals_met ?? 0) / t.goals_total) * 100) : null;
+                  return (
+                    <tr key={t.id} className="border-b last:border-0 transition-colors hover:bg-muted/30">
+                      <td className="max-w-xs px-4 py-3">
+                        <Link href={`/function/tasks/detail?id=${t.id}`} className="group flex flex-col">
+                          <span className="truncate font-medium group-hover:underline">{t.description}</span>
+                          <span className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground">{t.id}</span>
+                        </Link>
+                      </td>
+                      <td className="px-4 py-3">
+                        <StatusBadge domain="task" value={t.status} dot className="px-1.5 py-0 text-[10px]" />
+                      </td>
+                      <td className="px-4 py-3">
+                        <StatusBadge
+                          domain="engine"
+                          value={t.engine_mode ?? "idle"}
+                          className="px-1.5 py-0 text-[10px]"
+                        />
+                      </td>
+                      <td className="px-4 py-3">
+                        {goalsPct !== null ? (
+                          <div className="flex items-center gap-2">
+                            <Progress value={goalsPct} className="h-1 w-14" />
+                            <span className="tabular-nums text-muted-foreground">
+                              {t.goals_met ?? 0}/{t.goals_total}
+                            </span>
+                          </div>
+                        ) : (
+                          <span className="text-muted-foreground">—</span>
+                        )}
+                      </td>
+                      <td className="px-4 py-3 tabular-nums">
+                        {(t.in_flight ?? 0) > 0 ? (
+                          <span className="font-semibold">{t.in_flight}</span>
+                        ) : (
+                          <span className="text-muted-foreground">—</span>
+                        )}
+                      </td>
+                      <td className="px-4 py-3 tabular-nums text-muted-foreground">
+                        {fmtRel(t.last_activity_unix ?? t.created_unix)}
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
+            </tbody>
+          </table>
+          <DashboardPager {...taskPager.pager} pageSizeOptions={[5, 10, 20, 50]} className="px-4" />
+        </div>
       </Card>
 
       {/* ── Row 5: 资产分布 | 流量状态码 | 拦截 & 待审批 ── */}
@@ -1100,7 +1167,7 @@ export default function DashboardPage() {
               <div className="border-t pt-2.5">
                 <div className="mb-1.5 text-[10px] text-muted-foreground">最近请求</div>
                 <div className="flex flex-col gap-1.5">
-                  {recentTraffic.map((e) => (
+                  {trafficPageItems.map((e) => (
                     <div key={e.id} className="flex items-center gap-1.5 text-[10px]">
                       <span
                         className={cn(
@@ -1121,6 +1188,14 @@ export default function DashboardPage() {
                   ))}
                 </div>
               </div>
+
+              {recentTraffic.length > 0 && (
+                <DashboardPager
+                  {...trafficPager.pager}
+                  pageSizeOptions={[5, 10, 20]}
+                  className="-mx-4 -mb-4 mt-2.5 px-4 pb-2.5"
+                />
+              )}
             </>
           )}
         </Card>

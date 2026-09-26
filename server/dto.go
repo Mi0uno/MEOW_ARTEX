@@ -71,6 +71,8 @@ type TaskDTO struct {
 	SRCProfileID  int64 `json:"src_profile_id,omitempty"`
 	SRCPlatformID int64 `json:"src_platform_id,omitempty"`
 	SRCTargetID   int64 `json:"src_target_id,omitempty"`
+	// 奖励标准文本(SRC 任务的奖励依据):任务详情总览有内容才渲染,空则不占位。
+	RewardNote string `json:"reward_note,omitempty"`
 	// 出网方式(任务级覆盖):''=跟随全局;direct=强制直连;pool=强制走代理池。
 	ProxyMode    string `json:"proxy_mode,omitempty"`
 	ProxyGroupID int64  `json:"proxy_group_id,omitempty"`
@@ -168,6 +170,7 @@ func taskDTO(t *Task, status string) TaskDTO {
 		SRCProfileID:       t.SRCProfileID,
 		SRCPlatformID:      t.SRCPlatformID,
 		SRCTargetID:        t.SRCTargetID,
+		RewardNote:         t.RewardNote,
 		ProxyMode:          t.ProxyMode,
 		ProxyGroupID:       t.ProxyGroupID,
 		GuardMode:          guardMode,

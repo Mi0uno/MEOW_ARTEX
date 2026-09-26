@@ -73,6 +73,9 @@ type Task struct {
 	SRCProfileID  int64 `json:"src_profile_id,omitempty"`
 	SRCPlatformID int64 `json:"src_platform_id,omitempty"`
 	SRCTargetID   int64 `json:"src_target_id,omitempty"`
+	// 奖励标准文本(SRC 任务的奖励依据):创建时随任务落库,创建后只读;空=无。
+	// 与 Stage/Kind 一样是创建期不变量,不需要 lifecycle 锁。
+	RewardNote string `json:"reward_note,omitempty"`
 	// 出网方式(任务级覆盖):''=跟随全局;direct=强制直连;pool=强制走代理池。
 	// ProxyGroupID 仅在 pool 时有效(0=用全局选中的组)。
 	ProxyMode    string                 `json:"proxy_mode,omitempty"`
@@ -1013,6 +1016,7 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		StepKey: pt.StepKey, StepConfig: append(json.RawMessage(nil), pt.StepConfig...),
 		SRCMode: pt.SRCMode, SRCProfileID: pt.SRCProfileID,
 		SRCPlatformID: pt.SRCPlatformID, SRCTargetID: pt.SRCTargetID,
+		RewardNote: pt.RewardNote,
 		ProxyMode: pt.ProxyMode, ProxyGroupID: pt.ProxyGroupID,
 		guardMode: pgdb.NormalizeTaskGuardMode(pt.GuardMode), guardRuleIDs: pgdb.NormalizeTaskGuardRuleIDs(pt.GuardRuleIDs),
 		Store: store, Guard: guard.NewWithInterceptor(ic), notify: make(chan struct{}, 1),
