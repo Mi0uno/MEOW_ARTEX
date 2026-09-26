@@ -631,7 +631,7 @@ func extractAssetCandidates(segments []assetTextSegment) []assetCandidate {
 				add(&assetCandidate{Type: "ip", Value: host, Port: port, Source: seg.Kind})
 				return
 			}
-			if h := cleanAssetHostname(host); h != "" {
+			if h := cleanAssetHostname(host); h != "" && plausibleAssetHost(h) {
 				add(&assetCandidate{Type: "service", Value: h, Port: port, Source: seg.Kind})
 			}
 		})
@@ -643,9 +643,9 @@ func extractAssetCandidates(segments []assetTextSegment) []assetCandidate {
 			}
 			add(&assetCandidate{Type: "ip", Value: ip, Port: port, Source: seg.Kind})
 		})
-		// ④ 裸 hostname → domain。
+		// ④ 裸 hostname → domain(末段须是可信 TLD,滤掉代码 token 误提)。
 		for _, m := range reAssetHost.FindAllString(text, -1) {
-			if h := cleanAssetHostname(m); h != "" && !validAssetIPv4(h) {
+			if h := cleanAssetHostname(m); h != "" && !validAssetIPv4(h) && plausibleAssetHost(h) {
 				add(&assetCandidate{Type: "domain", Value: h, Source: seg.Kind})
 			}
 		}
@@ -726,6 +726,38 @@ func cleanAssetHostname(h string) string {
 	return h
 }
 
+// plausibleAssetTLDs 末段可信域:裸域名/host:port/URL 主机的最后一个标签必须
+// 命中才算候选。冒烟实测代码 token 会被 hostname 正则误提(Python 的
+// socket.gethostbyname / s.recv / host.encode——.recv/.encode 不是真实 TLD),
+// 白名单是最省噪音的闸;内网常见后缀(.local/.corp/.lan 等)一并保留。
+var plausibleAssetTLDs = map[string]bool{}
+
+func init() {
+	for _, t := range strings.Fields(
+		"com cn net org io jp kr uk de fr ru us tw hk mo sg in au ca br ir tr nl it es se no fi dk pl cz ch at be pt gr mx ar cl za my id th vn ph " +
+			"edu gov mil int info biz pro xyz top vip club shop site online tech cloud app dev ai cc tv me co live space link icu fun wiki news name asia mobi " +
+			"local corp lan intranet internal lab test demo example") {
+		plausibleAssetTLDs[t] = true
+	}
+}
+
+// plausibleAssetHost 候选级主机校验(纯函数):末段必须是可信 TLD,且 IP 形态的
+// 主机不能是 loopback/0.0.0.0/广播(URL 候选此前漏过这层,冒烟抓到
+// http://127.0.0.1:7890 混进暂存)。非 IP 主机还要带点(单标签不是域名)。
+func plausibleAssetHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	if validAssetIPv4(host) {
+		return !isBlockedAssetIPv4(host)
+	}
+	dot := strings.LastIndexByte(host, '.')
+	if dot < 0 || dot == len(host)-1 {
+		return false
+	}
+	return plausibleAssetTLDs[host[dot+1:]]
+}
+
 // splitAssetHostPort 拆 host:port(裸 host 亦可),port 非法/缺省为 0。
 func splitAssetHostPort(s string) (string, int) {
 	host, port := s, 0
@@ -747,7 +779,7 @@ func assetCandidateFromURL(raw string) *assetCandidate {
 		return nil
 	}
 	host := cleanAssetHostname(cutAssetHost(parsed.Hostname()))
-	if host == "" || !strings.Contains(host, ".") {
+	if !plausibleAssetHost(host) {
 		return nil
 	}
 	port := 0

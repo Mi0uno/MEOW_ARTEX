@@ -294,3 +294,26 @@ func TestAssetExtractSettingValue(t *testing.T) {
 		t.Fatal("开关存储值映射错误")
 	}
 }
+
+// TestAssetExtractNoiseFiltered 回归(8799 冒烟实测踩到):URL 主机为 loopback 的
+// service 候选与代码 token 形态的假域名(socket.gethostbyname/s.recv)必须被拒;
+// 真实域名与内网常见后缀(.corp)不受影响。
+func TestAssetExtractNoiseFiltered(t *testing.T) {
+	cands := extractAssetCandidates([]assetTextSegment{
+		assetSeg("tool_result", "代理 http://127.0.0.1:7890 已起;socket.gethostbyname 与 s.recv 是代码片段;真实目标 web01.corp 与 api.example.com 正常"),
+	})
+	if findCandidate(cands, "service", "127.0.0.1", 7890) != nil {
+		t.Fatalf("URL 主机为 loopback 应丢弃: %+v", cands)
+	}
+	for _, bad := range []string{"socket.gethostbyname", "s.recv"} {
+		if findCandidate(cands, "domain", bad, 0) != nil {
+			t.Fatalf("代码 token %s 不应被提取为域名: %+v", bad, cands)
+		}
+	}
+	if findCandidate(cands, "domain", "web01.corp", 0) == nil {
+		t.Fatalf("内网后缀域名 web01.corp 应保留: %+v", cands)
+	}
+	if findCandidate(cands, "domain", "api.example.com", 0) == nil {
+		t.Fatalf("真实域名 api.example.com 应保留: %+v", cands)
+	}
+}

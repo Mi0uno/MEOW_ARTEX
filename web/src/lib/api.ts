@@ -829,9 +829,10 @@ export const api = {
   assetExtractConfig: () => get<AssetExtractConfig>("/asset-extract/config"),
   saveAssetExtractConfig: (config: AssetExtractConfig) => put<AssetExtractConfig>("/asset-extract/config", config),
   // 手动归档：单条资产直录进资产库并关联当前任务（source='manual'）。
+  // task_id 后端是 int64，前端 Task.id 是 string，必须 Number() 转换。
   archiveTaskAsset: (taskId: string, asset: TaskAssetUpsert) =>
     post<ArchiveAssetResult>("/assets", {
-      task_id: taskId,
+      task_id: Number(taskId),
       source: "manual",
       source_summary: "手动归档",
       assets: [asset],
