@@ -18,35 +18,44 @@ import (
 
 // SRCReward 是一条 SRC 成果(可提交的漏洞产出)。
 type SRCReward struct {
-	ID           int64      `json:"id"`
-	CompanyID    *int64     `json:"company_id,omitempty"`
-	CompanyName  string     `json:"company_name,omitempty"`
-	PlatformID   *int64     `json:"platform_id,omitempty"`
-	PlatformName string     `json:"platform_name,omitempty"`
-	TargetID     *int64     `json:"target_id,omitempty"`
-	TaskID       *int64     `json:"task_id,omitempty"`
-	FindingID    *int64     `json:"finding_id,omitempty"`
-	EntryID      *int64     `json:"entry_id,omitempty"`
-	Title        string     `json:"title"`
-	Severity     string     `json:"severity"`
-	VulnClass    string     `json:"vuln_class"`
-	Status       string     `json:"status"`
-	PlatformRef  string     `json:"platform_ref"`
-	Feedback     string     `json:"feedback"`
-	SubmittedAt  *time.Time `json:"submitted_at,omitempty"`
-	CreatedAt    time.Time  `json:"created_at"`
-	UpdatedAt    time.Time  `json:"updated_at"`
+	ID           int64  `json:"id"`
+	CompanyID    *int64 `json:"company_id,omitempty"`
+	CompanyName  string `json:"company_name,omitempty"`
+	PlatformID   *int64 `json:"platform_id,omitempty"`
+	PlatformName string `json:"platform_name,omitempty"`
+	TargetID     *int64 `json:"target_id,omitempty"`
+	TaskID       *int64 `json:"task_id,omitempty"`
+	FindingID    *int64 `json:"finding_id,omitempty"`
+	EntryID      *int64 `json:"entry_id,omitempty"`
+	// ReportID 是该漏洞在报告中心的已归档漏洞报告 id(kind='finding' 按 finding_id 幂等,至多一条),
+	// 没归档(agent 还没写正文)为 NULL,成果页据此决定是否展示「报告」入口。
+	ReportID    *int64     `json:"report_id,omitempty"`
+	Title       string     `json:"title"`
+	Severity    string     `json:"severity"`
+	VulnClass   string     `json:"vuln_class"`
+	Status      string     `json:"status"`
+	PlatformRef string     `json:"platform_ref"`
+	Feedback    string     `json:"feedback"`
+	SubmittedAt *time.Time `json:"submitted_at,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
 }
 
 const srcRewardCols = `r.id, r.company_id, COALESCE(c.name,''), r.platform_id, COALESCE(p.name,''), r.target_id,
-	r.task_id, r.finding_id, r.entry_id,
+	r.task_id, r.finding_id, r.entry_id, rp.id,
 	r.title, r.severity, r.vuln_class, r.status, r.platform_ref, r.feedback, r.submitted_at, r.created_at, r.updated_at`
+
+// srcRewardJoins 是成果查询的固定 JOIN:企业/平台补名称,reports 补已归档漏洞报告 id。
+const srcRewardJoins = `
+	LEFT JOIN companies c ON c.id=r.company_id
+	LEFT JOIN src_platforms p ON p.id=r.platform_id
+	LEFT JOIN reports rp ON rp.kind='finding' AND rp.finding_id=r.finding_id`
 
 func scanSRCReward(sc interface{ Scan(...any) error }) (*SRCReward, error) {
 	var r SRCReward
 	var submitted sql.NullTime
 	if err := sc.Scan(&r.ID, &r.CompanyID, &r.CompanyName, &r.PlatformID, &r.PlatformName, &r.TargetID,
-		&r.TaskID, &r.FindingID, &r.EntryID,
+		&r.TaskID, &r.FindingID, &r.EntryID, &r.ReportID,
 		&r.Title, &r.Severity, &r.VulnClass, &r.Status, &r.PlatformRef, &r.Feedback,
 		&submitted, &r.CreatedAt, &r.UpdatedAt); err != nil {
 		return nil, err
@@ -146,9 +155,7 @@ func (d *DB) ListSRCRewards(f SRCRewardFilter) ([]*SRCReward, int, map[string]in
 	case "severity":
 		order = `CASE r.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END ASC, r.created_at DESC`
 	}
-	q := `SELECT ` + srcRewardCols + ` FROM src_rewards r
-	LEFT JOIN companies c ON c.id=r.company_id
-	LEFT JOIN src_platforms p ON p.id=r.platform_id WHERE ` + filtered +
+	q := `SELECT ` + srcRewardCols + ` FROM src_rewards r` + srcRewardJoins + ` WHERE ` + filtered +
 		` ORDER BY ` + order + fmt.Sprintf(` LIMIT $%d OFFSET $%d`, len(fargs)+1, len(fargs)+2)
 	fargs = append(fargs, f.Limit, f.Offset)
 	items, err := d.Query(q, fargs...)
@@ -169,9 +176,7 @@ func (d *DB) ListSRCRewards(f SRCRewardFilter) ([]*SRCReward, int, map[string]in
 
 // GetSRCReward 取一条成果。
 func (d *DB) GetSRCReward(id int64) (*SRCReward, error) {
-	r, err := scanSRCReward(d.QueryRow(`SELECT `+srcRewardCols+` FROM src_rewards r
-	LEFT JOIN companies c ON c.id=r.company_id
-	LEFT JOIN src_platforms p ON p.id=r.platform_id WHERE r.id=$1`, id))
+	r, err := scanSRCReward(d.QueryRow(`SELECT `+srcRewardCols+` FROM src_rewards r`+srcRewardJoins+` WHERE r.id=$1`, id))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

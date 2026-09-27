@@ -480,6 +480,8 @@ export interface SRCReward {
   task_id?: number;
   finding_id?: number;
   entry_id?: number;
+  // 该漏洞在报告中心已归档的漏洞报告 id;agent 还没写正文(未归档)时没有
+  report_id?: number;
   title: string;
   severity: string;
   vuln_class: string;

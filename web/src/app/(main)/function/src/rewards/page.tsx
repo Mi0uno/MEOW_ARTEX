@@ -10,6 +10,8 @@ import {
   AwardIcon,
   ChevronDownIcon,
   ChevronUpIcon,
+  EyeIcon,
+  FileTextIcon,
   PencilIcon,
   SearchIcon,
   Trash2Icon,
@@ -451,13 +453,13 @@ export default function SRCRewardsPage() {
                       />
                     </TableHead>
                     <TableHead>成果标题</TableHead>
-                    <TableHead className="w-40">企业</TableHead>
+                    <TableHead className="w-28">企业</TableHead>
                     <TableHead className="w-20">严重度</TableHead>
-                    <TableHead className="w-32">漏洞类别</TableHead>
-                    <TableHead className="w-24">状态</TableHead>
-                    <TableHead className="w-32">来源任务</TableHead>
+                    <TableHead className="w-24">漏洞类别</TableHead>
+                    <TableHead className="w-20">状态</TableHead>
+                    <TableHead className="w-20">来源任务</TableHead>
                     <SortHead field="created">产出时间</SortHead>
-                    <TableHead className="w-32">操作</TableHead>
+                    <TableHead>操作</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -472,10 +474,11 @@ export default function SRCRewardsPage() {
                             aria-label={`选择成果 ${r.title}`}
                           />
                         </TableCell>
-                        <TableCell className="max-w-96">
-                          <span className="truncate font-medium" title={r.title}>
+                        <TableCell>
+                          {/* truncate 必须落在块级元素上:inline 元素的 overflow:hidden 不生效,长标题会画到后面的列上 */}
+                          <div className="max-w-80 truncate font-medium" title={r.title}>
                             {r.title}
-                          </span>
+                          </div>
                         </TableCell>
                         <TableCell className="text-muted-foreground text-xs">
                           {r.company_name || (r.company_id ? `企业 #${r.company_id}` : "—")}
@@ -507,6 +510,21 @@ export default function SRCRewardsPage() {
                         <TableCell className="text-muted-foreground text-xs">{fmtTime(r.created_at)}</TableCell>
                         <TableCell>
                           <div className="flex items-center gap-1">
+                            {r.finding_id ? (
+                              <Button variant="ghost" size="sm" asChild>
+                                <Link href={`/function/findings/detail?id=${r.finding_id}`}>
+                                  <EyeIcon className="size-3.5" />
+                                  查看
+                                </Link>
+                              </Button>
+                            ) : null}
+                            {r.report_id ? (
+                              <Button variant="ghost" size="icon-sm" asChild title="查看报告中心已归档的漏洞报告">
+                                <Link href={`/function/reports/detail?id=${r.report_id}`}>
+                                  <FileTextIcon className="size-3.5 text-muted-foreground" />
+                                </Link>
+                              </Button>
+                            ) : null}
                             <Button variant="ghost" size="sm" onClick={() => setEditing(r)}>
                               <PencilIcon className="size-3.5" />
                               提交
