@@ -594,6 +594,8 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetConstraintInject(s.constraintInjectWorker) // 操作约束注入 worker(可配置,默认开)
 	wk.SetMemoryBrief(s.memoryBriefBlock)            // 记忆简报注入 worker 系统提示词(契约 §7.3)
 	wk.SetMemoryRecallFn(s.memoryRecallFor)          // 跨任务记忆检索(契约 §7.3)
+	wk.SetVulnBrief(s.vulnBriefBlock)                // CVE 情报简报注入 worker 系统提示词(POC_INTEL_CONTRACTS.md)
+	wk.SetVulnSearchFn(s.vulndbSearchFor)            // vulndb_search 工具后端(同上)
 	// VPS 执行环境(契约 §6):任务指派了机器时,三个 agent 的 Bash 都换成 SSH 版、
 	// 系统提示词追加机器档案。worker 是主力执行,但 planner 的开局探测与 main agent
 	// 对话同样带 Bash——只换 worker 的话命令会从这两个角色漏回本机(掉马甲)。
@@ -615,6 +617,8 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	pl.SetConstraintInject(s.constraintInjectPlanner) // 操作约束注入 planner(可配置,默认开)
 	pl.SetMemoryBrief(s.memoryBriefBlock)             // 记忆简报注入 planner 系统提示词(契约 §7.3)
 	pl.SetMemoryRecallFn(s.memoryRecallFor)           // 跨任务记忆检索(契约 §7.3)
+	pl.SetVulnBrief(s.vulnBriefBlock)                 // CVE 情报简报注入 planner 系统提示词(POC_INTEL_CONTRACTS.md)
+	pl.SetVulnSearchFn(s.vulndbSearchFor)             // vulndb_search 工具后端(同上)
 	// cold-digest §7: 冷节点后台压缩。引擎经权威解析器实际驱动的就是这套 per-task planner
 	// (agentsForTask),Compactor 必须接在这里。走任务路由的 planner provider(§4:与 agent
 	// 同模型,随任务 LLM 链解析),压缩用 Complete 一次性生成 body。
@@ -630,6 +634,8 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	main.SetSteerWork(s.engine.SteerWork)     // steer_work：人对运行中 work 实时纠偏
 	main.SetMemoryBrief(s.memoryBriefBlock)   // 记忆简报注入主 agent 系统提示词(契约 §7.3)
 	main.SetMemoryRecallFn(s.memoryRecallFor) // 跨任务记忆检索(契约 §7.3)
+	main.SetVulnBrief(s.vulnBriefBlock)       // CVE 情报简报注入主 agent 系统提示词(POC_INTEL_CONTRACTS.md)
+	main.SetVulnSearchFn(s.vulndbSearchFor)   // vulndb_search 工具后端(同上)
 	// VPS 执行环境:planner/main 与 worker 共用同一个 per-run 解析器(见 worker 处注释)。
 	pl.SetVPSContext(s.vpsContextResolver())
 	main.SetVPSContext(s.vpsContextResolver())
