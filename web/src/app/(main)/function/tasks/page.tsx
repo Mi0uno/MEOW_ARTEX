@@ -3406,6 +3406,8 @@ function CreateTaskSheet({
   // 监管门限(任务级覆盖):""=跟随全局 / "off"=本任务不跑监管 / "enforce"=强制启用。
   // 规则集限定(guard_rule_ids)本次不做 UI,一律留空 = 用全部已启用规则。
   const [guardMode, setGuardMode] = React.useState("");
+  // CVE 情报简报联动(任务级三态):inherit=跟随全局 settings vulndb_task_brief。
+  const [vulnBrief, setVulnBrief] = React.useState<"inherit" | "on" | "off">("inherit");
 
   // 执行环境(高级设置):"local"=平台本机(默认) / "machine"=指定机器 / "auto"=自动分配。
   // 在线空闲机器的拉取与哨兵处理都在共享 VpsExecSelect 内部(与 SRC 对话框/批量页共用)。
@@ -3494,6 +3496,8 @@ function CreateTaskSheet({
         seedFirstIntent,
         planHeartbeatSeconds: heartbeatSec,
         coverageEnabled,
+        // CVE 情报简报联动:inherit=跟随全局(null),on/off=任务级强制开/关。
+        vulnBrief: vulnBrief === "inherit" ? null : vulnBrief === "on",
         stage,
         // 出网方式:默认跟随全局;选「走代理池」时可指定用哪个组。
         proxyMode,
@@ -3771,6 +3775,29 @@ function CreateTaskSheet({
                   <p className="text-muted-foreground text-xs">
                     默认开启：计算并展示测试覆盖度、态势图显示测试进度、自动累积测试范围。关闭后不再计算/展示覆盖度，
                     态势图仅展示资产不显示进度，agent 也不再获得范围类工具。关闭不影响「关联企业资产范围」。
+                  </p>
+                </div>
+                {/* CVE 情报简报联动:任务启动时按资产指纹匹配库内漏洞注入 AI 系统提示。 */}
+                <div className="grid gap-2">
+                  <Label htmlFor="vuln-brief">CVE 情报联动</Label>
+                  <Select
+                    value={vulnBrief}
+                    onValueChange={(v) => setVulnBrief(v === "inherit" || v === "on" || v === "off" ? v : "inherit")}
+                  >
+                    <SelectTrigger id="vuln-brief" className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectGroup>
+                        <SelectItem value="inherit">跟随全局（默认）</SelectItem>
+                        <SelectItem value="on">本任务开启</SelectItem>
+                        <SelectItem value="off">本任务关闭</SelectItem>
+                      </SelectGroup>
+                    </SelectContent>
+                  </Select>
+                  <p className="text-muted-foreground text-xs">
+                    开启后任务启动时按资产指纹（技术栈/服务/页面标题）自动匹配平台漏洞库，把 KEV
+                    在野利用与带 PoC 的已知漏洞注入 AI 系统提示；agent 也可用 vulndb_search 工具随时深查。
                   </p>
                 </div>
                 {/* 出网方式:本任务的流量走哪条路。默认跟随全局,可单独覆盖。

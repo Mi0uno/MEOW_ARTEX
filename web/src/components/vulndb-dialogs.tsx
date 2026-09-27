@@ -5,11 +5,12 @@
 
 import * as React from "react";
 
-import { DownloadIcon, PencilIcon, PlusIcon, Trash2Icon } from "lucide-react";
+import { DownloadIcon, PencilIcon, PlusIcon, SparklesIcon, Trash2Icon } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -24,6 +25,7 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectVa
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
 import type { VulnEntry, VulnPoc } from "@/lib/types";
+import { PocReviewBadge } from "@/components/vulndb-poc-review";
 
 // 分类与严重度的展示样式(两页共用,保持一致)。
 export const CATEGORY_BADGE: Record<string, { label: string; badge: string }> = {
@@ -248,6 +250,8 @@ export function VulnDetailDialog({
   const [pocs, setPocs] = React.useState<VulnPoc[]>([]);
   const [editingPoc, setEditingPoc] = React.useState<VulnPoc | null>(null);
   const [adding, setAdding] = React.useState(false);
+  // LLM 审核为存疑(rejected)的 PoC 默认折叠——软质检层的「可信列表」语义。
+  const [hideRejected, setHideRejected] = React.useState(true);
 
   const load = React.useCallback(() => {
     if (!entryID) return;
@@ -362,57 +366,96 @@ export function VulnDetailDialog({
               <div className="border-t pt-3">
                 <div className="mb-2 flex items-center justify-between">
                   <p className="text-xs font-medium">PoC / EXP({pocs.length})</p>
-                  <Button size="sm" variant="outline" onClick={() => setAdding(true)}>
-                    <PlusIcon className="size-3.5" />
-                    添加 PoC
-                  </Button>
-                </div>
-                {pocs.length === 0 ? (
-                  <p className="text-muted-foreground py-3 text-center text-xs">
-                    还没有 PoC。定时采集会自动发现公开 PoC,也可手动添加。
-                  </p>
-                ) : (
-                  <div className="space-y-2">
-                    {pocs.map((p) => (
-                      <div key={p.id} className="rounded border p-2">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <Badge variant="secondary" className="text-xs">
-                            {p.kind}
-                          </Badge>
-                          <span className="min-w-0 flex-1 truncate text-xs font-medium" title={p.name}>
-                            {p.name}
-                          </span>
-                          {p.language && <span className="text-muted-foreground text-xs">{p.language}</span>}
-                          <Badge variant="outline" className="text-xs">
-                            {POC_SOURCE_LABEL[p.source] ?? p.source}
-                          </Badge>
-                          <Button variant="ghost" size="sm" onClick={() => setEditingPoc(p)}>
-                            <PencilIcon className="size-3.5" />
-                          </Button>
-                          <Button variant="ghost" size="sm" onClick={() => void removePoc(p)}>
-                            <Trash2Icon className="text-muted-foreground size-3.5" />
-                          </Button>
-                        </div>
-                        {p.content && (
-                          <pre className="bg-muted mt-2 max-h-40 overflow-auto rounded p-2 font-mono text-xs whitespace-pre-wrap break-all">
-                            {p.content}
-                          </pre>
-                        )}
-                        {p.source_url && (
-                          <a
-                            href={p.source_url}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="text-blue-600 mt-1 inline-block text-xs break-all hover:underline"
-                          >
-                            <DownloadIcon className="mr-1 inline size-3" />
-                            {p.source_url}
-                          </a>
-                        )}
-                      </div>
-                    ))}
+                  <div className="flex items-center gap-2">
+                    {/* 隐藏存疑(POC_INTEL 软质检):rejected 的 PoC 默认折叠,一键切回。 */}
+                    <label className="flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground">
+                      <Checkbox checked={hideRejected} onCheckedChange={(v) => setHideRejected(v === true)} />
+                      隐藏存疑
+                    </label>
+                    <Button size="sm" variant="outline" onClick={() => setAdding(true)}>
+                      <PlusIcon className="size-3.5" />
+                      添加 PoC
+                    </Button>
                   </div>
-                )}
+                </div>
+                {(() => {
+                  const visiblePocs = hideRejected ? pocs.filter((p) => p.review_status !== "rejected") : pocs;
+                  if (pocs.length === 0) {
+                    return (
+                      <p className="text-muted-foreground py-3 text-center text-xs">
+                        还没有 PoC。定时采集会自动发现公开 PoC,也可手动添加。
+                      </p>
+                    );
+                  }
+                  if (visiblePocs.length === 0) {
+                    return (
+                      <p className="text-muted-foreground py-3 text-center text-xs">
+                        全部 {pocs.length} 条 PoC 都被 LLM 审核标记为存疑,已隐藏;取消勾选「隐藏存疑」可查看与改判。
+                      </p>
+                    );
+                  }
+                  return (
+                    <div className="space-y-2">
+                      {visiblePocs.map((p) => (
+                        <div key={p.id} className="rounded border p-2">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <Badge variant="secondary" className="text-xs">
+                              {p.kind}
+                            </Badge>
+                            <span className="min-w-0 flex-1 truncate text-xs font-medium" title={p.name}>
+                              {p.name}
+                            </span>
+                            {p.language && <span className="text-muted-foreground text-xs">{p.language}</span>}
+                            <Badge variant="outline" className="text-xs">
+                              {POC_SOURCE_LABEL[p.source] ?? p.source}
+                            </Badge>
+                            <PocReviewBadge status={p.review_status} note={p.review_note} />
+                            {p.review_status !== "approved" && (
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                title="让 AI 重新审核这条 PoC"
+                                onClick={() => {
+                                  api
+                                    .reviewPoc(p.id)
+                                    .then(() => {
+                                      toast.success("已重新审核");
+                                      load();
+                                    })
+                                    .catch((e) => toast.error(`重审失败:${(e as Error).message}`));
+                                }}
+                              >
+                                <SparklesIcon className="size-3.5" />
+                              </Button>
+                            )}
+                            <Button variant="ghost" size="sm" onClick={() => setEditingPoc(p)}>
+                              <PencilIcon className="size-3.5" />
+                            </Button>
+                            <Button variant="ghost" size="sm" onClick={() => void removePoc(p)}>
+                              <Trash2Icon className="text-muted-foreground size-3.5" />
+                            </Button>
+                          </div>
+                          {p.content && (
+                            <pre className="bg-muted mt-2 max-h-40 overflow-auto rounded p-2 font-mono text-xs whitespace-pre-wrap break-all">
+                              {p.content}
+                            </pre>
+                          )}
+                          {p.source_url && (
+                            <a
+                              href={p.source_url}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="text-blue-600 mt-1 inline-block text-xs break-all hover:underline"
+                            >
+                              <DownloadIcon className="mr-1 inline size-3" />
+                              {p.source_url}
+                            </a>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })()}
               </div>
             </div>
           )}

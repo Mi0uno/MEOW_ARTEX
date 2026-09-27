@@ -48,6 +48,8 @@ import { TablePagination } from "@/components/table-pagination";
 import { api } from "@/lib/api";
 import type { VulnEntry, VulnSyncRun } from "@/lib/types";
 import { VulnDetailDialog, VulnEntryDialog, severityBadgeClass } from "@/components/vulndb-dialogs";
+import { VulndbBackfillCard } from "@/components/vulndb-backfill-card";
+import { PocReviewPanel } from "@/components/vulndb-poc-review";
 
 const PAGE_SIZE = 50;
 const RUNS_PAGE_SIZE = 20;
@@ -64,6 +66,7 @@ const SOURCE_LABELS: Record<string, string> = {
   articles: "安全社区文章",
   nvd_backfill: "NVD 历史回填",
   cnvd_feed: "CNVD 数据端点",
+  trickest: "trickest 全网聚合",
 };
 // 各源实时状态表的固定展示顺序;后端新增的未知源追加在尾部,不漏显。
 const SOURCE_ORDER = [
@@ -77,6 +80,7 @@ const SOURCE_ORDER = [
   "articles",
   "nvd_backfill",
   "cnvd_feed",
+  "trickest",
 ];
 
 // 采集记录的源分类(情报源页签的分类页签):每类是一组 source 键,后端
@@ -84,7 +88,7 @@ const SOURCE_ORDER = [
 const SOURCE_GROUPS: { key: string; label: string; sources: string[] }[] = [
   { key: "all", label: "全部", sources: [] },
   { key: "intel", label: "漏洞情报", sources: ["nvd", "github_advisory", "kev", "nvd_backfill", "cnvd_feed"] },
-  { key: "poc", label: "PoC 源", sources: ["exploitdb", "github_poc", "pocorexp_today", "nuclei"] },
+  { key: "poc", label: "PoC 源", sources: ["exploitdb", "github_poc", "pocorexp_today", "nuclei", "trickest"] },
   { key: "community", label: "社区文章", sources: ["articles"] },
 ];
 
@@ -586,6 +590,13 @@ export default function CVEPage() {
               )}
             </div>
           )}
+
+          {/* PoC 补全回填(nuclei 正文 / trickest 历史)+ LLM 审核工作台(POC_INTEL 契约)。 */}
+          <div className="grid gap-3 lg:grid-cols-3">
+            <VulndbBackfillCard kind="nuclei" />
+            <VulndbBackfillCard kind="trickest" />
+            <PocReviewPanel />
+          </div>
 
           {/* 各源实时状态(每源最近一轮,DISTINCT ON)。 */}
           <Card>

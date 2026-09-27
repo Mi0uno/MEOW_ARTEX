@@ -1281,7 +1281,7 @@ export const api = {
   cancelVulnBackfill: () => del<{ status: string }>("/vulndb/backfill"),
   // ---- POC_INTEL_CONTRACTS:任务↔漏洞库联动 + PoC 猎取 + nuclei 回填 + LLM 审核 ----
   taskVulnBrief: (taskId: string | number) =>
-    get<VulnBriefDTO>(`/tasks/${taskId}/vuln-brief`),
+    get<{ brief: VulnBriefDTO }>(`/tasks/${taskId}/vuln-brief`).then((r) => r.brief),
   pocReviewStats: () =>
     get<PocReviewStats>("/vulndb/review/stats").then((r) => ({
       pending: r.pending ?? 0,
