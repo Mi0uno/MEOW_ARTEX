@@ -172,6 +172,8 @@ import type {
   VulnPoc,
   VulnSyncRun,
   VulnBriefDTO,
+  VulnBriefEntriesDTO,
+  VulnFingerprintHit,
   PocReviewStats,
   PocBackfillStatus,
   TaskArchive,
@@ -1282,6 +1284,24 @@ export const api = {
   // ---- POC_INTEL_CONTRACTS:任务↔漏洞库联动 + PoC 猎取 + nuclei 回填 + LLM 审核 ----
   taskVulnBrief: (taskId: string | number) =>
     get<{ brief: VulnBriefDTO }>(`/tasks/${taskId}/vuln-brief`).then((r) => r.brief),
+  // 简报「匹配漏洞」分页列表:scope=all|kev|high|rest;sort=severity|poc|updated。
+  taskVulnBriefEntries: (
+    taskId: string | number,
+    input?: { scope?: string; severity?: string; q?: string; sort?: string; desc?: boolean; limit?: number; offset?: number },
+  ) => {
+    const p = new URLSearchParams();
+    if (input?.scope && input.scope !== "all") p.set("scope", input.scope);
+    if (input?.severity) p.set("severity", input.severity);
+    if (input?.q) p.set("q", input.q);
+    if (input?.sort) p.set("sort", input.sort);
+    if (input?.desc === false) p.set("desc", "0");
+    p.set("limit", String(input?.limit ?? 20));
+    p.set("offset", String(input?.offset ?? 0));
+    return get<VulnBriefEntriesDTO>(`/tasks/${taskId}/vuln-brief/entries?${p.toString()}`).then((r) => ({
+      entries: arr(r.entries),
+      total: r.total ?? 0,
+    }));
+  },
   pocReviewStats: () =>
     get<PocReviewStats>("/vulndb/review/stats").then((r) => ({
       pending: r.pending ?? 0,

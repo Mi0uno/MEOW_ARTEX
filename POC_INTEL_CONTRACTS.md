@@ -111,3 +111,77 @@ wk/pl/main.SetVulnSearchFn(fn func(ctx, query, severity, kev, hasPoc string, lim
 
 ## §9 明确不做（本轮范围外）
 PoC 可执行性自动验证（沙箱跑）；DDG 全网批量猎取（trickest 已覆盖，单条归类取证保留）；hot_cves.csv 热榜富化；trickest summary_html/GitHub API 配额消耗路径；PoC 审核的流式进度推送（轮询足够）；web 端 github token 配置 UI（settings 手工配，`vulndb_github_token` 已有三处消费）。
+
+---
+
+# 修订 §10（2026-09-27 下午）：简报入口卡片化 + 对话框双页签四件套 + 点 CVE 看详情
+
+> 用户反馈：①任务详情页「CVE 情报简报」只是个小按钮，与记忆简报整宽卡片不对称；②对话框没有分页器/分类器；③点具体 CVE 应能看漏洞详情；④指纹里一半是噪声词。主会话已冻结下方 wire 与 db 函数，双 agent 并行实现。
+
+## §10.1 已冻结（主会话改完提交，agents 只读）
+```go
+// db/vulndb.go（已实现，勿改）：
+type VulnMatchFilter struct {
+    Terms []string; Scope string /*""|kev|high|rest*/; Severity string; Q string
+    Sort string /*severity(默认)|poc|updated*/; Desc bool; Limit, Offset int
+}
+(d *DB) MatchVulnEntriesForFingerprintsPage(f VulnMatchFilter) ([]*VulnEntry, int, error)
+```
+```ts
+// web/src/lib/types.ts（已改）：VulnFingerprintHit{term,hits}；VulnBriefDTO.fingerprints:
+//   VulnFingerprintHit[]；新增 counts:{kev,high,rest,total}；新增 VulnBriefEntriesDTO
+// web/src/lib/api.ts（已改）：taskVulnBriefEntries(taskId, {scope,severity,q,sort,desc,limit,offset})
+//   → GET /tasks/{id}/vuln-brief/entries → {entries: VulnEntry[], total: number}
+```
+
+## §10.2 wire 契约（逐字，Agent 1 实现）
+```
+GET /api/tasks/{id}/vuln-brief（改造现有 handler）
+→ 200 {"brief": {
+    "task_id": string, "enabled": bool, "generated_at": string,
+    "fingerprints": [{"term": string, "hits": int}],        // 按命中数降序,最多 24 个
+    "counts": {"kev": int, "high": int, "rest": int, "total": int},
+    "entries": [VulnEntry]                                   // 兼容保留:全量命中(上限 30)
+  }}
+enabled=false → fingerprints=[], counts 全 0, entries=[]；任务不存在 404（不变）
+counts 语义：kev=命中中 KEV 数；high=非 KEV 且 critical/high；rest=其余；total=全部。
+
+GET /api/tasks/{id}/vuln-brief/entries?scope=&severity=&q=&sort=&desc=&limit=&offset=
+→ 200 {"entries": [VulnEntry], "total": int}
+scope: all(缺省)|kev|high|rest（语义同 counts）；severity: critical|high|medium|low；
+q: ILIKE 标题/厂商/产品/CVE编号；sort: severity(缺省)|poc|updated；desc 缺省 1（"0"=升序）；
+limit 夹取 1-100 缺省 20；offset≥0。联动关闭 → 200 {entries:[],total:0}；任务不存在 404。
+实现：解析参数→ db.MatchVulnEntriesForFingerprintsPage（terms 从缓存/重算的指纹来）。
+```
+**指纹 hits**：对前 24 个指纹词逐词 `COUNT(*)`（同一匹配 WHERE，词为单 LIKE），按 hits 降序取前 24。
+**停用词扩充**（Agent 1，`vulnBriefNoiseWords` 补充，单测锁住）：unknown/suspected/response/request/
+proxy/tcp/udp/http/https/spa/editor/login/index/main/static/manager/system/enterprise/default/
+admin/example/sample/test/temp/local/service/services/app/web/core/common/public/old/new/v1/v2/
+content/static/js（大小写不敏感；nginx/apache/shiro/致远oa 这类真指纹绝不停）。
+
+## §10.3 文件所有权（本轮）
+| 文件 | 归属 |
+|---|---|
+| db/、types.ts、api.ts、契约 | 主会话冻结 |
+| server/vulndb_briefing.go、server/vulndb_task_api.go | **Agent 1** |
+| web/src/components/vuln-briefing-dialog.tsx（重构） | **Agent 2** |
+| web/src/components/task-detail-view.tsx（仅挂载点替换） | **Agent 2** |
+
+## §10.4 Agent 2 — 前端（组件行为规格）
+1. **TaskVulnBriefingCard**（在 vuln-briefing-dialog.tsx 导出，替换任务详情页的裸按钮挂载）：
+   与 TaskMemoryBriefingCard 同构整宽 Card——标题行（ShieldAlertIcon + 「CVE 情报简报」+ 副标题
+   「按本任务资产指纹匹配，任务启动时已注入 AI」）+ 内容区：enabled=false → 一行关闭说明；
+   否则统计行「KEV N · 高危 N · 其他 N · 共 total 条（M 个指纹）」+ KEV 前三条预览（cve_id+标题，
+   标题以 cve_id 开头时剥掉前缀，truncate）+「查看完整简报」按钮打开重构后的 Dialog。
+   拉取失败静默 null（不崩任务详情页，沿用现组件 unwrapBrief 兼容）。
+2. **Dialog 重构为双页签**（页签可点切换，带计数）：
+   - 「匹配漏洞」(counts.total)：分类页签 全部/KEV/高危/其他（映射 scope，计数来自 counts，
+     激活页签 aria-pressed——别把页签做成只读徽标的老教训）+ 搜索框（400ms 防抖）+ 严重度 Select
+     + 排序 Select（严重度/PoC 数/更新时间）+ TablePagination（limit 20）+ 条目行
+     （严重度徽标+KEV 徽标+cve_id+剥前缀标题+厂商产品+PoC xN）。**行点击→打开 VulnDetailDialog**
+     （复用 components/vulndb-dialogs.tsx 的 `VulnDetailDialog{entryID,onOpenChange,onChanged,onEdit}`，
+     onChanged=刷新当前页，onEdit=no-op）。分页数据走 api.taskVulnBriefEntries。
+   - 「指纹」(fingerprints.length)：flex wrap 徽标（term + hits 计数），hits=0 灰显；
+     点击指纹 → 切到「匹配漏洞」页签且 q=该词（清空手动搜索）。
+3. 其余红线沿用 §1；前端不跑 tsc（集成期主会话统一）。
+

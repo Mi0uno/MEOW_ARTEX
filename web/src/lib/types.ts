@@ -310,12 +310,24 @@ export interface VulnPoc {
 }
 
 // 任务 CVE 情报简报(GET /api/tasks/{id}/vuln-brief,按任务资产指纹自动匹配库内漏洞)。
+export interface VulnFingerprintHit {
+  term: string;
+  hits: number; // 该指纹词在库内的带 PoC 命中数(0=无命中,前端灰显)
+}
+
 export interface VulnBriefDTO {
   task_id: string;
   enabled: boolean; // 本任务是否启用联动(任务级三态 or 全局开关)
   generated_at: string;
-  fingerprints: string[]; // 参与匹配的资产指纹词
-  entries: VulnEntry[]; // 命中条目(kev/severity 已排序;前端按 kev 分组渲染)
+  fingerprints: VulnFingerprintHit[]; // 按命中数降序,最多 24 个
+  counts: { kev: number; high: number; rest: number; total: number }; // 分类页签计数
+  entries: VulnEntry[]; // 全量命中(上限 30,兼容保留);分页列表走 /vuln-brief/entries
+}
+
+// 任务简报「匹配漏洞」分页列表(GET /api/tasks/{id}/vuln-brief/entries)。
+export interface VulnBriefEntriesDTO {
+  entries: VulnEntry[];
+  total: number;
 }
 
 // PoC 审核三态计数(GET /api/vulndb/review/stats)。

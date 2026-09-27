@@ -1052,3 +1052,97 @@ func (d *DB) MatchVulnEntriesForFingerprints(terms []string, limit int) ([]*Vuln
 	}
 	return out, rows.Err()
 }
+
+// VulnMatchFilter 是指纹匹配的分页筛选(任务简报「匹配漏洞」列表用)。
+type VulnMatchFilter struct {
+	Terms    []string
+	Scope    string // ""=全部; kev=仅KEV; high=非KEV且critical/high; rest=其余
+	Severity string // critical|high|medium|low(空=不限)
+	Q        string // 标题/厂商/产品/CVE编号 ILIKE(空=不限)
+	Sort     string // severity(默认,kev 优先)|poc|updated
+	Desc     bool   // 默认 true
+	Limit    int
+	Offset   int
+}
+
+// MatchVulnEntriesForFingerprintsPage 是 MatchVulnEntriesForFingerprints 的
+// 分页筛选版(简报对话框「匹配漏洞」页签:分类 scope + 严重度 + 搜索 + 排序 + 分页)。
+// 返回 (本页条目, 筛选后总数)。terms 为空或全为噪声词时返回空集。
+func (d *DB) MatchVulnEntriesForFingerprintsPage(f VulnMatchFilter) ([]*VulnEntry, int, error) {
+	patterns := []any{}
+	for _, t := range f.Terms {
+		t = strings.TrimSpace(t)
+		if len(t) < 3 { // 过短词误配率极高,与无分页版同一兜底
+			continue
+		}
+		patterns = append(patterns, "%"+t+"%")
+	}
+	if len(patterns) == 0 {
+		return []*VulnEntry{}, 0, nil
+	}
+	where := `status='active' AND poc_count > 0
+		AND (vendor ILIKE ANY($1) OR product ILIKE ANY($1) OR title ILIKE ANY($1) OR affected ILIKE ANY($1))`
+	args := []any{patterns}
+	switch f.Scope {
+	case "kev":
+		where += " AND kev"
+	case "high":
+		where += " AND NOT kev AND severity IN ('critical','high')"
+	case "rest":
+		where += " AND NOT kev AND (severity IS NULL OR severity NOT IN ('critical','high'))"
+	}
+	if f.Severity != "" {
+		where += fmt.Sprintf(" AND severity = $%d", len(args)+1)
+		args = append(args, f.Severity)
+	}
+	if q := strings.TrimSpace(f.Q); q != "" {
+		where += fmt.Sprintf(` AND (title ILIKE $%d OR vendor ILIKE $%d OR product ILIKE $%d OR cve_id ILIKE $%d)`,
+			len(args)+1, len(args)+2, len(args)+3, len(args)+4)
+		lk := "%" + q + "%"
+		args = append(args, lk, lk, lk, lk)
+	}
+	var total int
+	if err := d.QueryRow(`SELECT COUNT(*) FROM vulndb_entries WHERE `+where, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	dir := "DESC"
+	if !f.Desc {
+		dir = "ASC"
+	}
+	var order string
+	switch f.Sort {
+	case "poc":
+		order = fmt.Sprintf(`kev DESC, poc_count %s, updated_at DESC`, dir)
+	case "updated":
+		order = fmt.Sprintf(`updated_at %s, kev DESC`, dir)
+	default: // severity(默认)
+		order = fmt.Sprintf(`kev DESC, CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END %s, poc_count DESC`, dir)
+	}
+	limit := f.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	offset := f.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	args = append(args, limit, offset)
+	rows, err := d.Query(`SELECT `+vulnEntryListCols+` FROM vulndb_entries
+		WHERE `+where+fmt.Sprintf(` ORDER BY %s LIMIT $%d OFFSET $%d`, order, len(args)-1, len(args)), args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	out := []*VulnEntry{}
+	for rows.Next() {
+		e, err := scanVulnEntry(rows, false)
+		if err != nil {
+			return nil, 0, err
+		}
+		out = append(out, e)
+	}
+	return out, total, rows.Err()
+}
