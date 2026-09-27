@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,33 +42,42 @@ const (
 	vulnBriefMatchLimit = 30
 	// vulnBriefTextMaxRunes 简报整体字数上限(与记忆简报同量级,防提示词膨胀)。
 	vulnBriefTextMaxRunes = 8000
+	// vulnBriefFPMaxHits 简报 wire 里带命中计数的指纹词上限(契约 §10.2:前 24 词逐词 COUNT)。
+	vulnBriefFPMaxHits = 24
 )
 
 // vulnBriefNoiseWords 指纹去噪停用词表。只停「协议/域名碎片、标记语言、页面模板
-// 与泛运维词」——nginx/apache/shiro/tomcat 这类真指纹绝不停用(契约 §4.1 明示)。
+// 与泛运维词」——nginx/apache/shiro/seeyon(致远oa) 这类真指纹绝不停用(契约 §4.1/§10.2 明示)。
 // 判定在小写化后进行;表外的词一律放行,宁可多匹配不可漏指纹。
 var vulnBriefNoiseWords = map[string]bool{
-	// 协议/域名碎片
-	"http": true, "https": true, "www": true, "com": true, "cn": true, "net": true, "org": true,
-	// 标记语言/前端资源泛词
+	// 协议/传输层与域名碎片(§10.2 扩充:tcp/udp)
+	"http": true, "https": true, "tcp": true, "udp": true,
+	"www": true, "com": true, "cn": true, "net": true, "org": true,
+	// 标记语言/前端资源泛词(§10.2 扩充:spa/editor/js/content)
 	"html": true, "htm": true, "script": true, "javascript": true, "text": true,
 	"stylesheet": true, "css": true, "image": true, "images": true, "img": true,
 	"icon": true, "icons": true, "font": true, "fonts": true, "static": true,
-	"asset": true, "assets": true, "media": true,
-	// 页面模板泛词
+	"asset": true, "assets": true, "media": true, "js": true, "spa": true,
+	"editor": true, "content": true,
+	// 页面模板/导航/路径泛词(§10.2 扩充:main/public/example/sample/local/temp)
 	"index": true, "default": true, "home": true, "homepage": true, "page": true,
 	"title": true, "welcome": true, "login": true, "logout": true, "redirect": true,
-	// 泛运维/泛产品词(不代表具体组件指纹)
-	"server": true, "service": true, "web": true, "site": true, "website": true,
+	"main": true, "public": true, "example": true, "sample": true, "local": true, "temp": true,
+	// 泛运维/泛产品词(不代表具体组件指纹;§10.2 扩充:services/enterprise/core/common)
+	"server": true, "service": true, "services": true, "web": true, "site": true, "website": true,
 	"system": true, "platform": true, "application": true, "app": true, "software": true,
 	"admin": true, "management": true, "manager": true, "console": true, "panel": true,
 	"dashboard": true, "portal": true, "powered": true, "copyright": true,
 	"version": true, "update": true, "online": true, "cloud": true,
+	"enterprise": true, "core": true, "common": true,
+	// 版本/状态/请求类虚词(§10.2 扩充:v1/v2/old/new/unknown/suspected/test/request/response/proxy)
+	"v1": true, "v2": true, "old": true, "new": true, "unknown": true, "suspected": true,
+	"test": true, "request": true, "response": true, "proxy": true,
 	// 英文虚词(page_title 分词残渣)
 	"the": true, "and": true, "for": true, "with": true, "you": true, "your": true,
 	"this": true, "that": true, "from": true, "not": true, "can": true, "will": true,
 	"have": true, "has": true, "been": true, "more": true, "all": true, "any": true,
-	"about": true, "please": true, "sign": true, "our": true, "new": true, "get": true,
+	"about": true, "please": true, "sign": true, "our": true, "get": true,
 }
 
 // vulnBriefTokenize 把一段指纹文本拆成词:按「字母(含 CJK)/数字」以外的字符切分,
@@ -280,11 +290,90 @@ func formatVulnSearchResult(query string, items []*db.VulnEntry, total int) stri
 	return b.String()
 }
 
+// vulnTermHitCounter 单指纹词命中计数:复用冻结的 db.MatchVulnEntriesForFingerprintsPage
+// (Terms=单词、Limit=1),其 total 就是「active+poc_count>0+四列 ILIKE 该词」的 COUNT——
+// 与简报匹配天然同一 WHERE,零裸 SQL。生产实现注入 assembleVulnFingerprintHits。
+func vulnTermHitCounter(pg *db.DB) func(string) (int, error) {
+	return func(term string) (int, error) {
+		_, total, err := pg.MatchVulnEntriesForFingerprintsPage(
+			db.VulnMatchFilter{Terms: []string{term}, Limit: 1})
+		return total, err
+	}
+}
+
+// vulnScopeTotalCounter scope 维度命中计数(kev|high|rest):同一实现带全量指纹词,
+// Scope 过滤由 db 层完成,total 即该分类总数。
+func vulnScopeTotalCounter(pg *db.DB, terms []string) func(string) (int, error) {
+	return func(scope string) (int, error) {
+		_, total, err := pg.MatchVulnEntriesForFingerprintsPage(
+			db.VulnMatchFilter{Terms: terms, Scope: scope, Limit: 1})
+		return total, err
+	}
+}
+
+// assembleVulnFingerprintHits 对前 vulnBriefFPMaxHits 个指纹词逐词计数(契约 §10.2),
+// 按 hits 降序返回(同数保持原信号强度顺序,稳定排序)。countOf 封装「同一匹配 WHERE
+// 的单词计数」,生产走 vulnTermHitCounter,测试注入假计数器。
+func assembleVulnFingerprintHits(terms []string, countOf func(string) (int, error)) ([]vulnFingerprintHit, error) {
+	if len(terms) > vulnBriefFPMaxHits {
+		terms = terms[:vulnBriefFPMaxHits]
+	}
+	hits := make([]vulnFingerprintHit, 0, len(terms))
+	for _, term := range terms {
+		n, err := countOf(term)
+		if err != nil {
+			return nil, err
+		}
+		hits = append(hits, vulnFingerprintHit{Term: term, Hits: n})
+	}
+	sort.SliceStable(hits, func(i, j int) bool { return hits[i].Hits > hits[j].Hits })
+	return hits, nil
+}
+
+// assembleVulnMatchCounts 三次 scope 轻量计数拼 counts(契约 §10.2):kev/high/rest
+// 三过滤互斥且完备,各取一次 total 后求和即全量 total——比一次无上限全量拉取再在
+// Go 里分组更精确(命中可远超 30)也更省。scopeTotal 生产走 vulnScopeTotalCounter。
+func assembleVulnMatchCounts(scopeTotal func(string) (int, error)) (vulnBriefCounts, error) {
+	var c vulnBriefCounts
+	scopes := []struct {
+		name string
+		dst  *int
+	}{{"kev", &c.KEV}, {"high", &c.High}, {"rest", &c.Rest}}
+	for _, sc := range scopes {
+		n, err := scopeTotal(sc.name)
+		if err != nil {
+			return vulnBriefCounts{}, err
+		}
+		*sc.dst = n
+	}
+	c.Total = c.KEV + c.High + c.Rest
+	return c, nil
+}
+
+// vulnFingerprintHit 单个指纹词的库内命中计数(wire 对齐 web/src/lib/types.ts 的
+// VulnFingerprintHit;hits=0 时前端灰显,所以 0 命中词也保留在列表里)。
+type vulnFingerprintHit struct {
+	Term string `json:"term"`
+	Hits int    `json:"hits"`
+}
+
+// vulnBriefCounts 命中三分类计数(wire 对齐 VulnBriefDTO.counts,契约 §10.2 语义):
+// kev=命中中 KEV 数;high=非 KEV 且 critical/high;rest=其余;total=全部。
+// db 三 scope 过滤互斥且完备,total 恒等于三者之和。
+type vulnBriefCounts struct {
+	KEV   int `json:"kev"`
+	High  int `json:"high"`
+	Rest  int `json:"rest"`
+	Total int `json:"total"`
+}
+
 // vulnBriefResult 一次简报构建的完整产物:注入文本 + API 展示数据共用。
 type vulnBriefResult struct {
 	generatedAt  time.Time
 	enabled      bool
-	fingerprints []string
+	fingerprints []string              // 参与匹配的指纹词(信号强度序,注入文本/entries 端点复用)
+	fpHits       []vulnFingerprintHit  // 前 24 词的命中计数(按 hits 降序,契约 §10.2)
+	counts       vulnBriefCounts       // 三分类计数(简报对话框分类页签)
 	entries      []*db.VulnEntry
 	text         string
 }
@@ -326,7 +415,8 @@ func (s *Server) vulnBriefingFor(taskID int64) (*vulnBriefResult, error) {
 		}
 	}
 	if s.m == nil || s.m.PG() == nil {
-		return &vulnBriefResult{generatedAt: time.Now(), fingerprints: []string{}, entries: []*db.VulnEntry{}}, nil
+		return &vulnBriefResult{generatedAt: time.Now(), fingerprints: []string{},
+			fpHits: []vulnFingerprintHit{}, entries: []*db.VulnEntry{}}, nil
 	}
 	pt, err := s.m.PG().GetTask(taskID)
 	if err != nil {
@@ -339,6 +429,7 @@ func (s *Server) vulnBriefingFor(taskID int64) (*vulnBriefResult, error) {
 		generatedAt:  time.Now(),
 		enabled:      s.vulnBriefEnabledFor(pt),
 		fingerprints: []string{},
+		fpHits:       []vulnFingerprintHit{},
 		entries:      []*db.VulnEntry{},
 	}
 	if res.enabled {
@@ -349,12 +440,25 @@ func (s *Server) vulnBriefingFor(taskID int64) (*vulnBriefResult, error) {
 			}
 			res.fingerprints = vulnBriefFingerprints(assets)
 			if len(res.fingerprints) > 0 {
-				entries, merr := s.m.PG().MatchVulnEntriesForFingerprints(res.fingerprints, vulnBriefMatchLimit)
+				pg := s.m.PG()
+				// 指纹带命中计数(契约 §10.2):前 24 词逐词 COUNT,失败与匹配同权上抛
+				// (不缓存,下次调用自动重试)。
+				hits, herr := assembleVulnFingerprintHits(res.fingerprints, vulnTermHitCounter(pg))
+				if herr != nil {
+					return nil, herr
+				}
+				res.fpHits = hits
+				entries, merr := pg.MatchVulnEntriesForFingerprints(res.fingerprints, vulnBriefMatchLimit)
 				if merr != nil {
 					return nil, merr
 				}
 				res.entries = entries
 				res.text = assembleVulnBriefText(res.fingerprints, entries)
+				counts, cerr := assembleVulnMatchCounts(vulnScopeTotalCounter(pg, res.fingerprints))
+				if cerr != nil {
+					return nil, cerr
+				}
+				res.counts = counts
 			}
 		}
 	}

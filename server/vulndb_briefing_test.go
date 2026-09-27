@@ -5,6 +5,8 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -206,5 +208,193 @@ func TestVulnBriefSearchFormat(t *testing.T) {
 	}
 	if got := formatVulnSearchResult("shiro", nil, 0); got != "未命中" {
 		t.Errorf("空命中应输出「未命中」, got %q", got)
+	}
+}
+
+// TestVulnBriefNoiseWordsExpanded 契约 §10.2 扩充停用词全表锁定(逐词,含 <3 字节的
+// v1/v2/js——表内兜底)+ 真指纹(含契约点名的 seeyon/致远oa)绝不停;并验证指纹聚合
+// 链路上的大小写归一与灰显零命中词保留。
+func TestVulnBriefNoiseWordsExpanded(t *testing.T) {
+	// 契约 §10.2 清单逐词:unknown/suspected/response/request/proxy/tcp/udp/http/https/
+	// spa/editor/login/index/main/static/manager/system/enterprise/default/admin/example/
+	// sample/test/temp/local/service/services/app/web/core/common/public/old/new/v1/v2/
+	// content/js。
+	stop := []string{
+		"unknown", "suspected", "response", "request", "proxy", "tcp", "udp", "http", "https",
+		"spa", "editor", "login", "index", "main", "static", "manager", "system", "enterprise",
+		"default", "admin", "example", "sample", "test", "temp", "local", "service", "services",
+		"app", "web", "core", "common", "public", "old", "new", "v1", "v2", "content", "js",
+	}
+	for _, w := range stop {
+		if !vulnBriefNoiseWords[w] {
+			t.Errorf("契约 §10.2 停用词 %q 缺失", w)
+		}
+	}
+	// 真指纹绝不停:契约点名 nginx/apache/shiro/致远oa/seeyon + 常见组件。
+	keep := []string{"nginx", "apache", "shiro", "seeyon", "致远oa", "tomcat", "weblogic",
+		"jenkins", "spring", "若依", "通达oa"}
+	for _, w := range keep {
+		if vulnBriefNoiseWords[w] {
+			t.Errorf("真指纹 %q 不应被 §10.2 扩充误停", w)
+		}
+	}
+	// 大小写归一在指纹聚合处完成:大写形态的停用词被滤掉,真指纹保留。
+	terms := vulnBriefFingerprints([]*db.Asset{{
+		Technologies: []string{"Seeyon 致远OA", "Unknown Service"},
+		PageTitle:    "系统登录 - static content v1",
+	}})
+	got := map[string]bool{}
+	for _, term := range terms {
+		got[term] = true
+	}
+	for _, w := range []string{"seeyon", "致远oa", "系统登录"} {
+		if !got[w] {
+			t.Errorf("真指纹 %q 应保留: got %v", w, terms)
+		}
+	}
+	for _, w := range []string{"unknown", "service", "static", "content", "v1"} {
+		if got[w] {
+			t.Errorf("停用词 %q(大小写不敏感)不应出现在指纹里: got %v", w, terms)
+		}
+	}
+}
+
+// TestVulnBriefFingerprintHits hits 拼装(契约 §10.2):截前 24 词逐词计数、按 hits
+// 降序(同数保持信号强度顺序)、0 命中词保留、计数器错误上抛。
+func TestVulnBriefFingerprintHits(t *testing.T) {
+	terms := make([]string, 0, 30)
+	for i := 0; i < 30; i++ {
+		terms = append(terms, fmt.Sprintf("term%02d", i))
+	}
+	counts := map[string]int{"term00": 3, "term01": 7, "term02": 3, "term05": 12}
+	hits, err := assembleVulnFingerprintHits(terms, func(term string) (int, error) {
+		return counts[term], nil // map 缺省 0=零命中词保留
+	})
+	if err != nil {
+		t.Fatalf("拼装不应报错: %v", err)
+	}
+	if len(hits) != vulnBriefFPMaxHits {
+		t.Fatalf("应截前 %d 个指纹词, 实际 %d", vulnBriefFPMaxHits, len(hits))
+	}
+	// 降序:hits[0]=term05(12) > hits[1]=term01(7)。
+	if hits[0].Term != "term05" || hits[0].Hits != 12 {
+		t.Errorf("hits[0] 应为 term05 x12, got %+v", hits[0])
+	}
+	if hits[1].Term != "term01" || hits[1].Hits != 7 {
+		t.Errorf("hits[1] 应为 term01 x7, got %+v", hits[1])
+	}
+	// 同数稳定:term00 与 term02 都是 3,保持原信号强度顺序(term00 在前)。
+	idx := map[string]int{}
+	for i, h := range hits {
+		idx[h.Term] = i
+	}
+	if idx["term00"] >= idx["term02"] {
+		t.Errorf("同 hits 应保持原信号强度顺序: term00(%d) 应在 term02(%d) 前", idx["term00"], idx["term02"])
+	}
+	// 超出 24 的词(term24..term29)不参与。
+	for _, h := range hits {
+		if h.Term == "term24" || h.Term == "term29" {
+			t.Errorf("term24/term29 超出前 24 截断, 不应出现: %v", hits)
+		}
+	}
+	// 空输入 → 空切片(非 nil,wire 序列化 [])。
+	empty, err := assembleVulnFingerprintHits(nil, func(string) (int, error) { return 0, nil })
+	if err != nil || empty == nil || len(empty) != 0 {
+		t.Errorf("空输入应得非 nil 空切片, got %v, err %v", empty, err)
+	}
+	// 计数器错误上抛。
+	if _, err := assembleVulnFingerprintHits([]string{"a"}, func(string) (int, error) {
+		return 0, fmt.Errorf("db down")
+	}); err == nil {
+		t.Errorf("计数器错误应上抛")
+	}
+}
+
+// TestVulnBriefMatchCounts counts 分组(契约 §10.2):kev/high/rest 三 scope total,
+// total=三者之和(三过滤互斥完备);零值/错误传播。
+func TestVulnBriefMatchCounts(t *testing.T) {
+	totals := map[string]int{"kev": 2, "high": 5, "rest": 8}
+	c, err := assembleVulnMatchCounts(func(scope string) (int, error) { return totals[scope], nil })
+	if err != nil {
+		t.Fatalf("counts 不应报错: %v", err)
+	}
+	if c.KEV != 2 || c.High != 5 || c.Rest != 8 {
+		t.Errorf("分类计数不符: got %+v", c)
+	}
+	if c.Total != 15 {
+		t.Errorf("total 应为三分类之和 15, got %d", c.Total)
+	}
+	// 全零:total=0(联动关/零命中 wire 全 0)。
+	if c, err := assembleVulnMatchCounts(func(string) (int, error) { return 0, nil }); err != nil || c.Total != 0 {
+		t.Errorf("全零计数应得 total=0, got %+v, err %v", c, err)
+	}
+	// 任一 scope 查询失败应上抛。
+	if _, err := assembleVulnMatchCounts(func(scope string) (int, error) {
+		if scope == "high" {
+			return 0, fmt.Errorf("db down")
+		}
+		return 1, nil
+	}); err == nil {
+		t.Errorf("scope 计数错误应上抛")
+	}
+}
+
+// TestVulnBriefEntriesQuery 分页参数解析(契约 §10.2):缺省值/scope 映射/白名单 400/
+// desc/limit 夹取/offset 归零。
+func TestVulnBriefEntriesQuery(t *testing.T) {
+	// 全缺省。
+	q, err := parseVulnBriefEntriesQuery(url.Values{})
+	if err != nil {
+		t.Fatalf("空参数不应报错: %v", err)
+	}
+	if q.Scope != "" || q.Severity != "" || q.Q != "" || q.Sort != "severity" ||
+		!q.Desc || q.Limit != 20 || q.Offset != 0 {
+		t.Errorf("缺省值不符: %+v", q)
+	}
+	// scope:all 映射空(db 层 ""=全部);kev/high/rest 透传。
+	for in, want := range map[string]string{"all": "", "kev": "kev", "high": "high", "rest": "rest"} {
+		q, err := parseVulnBriefEntriesQuery(url.Values{"scope": {in}})
+		if err != nil || q.Scope != want {
+			t.Errorf("scope=%q 应得 %q (err %v), got %+v", in, want, err, q)
+		}
+	}
+	// 白名单外 → 400 错误。
+	for _, bad := range []struct{ key, val string }{
+		{"scope", "everything"}, {"severity", "all"}, {"sort", "hits"},
+	} {
+		if _, err := parseVulnBriefEntriesQuery(url.Values{bad.key: {bad.val}}); err == nil {
+			t.Errorf("%s=%q 白名单外应报错(400)", bad.key, bad.val)
+		}
+	}
+	// 合法 severity/sort 透传;q 去首尾空白。
+	q, err = parseVulnBriefEntriesQuery(url.Values{
+		"scope": {"rest"}, "severity": {"medium"}, "sort": {"updated"}, "q": {" shiro "},
+	})
+	if err != nil {
+		t.Fatalf("合法参数不应报错: %v", err)
+	}
+	if q.Scope != "rest" || q.Severity != "medium" || q.Sort != "updated" || q.Q != "shiro" {
+		t.Errorf("参数透传不符: %+v", q)
+	}
+	// desc:仅 "0" 升序;"1"/其他/缺省都按降序。
+	for in, want := range map[string]bool{"0": false, "1": true, "true": true, "": true} {
+		q, err := parseVulnBriefEntriesQuery(url.Values{"desc": {in}})
+		if err != nil || q.Desc != want {
+			t.Errorf("desc=%q 应得 %v (err %v), got %+v", in, want, err, q)
+		}
+	}
+	// limit 夹取 1-100,缺省 20;非数字按缺省。
+	for in, want := range map[string]int{"": 20, "abc": 20, "0": 1, "-5": 1, "1": 1, "20": 20, "100": 100, "500": 100} {
+		q, err := parseVulnBriefEntriesQuery(url.Values{"limit": {in}})
+		if err != nil || q.Limit != want {
+			t.Errorf("limit=%q 应夹取为 %d (err %v), got %d", in, want, err, q.Limit)
+		}
+	}
+	// offset:负数/非数字归 0,合法值透传。
+	for in, want := range map[string]int{"": 0, "x": 0, "-3": 0, "0": 0, "40": 40} {
+		q, err := parseVulnBriefEntriesQuery(url.Values{"offset": {in}})
+		if err != nil || q.Offset != want {
+			t.Errorf("offset=%q 应得 %d (err %v), got %d", in, want, err, q.Offset)
+		}
 	}
 }
