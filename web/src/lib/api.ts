@@ -1631,7 +1631,7 @@ export const api = {
     const m = cd.match(/filename\*=UTF-8''([^;]+)/);
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = m ? decodeURIComponent(m[1]) : `reports-export.${format === "docx" ? "zip" : "zip"}`;
+    a.download = m ? decodeURIComponent(m[1]) : "reports-export.zip";
     a.click();
     URL.revokeObjectURL(a.href);
   },

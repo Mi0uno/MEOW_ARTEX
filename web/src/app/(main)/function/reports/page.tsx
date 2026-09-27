@@ -18,6 +18,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 
 import {
   Building2Icon,
+  DownloadIcon,
   EyeIcon,
   FileTextIcon,
   LayoutTemplateIcon,
@@ -116,6 +117,8 @@ function ReportsCenterInner() {
   const [checkedIds, setCheckedIds] = React.useState<Set<number>>(new Set());
   const [deleting, setDeleting] = React.useState(false);
   const [confirmOpen, setConfirmOpen] = React.useState(false);
+  // 批量导出对话框:与批量删除同一勾选集合(导出不清空勾选)。
+  const [exportOpen, setExportOpen] = React.useState(false);
 
   const toggleChecked = (id: number, checked: boolean) => {
     setCheckedIds((prev) => {
@@ -499,10 +502,17 @@ function ReportsCenterInner() {
               </TabsList>
             </Tabs>
             {checkedIds.size > 0 && (
-              <Button variant="destructive" size="sm" disabled={deleting} onClick={() => setConfirmOpen(true)}>
-                <Trash2Icon className="size-4" />
-                删除已选 ({checkedIds.size})
-              </Button>
+              <>
+                {/* 导出在删除左边:两者同源勾选集,导出是无损操作放外侧不抢眼。 */}
+                <Button variant="outline" size="sm" onClick={() => setExportOpen(true)}>
+                  <DownloadIcon className="size-4" />
+                  导出已选 ({checkedIds.size})
+                </Button>
+                <Button variant="destructive" size="sm" disabled={deleting} onClick={() => setConfirmOpen(true)}>
+                  <Trash2Icon className="size-4" />
+                  删除已选 ({checkedIds.size})
+                </Button>
+              </>
             )}
             <span className="ml-auto text-muted-foreground text-xs tabular-nums">
               共 {total} 份{query ? `(命中 ${total})` : ""}
@@ -571,6 +581,8 @@ function ReportsCenterInner() {
           router.push(`/function/reports/detail?id=${id}`);
         }}
       />
+
+      <BatchExportDialog open={exportOpen} onOpenChange={setExportOpen} ids={[...checkedIds]} />
     </div>
   );
 }
@@ -647,6 +659,119 @@ function CreateReportDialog({
           </Button>
           <Button onClick={() => void submit()} disabled={busy}>
             创建
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// BatchExportDialog 批量导出已选报告:勾选集合一键打包为 zip 下载。服务端逐份按
+// 所选格式与模板渲染,失败项写入包内失败清单(不中断整体导出)。模板为可选项,
+// 加载失败只 toast 不阻塞;格式/模板单选交互与详情页 ExportDialog「直接导出」同款。
+function BatchExportDialog({
+  open,
+  onOpenChange,
+  ids,
+}: {
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+  ids: number[];
+}) {
+  const [format, setFormat] = React.useState<"md" | "docx">("md");
+  // 哨兵 "none" = 不使用模板(Radix Select 保留空串,不能用 "" 表达空选)。
+  const [tplId, setTplId] = React.useState("none");
+  const [templates, setTemplates] = React.useState<ReportTemplate[]>([]);
+  const [templatesLoaded, setTemplatesLoaded] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+
+  // 打开时且首次成功拉取后不再重复请求;失败仅 toast,下次打开可重试(模板可选,不阻塞导出)。
+  React.useEffect(() => {
+    if (!open || templatesLoaded) return;
+    api
+      .reportTemplates({ limit: 100 })
+      .then((r) => {
+        setTemplates(r.templates);
+        setTemplatesLoaded(true);
+      })
+      .catch((e) => toast.error(`加载模板失败:${(e as Error).message}`));
+  }, [open, templatesLoaded]);
+
+  const submit = async () => {
+    // 防御:工具栏只在勾选非空时可达,这里仍兜底防空数组发请求。
+    if (ids.length === 0) {
+      toast.error("请先勾选要导出的报告");
+      return;
+    }
+    setBusy(true);
+    try {
+      await api.exportReportsBatch(ids, format, tplId === "none" ? undefined : Number(tplId));
+      toast.success(`已导出 ${ids.length} 份报告`);
+      onOpenChange(false);
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>批量导出报告</DialogTitle>
+          <DialogDescription>
+            将打包导出已选的 {ids.length} 份报告为 zip 压缩包;单份报告按所选格式与模板渲染,导出失败的报告会列在压缩包内的失败清单中。
+          </DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-3">
+          <div className="grid gap-1.5">
+            <Label>导出格式</Label>
+            {/* 与详情页 ExportDialog 一致:Select 单选 md / docx。 */}
+            <Select value={format} onValueChange={(v) => setFormat(v as "md" | "docx")}>
+              <SelectTrigger className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectItem value="md">Markdown (.md)</SelectItem>
+                  <SelectItem value="docx">Word (.docx)</SelectItem>
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="grid gap-1.5">
+            <Label>报告模板(可选)</Label>
+            <Select value={tplId} onValueChange={setTplId}>
+              <SelectTrigger className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectItem value="none">不使用模板(原文)</SelectItem>
+                  {templates.map((t) => (
+                    <SelectItem key={t.id} value={String(t.id)}>
+                      {t.name}({t.format})
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+            {templates.length === 0 && (
+              <p className="text-muted-foreground text-[11px]">
+                还没有模板:在报告中心页点「模板管理」上传 .docx / .md 模板;不使用模板则直接导出原文。
+              </p>
+            )}
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={busy}>
+            取消
+          </Button>
+          {/* 大包同步生成需数秒,busy 期间禁用并换文案,避免用户以为卡死重复点击。 */}
+          <Button onClick={() => void submit()} disabled={busy}>
+            <DownloadIcon className="size-4" />
+            {busy ? "打包中…" : "打包导出"}
           </Button>
         </DialogFooter>
       </DialogContent>
