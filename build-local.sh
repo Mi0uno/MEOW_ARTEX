@@ -100,7 +100,7 @@ fi
 ok "部署完成：$TARGET"
 if [ "$REPO_OS" = "windows" ]; then
   echo "    桌面使用：双击 MEOWFUCK.exe（无需控制台）。"
-  echo "    服务方式：先 pg-start.bat 再 start.bat，日志在控制台可见。"
+  echo "    服务方式：运行 start.bat（控制台守护，日志在控制台可见）。"
 else
   echo "    运行：cd $TARGET && ./start.sh"
 fi
