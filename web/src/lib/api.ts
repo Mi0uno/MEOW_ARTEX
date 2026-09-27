@@ -1604,6 +1604,37 @@ export const api = {
     a.click();
     URL.revokeObjectURL(a.href);
   },
+  // 批量导出报告(报告中心勾选后):服务端打包 zip 流式返回,浏览器触发下载。
+  // format=md|docx(逐份按单份导出语义渲染),templateId 可选(全部套同一模板)。
+  exportReportsBatch: async (ids: number[], format: "md" | "docx" = "md", templateId?: number) => {
+    const token = getToken();
+    const r = await fetch("/api/reports/export-batch", {
+      method: "POST",
+      headers: {
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ ids, format, template_id: templateId ?? 0 }),
+    });
+    if (!r.ok) {
+      let msg = `批量导出失败:${r.status}`;
+      try {
+        const j = await r.json();
+        if (typeof j?.error === "string") msg = j.error;
+      } catch {
+        /* 非 JSON 错误体,保留状态码信息 */
+      }
+      throw new Error(msg);
+    }
+    const blob = await r.blob();
+    const cd = r.headers.get("Content-Disposition") ?? "";
+    const m = cd.match(/filename\*=UTF-8''([^;]+)/);
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = m ? decodeURIComponent(m[1]) : `reports-export.${format === "docx" ? "zip" : "zip"}`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  },
   // 从现有产出归档:任务总结报告(即时渲染探索图)/漏洞报告(需 findings.report 已有正文)。
   generateTaskReport: (taskId: string) =>
     post<{ id: number; created: boolean }>("/reports/generate", { source: "task", task_id: taskId }),
