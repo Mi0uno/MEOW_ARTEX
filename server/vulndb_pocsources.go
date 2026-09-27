@@ -379,7 +379,11 @@ func nucleiFetchCVEPathsByYear(ctx context.Context, headers map[string]string) (
 }
 
 // nucleiAttachTemplates 把 CVE → 模板路径映射挂到库内已有条目(只挂不建,幂等)。
-func nucleiAttachTemplates(ctx context.Context, pg *db.DB, templates map[string]string) (int, error) {
+// 挂载**新增**行后当场抓模板正文写入(新增量小;client 为 nil 时跳过抓取)。
+// Content 刻意留空入库:抓取失败保留空 content,由 nuclei 正文回填
+// (vulndb_nuclei_body.go,按 source='nuclei' AND content='' 找目标)兜底补齐;
+// 当场抓失败不算失败、不报 error。
+func nucleiAttachTemplates(ctx context.Context, pg *db.DB, client *http.Client, templates map[string]string) (int, error) {
 	attached := 0
 	cves := make([]string, 0, len(templates))
 	for cve := range templates {
@@ -399,21 +403,41 @@ func nucleiAttachTemplates(ctx context.Context, pg *db.DB, templates map[string]
 			continue // 条目不存在:只挂不建
 		}
 		path := templates[cve]
+		sourceURL := nucleiTemplateURLPrefix + path
 		_, created, err := pg.CreateVulnPoc(db.VulnPocInput{
 			EntryID:   entry.ID,
 			Kind:      "nuclei",
 			Source:    "nuclei",
-			SourceURL: nucleiTemplateURLPrefix + path,
+			SourceURL: sourceURL,
 			Name:      "nuclei 模板: " + cve,
 			Language:  "yaml",
-			Content:   fmt.Sprintf("nuclei 官方模板,可直接用 nuclei -t %s 运行。\n%s", path, path),
+			Content:   "", // 正文当场抓(下);失败留空等回填兜底
 		})
 		if err != nil {
 			log.Printf("[vulndb-sync] nuclei PoC 入库失败(%s): %v", cve, err)
 			continue
 		}
-		if created {
-			attached++
+		if !created {
+			continue
+		}
+		attached++
+		if client == nil {
+			continue // 无可用客户端:保留空 content,回填兜底
+		}
+		// 当场抓正文(单次尝试,不重试不退避):失败只记日志,不算整轮失败。
+		if err := nucleiBodyPace(ctx); err != nil {
+			return attached, err
+		}
+		body, ferr := nucleiBodyFetchOnce(ctx, client, nucleiRawBaseURL+path)
+		if ferr != nil {
+			log.Printf("[vulndb-sync] nuclei 模板正文当场抓取失败(%s,留待回填): %v", path, ferr)
+			continue
+		}
+		if strings.TrimSpace(string(body)) == "" {
+			continue
+		}
+		if _, werr := pg.SetVulnPocContent(entry.ID, sourceURL, string(body), "yaml"); werr != nil {
+			log.Printf("[vulndb-sync] nuclei 模板正文写入失败(%s,留待回填): %v", path, werr)
 		}
 	}
 	return attached, nil
@@ -464,6 +488,7 @@ func (v *vulnSync) syncNucleiTemplates(ctx context.Context) (pocs int, err error
 	}
 	templates := nucleiFilterCVEPaths(paths)
 	log.Printf("[vulndb-sync] nuclei 模板解析出 %d 个 CVE", len(templates))
-	pocs, err = nucleiAttachTemplates(ctx, v.s.m.PG(), templates)
+	// 挂新增行时用回填专用客户端(30s 上限/代理感知)当场抓正文。
+	pocs, err = nucleiAttachTemplates(ctx, v.s.m.PG(), v.s.nucleiBodyHTTPClient(), templates)
 	return pocs, err
 }
