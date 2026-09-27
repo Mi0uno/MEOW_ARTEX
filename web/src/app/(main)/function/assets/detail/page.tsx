@@ -44,6 +44,7 @@ import { AssetImportDialog } from "@/components/asset-import-dialog";
 import { ReconGraph } from "@/components/recon-graph";
 import { assetsToTaskGraph } from "@/components/asset-graph";
 import { StatusBadge } from "@/components/status-badge";
+import { TablePagination } from "@/components/table-pagination";
 import { api } from "@/lib/api";
 import type { Asset, Company } from "@/lib/types";
 
@@ -91,7 +92,7 @@ export default function CompanyDetailPage() {
 
   return (
     <React.Suspense fallback={null}>
-      {id ? <CompanyDetailInner companyId={Number(id)} /> : <MissingId />}
+      {id ? <CompanyDetailInner key={id} companyId={Number(id)} /> : <MissingId />}
     </React.Suspense>
   );
 }
@@ -118,37 +119,102 @@ function CompanyAssetGraph({ assets, className }: { assets: Asset[]; className?:
 function CompanyDetailInner({ companyId }: { companyId: number }) {
   const [company, setCompany] = React.useState<Company | null>(null);
   const [loaded, setLoaded] = React.useState(false);
+  // 资产列表走服务端 分页/分类/搜索,不再一次拉全——后端单页有上限,拉全会被静默截断。
   const [assets, setAssets] = React.useState<Asset[]>([]);
+  const [total, setTotal] = React.useState(0);
+  const [counts, setCounts] = React.useState<Record<string, number>>({});
   const [assetsLoaded, setAssetsLoaded] = React.useState(false);
   const [typeFilter, setTypeFilter] = React.useState<string>("all");
   const [query, setQuery] = React.useState("");
+  const [search, setSearch] = React.useState("");
+  const [page, setPage] = React.useState(1);
+  const [pageSize, setPageSize] = React.useState(50);
   const [selected, setSelected] = React.useState<Set<number>>(new Set());
   const [tab, setTab] = React.useState<string | null>(null);
   const activeTab = tab ?? "assets";
+  // 关系图需要全量资产(列表只取当前页):首次切到关系图时分页循环拉齐。
+  const [graphAssets, setGraphAssets] = React.useState<Asset[]>([]);
+  const [graphState, setGraphState] = React.useState<"idle" | "loading" | "done" | "error">("idle");
 
-  const load = React.useCallback(() => {
+  const loadCompany = React.useCallback(() => {
     api
       .companies()
       .then((cs) => setCompany(cs.find((c) => c.id === companyId) ?? null))
       .catch(() => undefined)
       .finally(() => setLoaded(true));
-    api
-      .assetsByCompany(companyId)
-      .then((r) => setAssets(r.assets))
-      .catch(() => undefined)
-      .finally(() => setAssetsLoaded(true));
+  }, [companyId]);
+
+  const reqSeq = React.useRef(0);
+  const loadAssets = React.useCallback(
+    (t: string, kw: string, p: number, size: number) => {
+      const seq = ++reqSeq.current;
+      api
+        .assetsByCompany(companyId, { type: t === "all" ? "" : t, q: kw, limit: size, offset: (p - 1) * size })
+        .then((r) => {
+          if (seq !== reqSeq.current) return;
+          setAssets(r.assets);
+          setTotal(r.total);
+          setCounts(r.counts);
+          setAssetsLoaded(true);
+          // 删除/切筛选后当前页可能越过末页:回跳最后一页。
+          if (r.assets.length === 0 && p > 1 && r.total > 0) {
+            setPage(Math.max(1, Math.ceil(r.total / size)));
+          }
+        })
+        .catch(() => setAssetsLoaded(true));
+    },
+    [companyId],
+  );
+
+  React.useEffect(() => {
+    loadCompany();
+  }, [loadCompany]);
+  React.useEffect(() => {
+    loadAssets(typeFilter, search, page, pageSize);
+  }, [loadAssets, typeFilter, search, page, pageSize]);
+
+  // 搜索词 400ms 防抖上服务端;每次新搜索回到第 1 页。
+  React.useEffect(() => {
+    const t = setTimeout(() => {
+      setSearch(query.trim());
+      setPage(1);
+    }, 400);
+    return () => clearTimeout(t);
+  }, [query]);
+
+  const graphBusyRef = React.useRef(false);
+  const loadGraph = React.useCallback(async () => {
+    if (graphBusyRef.current) return;
+    graphBusyRef.current = true;
+    setGraphState("loading");
+    try {
+      const out: Asset[] = [];
+      const size = 200; // 后端单页上限
+      for (let offset = 0; ; offset += size) {
+        const r = await api.assetsByCompany(companyId, { limit: size, offset });
+        out.push(...r.assets);
+        if (r.assets.length < size || out.length >= r.total) break;
+      }
+      setGraphAssets(out);
+      setGraphState("done");
+    } catch {
+      setGraphState("error");
+    } finally {
+      graphBusyRef.current = false;
+    }
   }, [companyId]);
 
   React.useEffect(() => {
-    load();
-  }, [load]);
+    if (activeTab === "graph") void loadGraph();
+  }, [activeTab, loadGraph]);
 
-  const filtered = assets.filter((a) => {
-    if (typeFilter !== "all" && a.type !== typeFilter) return false;
-    if (!query.trim()) return true;
-    const q = query.trim().toLowerCase();
-    return assetValue(a).toLowerCase().includes(q) || (a.service_name ?? "").toLowerCase().includes(q);
-  });
+  const reloadNow = () => {
+    loadCompany();
+    loadAssets(typeFilter, search, page, pageSize);
+    setGraphAssets([]);
+    setGraphState("idle");
+    if (activeTab === "graph") void loadGraph();
+  };
 
   const removeSelected = async () => {
     if (selected.size === 0) return;
@@ -156,7 +222,7 @@ function CompanyDetailInner({ companyId }: { companyId: number }) {
       await api.deleteAssets([...selected]);
       toast.success(`已删除 ${selected.size} 个资产`);
       setSelected(new Set());
-      load();
+      loadAssets(typeFilter, search, page, pageSize);
     } catch (e) {
       toast.error(`删除失败：${(e as Error).message}`);
     }
@@ -181,18 +247,20 @@ function CompanyDetailInner({ companyId }: { companyId: number }) {
         next.delete(id);
         return next;
       });
-      load();
+      loadAssets(typeFilter, search, page, pageSize);
     } catch (e) {
       toast.error(`删除失败：${(e as Error).message}`);
     }
   };
 
-  const typeCounts = new Map<string, number>();
-  for (const a of assets) typeCounts.set(a.type, (typeCounts.get(a.type) ?? 0) + 1);
+  // 分类计数来自后端全量聚合,不受当前类型/搜索筛选影响(分类器铁律)。
+  const allCount = Object.values(counts).reduce((a, b) => a + b, 0);
+  const typePills = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  const isFiltered = typeFilter !== "all" || search !== "";
 
-  // 全选范围 = 当前筛选后的行集合（与资产主页按当前页全选的语义一致）。
-  const allFilteredSelected = filtered.length > 0 && filtered.every((a) => selected.has(a.id));
-  const someFilteredSelected = filtered.some((a) => selected.has(a.id));
+  // 全选范围 = 当前页行集合（与资产主页按当前页全选的语义一致）。
+  const allFilteredSelected = assets.length > 0 && assets.every((a) => selected.has(a.id));
+  const someFilteredSelected = assets.some((a) => selected.has(a.id));
 
   if (!company) {
     return (
@@ -232,7 +300,7 @@ function CompanyDetailInner({ companyId }: { companyId: number }) {
             size="icon-sm"
             variant="ghost"
             onClick={() => {
-              load();
+              reloadNow();
               toast.success("已刷新");
             }}
             aria-label="刷新"
@@ -247,7 +315,7 @@ function CompanyDetailInner({ companyId }: { companyId: number }) {
         </p>
         <div className="no-scrollbar min-w-0 overflow-x-auto">
           <TabsList variant="default" className="min-w-max">
-            <TabsTrigger value="assets">资产({assets.length})</TabsTrigger>
+            <TabsTrigger value="assets">资产({allCount})</TabsTrigger>
             <TabsTrigger value="graph">关系图</TabsTrigger>
             <TabsTrigger value="scope">范围</TabsTrigger>
           </TabsList>
@@ -259,30 +327,34 @@ function CompanyDetailInner({ companyId }: { companyId: number }) {
           <Card>
             <CardContent className="pt-4">
               <div className="flex flex-wrap items-center gap-1.5">
-                {/* 类型条:与主资产页同款,点击筛选,带计数 */}
+                {/* 类型条:与主资产页同款,点击筛选,带计数(后端全量聚合,不随筛选/搜索变化) */}
                 <button
                   type="button"
-                  onClick={() => setTypeFilter("all")}
+                  onClick={() => {
+                    setPage(1);
+                    setTypeFilter("all");
+                  }}
                   className={`rounded-full border px-3 py-1 text-xs transition-colors ${
                     typeFilter === "all" ? "border-primary bg-primary text-primary-foreground" : "hover:bg-muted"
                   }`}
                 >
-                  全部 {assets.length}
+                  全部 {allCount}
                 </button>
-                {[...typeCounts.entries()]
-                  .sort((a, b) => b[1] - a[1])
-                  .map(([t, n]) => (
-                    <button
-                      key={t}
-                      type="button"
-                      onClick={() => setTypeFilter(t)}
-                      className={`rounded-full border px-3 py-1 text-xs transition-colors ${
-                        typeFilter === t ? "border-primary bg-primary text-primary-foreground" : "hover:bg-muted"
-                      }`}
-                    >
-                      {ASSET_TYPE_LABEL[t] ?? t} {n}
-                    </button>
-                  ))}
+                {typePills.map(([t, n]) => (
+                  <button
+                    key={t}
+                    type="button"
+                    onClick={() => {
+                      setPage(1);
+                      setTypeFilter(t);
+                    }}
+                    className={`rounded-full border px-3 py-1 text-xs transition-colors ${
+                      typeFilter === t ? "border-primary bg-primary text-primary-foreground" : "hover:bg-muted"
+                    }`}
+                  >
+                    {ASSET_TYPE_LABEL[t] ?? t} {n}
+                  </button>
+                ))}
               </div>
               <div className="flex flex-wrap items-center gap-2">
                 <Input
@@ -292,11 +364,11 @@ function CompanyDetailInner({ companyId }: { companyId: number }) {
                   className="w-64"
                 />
                 <span className="text-muted-foreground text-xs tabular-nums">
-                  {filtered.length}/{assets.length} 条
+                  {isFiltered ? `命中 ${total} / ` : ""}共 {allCount} 条
                 </span>
                 <div className="ml-auto flex items-center gap-2">
                   {/* 给该企业上传文件添加资产：导入结果强制归属当前企业，关闭后刷新列表 */}
-                  <AssetImportDialog companyId={company.id} onImported={load} />
+                  <AssetImportDialog companyId={company.id} onImported={reloadNow} />
                   <AlertDialog>
                     <AlertDialogTrigger asChild>
                       <Button variant="outline" size="sm" disabled={selected.size === 0}>
@@ -319,91 +391,103 @@ function CompanyDetailInner({ companyId }: { companyId: number }) {
                   </AlertDialog>
                 </div>
               </div>
-              {assetsLoaded && filtered.length === 0 ? (
+              {assetsLoaded && assets.length === 0 ? (
                 <p className="text-muted-foreground py-12 text-center text-sm">
-                  {assets.length === 0
+                  {total === 0 && !isFiltered
                     ? "该企业还没有资产:建一个信息搜集步骤任务(手动导入/crt.sh/测绘),采纳后进这里"
                     : "没有匹配的记录"}
                 </p>
               ) : (
-                <div className="max-h-[64vh] overflow-y-auto">
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead className="w-10">
-                          {/* checkbox 自身就是按钮，点击不会带出行上其他语义（本页行无跳转） */}
-                          <Checkbox
-                            checked={allFilteredSelected ? true : someFilteredSelected ? "indeterminate" : false}
-                            onCheckedChange={(checked) =>
-                              setSelected(checked === true ? new Set(filtered.map((a) => a.id)) : new Set())
-                            }
-                            aria-label="全选当前筛选结果"
-                          />
-                        </TableHead>
-                        <TableHead className="w-24">类型</TableHead>
-                        <TableHead>值</TableHead>
-                        <TableHead className="w-40">说明</TableHead>
-                        <TableHead className="w-40" title="资产首次入库(created_at)时间">
-                          首次发现
-                        </TableHead>
-                        <TableHead className="w-40">最近活跃</TableHead>
-                        <TableHead className="w-10" />
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {filtered.map((a) => (
-                        <TableRow key={a.id}>
-                          <TableCell className="w-10 pr-0">
+                <>
+                  <div className="max-h-[64vh] overflow-y-auto">
+                    <Table>
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead className="w-10">
+                            {/* checkbox 自身就是按钮，点击不会带出行上其他语义（本页行无跳转） */}
                             <Checkbox
-                              checked={selected.has(a.id)}
-                              onCheckedChange={() => toggle(a.id)}
-                              aria-label={`选择资产 ${assetValue(a)}`}
+                              checked={allFilteredSelected ? true : someFilteredSelected ? "indeterminate" : false}
+                              onCheckedChange={(checked) =>
+                                setSelected(checked === true ? new Set(assets.map((a) => a.id)) : new Set())
+                              }
+                              aria-label="全选本页"
                             />
-                          </TableCell>
-                          <TableCell>
-                            <Badge variant="secondary" className="text-xs">
-                              {ASSET_TYPE_LABEL[a.type] ?? a.type}
-                            </Badge>
-                          </TableCell>
-                          <TableCell className="font-mono text-xs">{assetValue(a)}</TableCell>
-                          <TableCell className="text-muted-foreground max-w-[240px] truncate text-xs">
-                            {a.page_title || a.service_name || a.service_type || a.icp || "—"}
-                          </TableCell>
-                          <TableCell className="text-muted-foreground text-xs" title={fmtTime(a.created_at)}>
-                            {fmtTime(a.created_at)}
-                          </TableCell>
-                          <TableCell className="text-muted-foreground text-xs">{fmtTime(a.last_seen)}</TableCell>
-                          <TableCell className="w-10 pl-0 text-right">
-                            <AlertDialog>
-                              <AlertDialogTrigger asChild>
-                                <Button
-                                  variant="ghost"
-                                  size="icon"
-                                  className="size-7 text-muted-foreground hover:text-destructive"
-                                  aria-label={`删除资产 ${assetValue(a)}`}
-                                >
-                                  <Trash2Icon className="size-3.5" />
-                                </Button>
-                              </AlertDialogTrigger>
-                              <AlertDialogContent>
-                                <AlertDialogHeader>
-                                  <AlertDialogTitle>删除该资产?</AlertDialogTitle>
-                                  <AlertDialogDescription>
-                                    从全局资产库硬删除 {assetValue(a)}，不可撤销；关联任务中的引用将失效。
-                                  </AlertDialogDescription>
-                                </AlertDialogHeader>
-                                <AlertDialogFooter>
-                                  <AlertDialogCancel>取消</AlertDialogCancel>
-                                  <AlertDialogAction onClick={() => void deleteOne(a.id)}>删除</AlertDialogAction>
-                                </AlertDialogFooter>
-                              </AlertDialogContent>
-                            </AlertDialog>
-                          </TableCell>
+                          </TableHead>
+                          <TableHead className="w-24">类型</TableHead>
+                          <TableHead>值</TableHead>
+                          <TableHead className="w-40">说明</TableHead>
+                          <TableHead className="w-40" title="资产首次入库(created_at)时间">
+                            首次发现
+                          </TableHead>
+                          <TableHead className="w-40">最近活跃</TableHead>
+                          <TableHead className="w-10" />
                         </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                </div>
+                      </TableHeader>
+                      <TableBody>
+                        {assets.map((a) => (
+                          <TableRow key={a.id}>
+                            <TableCell className="w-10 pr-0">
+                              <Checkbox
+                                checked={selected.has(a.id)}
+                                onCheckedChange={() => toggle(a.id)}
+                                aria-label={`选择资产 ${assetValue(a)}`}
+                              />
+                            </TableCell>
+                            <TableCell>
+                              <Badge variant="secondary" className="text-xs">
+                                {ASSET_TYPE_LABEL[a.type] ?? a.type}
+                              </Badge>
+                            </TableCell>
+                            <TableCell className="font-mono text-xs">{assetValue(a)}</TableCell>
+                            <TableCell className="text-muted-foreground max-w-[240px] truncate text-xs">
+                              {a.page_title || a.service_name || a.service_type || a.icp || "—"}
+                            </TableCell>
+                            <TableCell className="text-muted-foreground text-xs" title={fmtTime(a.created_at)}>
+                              {fmtTime(a.created_at)}
+                            </TableCell>
+                            <TableCell className="text-muted-foreground text-xs">{fmtTime(a.last_seen)}</TableCell>
+                            <TableCell className="w-10 pl-0 text-right">
+                              <AlertDialog>
+                                <AlertDialogTrigger asChild>
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    className="size-7 text-muted-foreground hover:text-destructive"
+                                    aria-label={`删除资产 ${assetValue(a)}`}
+                                  >
+                                    <Trash2Icon className="size-3.5" />
+                                  </Button>
+                                </AlertDialogTrigger>
+                                <AlertDialogContent>
+                                  <AlertDialogHeader>
+                                    <AlertDialogTitle>删除该资产?</AlertDialogTitle>
+                                    <AlertDialogDescription>
+                                      从全局资产库硬删除 {assetValue(a)}，不可撤销；关联任务中的引用将失效。
+                                    </AlertDialogDescription>
+                                  </AlertDialogHeader>
+                                  <AlertDialogFooter>
+                                    <AlertDialogCancel>取消</AlertDialogCancel>
+                                    <AlertDialogAction onClick={() => void deleteOne(a.id)}>删除</AlertDialogAction>
+                                  </AlertDialogFooter>
+                                </AlertDialogContent>
+                              </AlertDialog>
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </div>
+                  <TablePagination
+                    page={page}
+                    pageSize={pageSize}
+                    total={total}
+                    onPageChange={setPage}
+                    onPageSizeChange={(s) => {
+                      setPage(1);
+                      setPageSize(s);
+                    }}
+                  />
+                </>
               )}
             </CardContent>
           </Card>
@@ -412,12 +496,20 @@ function CompanyDetailInner({ companyId }: { companyId: number }) {
         <TabsContent value="graph" className="mt-0">
           <Card>
             <CardContent className="p-0">
-              {assets.length === 0 ? (
+              {graphState !== "done" ? (
+                <p className="text-muted-foreground py-16 text-center text-sm">
+                  {graphState === "loading"
+                    ? "正在拉取全量资产生成关系图…"
+                    : graphState === "error"
+                      ? "关系图数据加载失败，点右上角刷新重试"
+                      : "资产关系图将在有资产数据后生成(根域名 → 子域名 → IP → Web 服务)"}
+                </p>
+              ) : graphAssets.length === 0 ? (
                 <p className="text-muted-foreground py-16 text-center text-sm">
                   资产关系图将在有资产数据后生成(根域名 → 子域名 → IP → Web 服务)
                 </p>
               ) : (
-                <CompanyAssetGraph assets={assets} className="h-[72vh]" />
+                <CompanyAssetGraph assets={graphAssets} className="h-[72vh]" />
               )}
             </CardContent>
           </Card>

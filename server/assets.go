@@ -361,6 +361,9 @@ func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
 	// total is the full match count ignoring limit/offset. Count first so an offset
 	// beyond the last row can return an empty page without an expensive scan.
 	total := 0
+	// counts 是按 type 的全量计数(不受 type/q 过滤影响,分类器页签用);
+	// 仅 company 分支返回,其余分支保持空 map(不能给 nil——nil 会序列化成 null)。
+	counts := map[string]int{}
 
 	// newer_than_days=N(资产监控配套的「新发现」筛选):created_at >= now()-N days。
 	// >0 才生效;生效时非 DSL 路径统一走 QueryAssets(company_id/task_id/type 全部
@@ -400,12 +403,11 @@ func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
 	} else {
 		companyID, _ := strconv.ParseInt(q.Get("company_id"), 10, 64)
 		taskID, _ := strconv.ParseInt(q.Get("task_id"), 10, 64)
+		kw := strings.TrimSpace(q.Get("q"))
 		switch {
 		case companyID > 0:
-			total, err = as.CountByCompany(companyID, typ)
-			if err == nil && offset < total {
-				assets, err = as.QueryByCompany(companyID, typ, limit, offset)
-			}
+			// 企业详情资产页签:分类计数 + 搜索 + 分页一次带齐。
+			assets, total, counts, err = as.ListCompanyAssets(companyID, typ, kw, limit, offset)
 		case taskID > 0:
 			total, err = as.CountByTask(taskID, typ)
 			if err == nil && offset < total {
@@ -430,6 +432,7 @@ func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
 		"count":  len(assets),
 		"total":  total,
 		"assets": assets,
+		"counts": counts,
 	})
 }
 

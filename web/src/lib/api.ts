@@ -774,10 +774,19 @@ export const api = {
     get<{ count: number; total: number; assets: Asset[] }>(`/assets?type=${type}&limit=${limit}&offset=${offset}`).then(
       (r) => ({ assets: r?.assets ?? [], total: r?.total ?? r?.count ?? 0 }),
     ),
-  assetsByCompany: (companyId: number, type = "", limit = 2000, offset = 0) =>
-    get<{ count: number; total: number; assets: Asset[] }>(
-      `/assets?company_id=${companyId}${type ? `&type=${encodeURIComponent(type)}` : ""}&limit=${limit}&offset=${offset}`,
-    ).then((r) => ({ assets: r?.assets ?? [], total: r?.total ?? r?.count ?? 0 })),
+  // 企业详情资产页签:服务端分类计数 + 搜索 + 分页。q 匹配资产值/服务名,
+  // counts 是按类型的全量计数(不受 type/q 筛选影响,分类器页签用)。
+  assetsByCompany: (companyId: number, opts: { type?: string; q?: string; limit?: number; offset?: number } = {}) =>
+    get<{ count: number; total: number; assets: Asset[]; counts?: Record<string, number> }>(
+      `/assets?company_id=${companyId}` +
+        (opts.type ? `&type=${encodeURIComponent(opts.type)}` : "") +
+        (opts.q ? `&q=${encodeURIComponent(opts.q)}` : "") +
+        `&limit=${opts.limit ?? 50}&offset=${opts.offset ?? 0}`,
+    ).then((r) => ({
+      assets: r?.assets ?? [],
+      total: r?.total ?? r?.count ?? 0,
+      counts: r?.counts ?? {},
+    })),
   searchAssets: (dsl: string, type = "", limit = 50, offset = 0) =>
     get<{ count: number; total: number; assets: Asset[] }>(
       `/assets?dsl=${encodeURIComponent(dsl)}${type ? `&type=${encodeURIComponent(type)}` : ""}&limit=${limit}&offset=${offset}`,

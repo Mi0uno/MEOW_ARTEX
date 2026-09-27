@@ -400,7 +400,7 @@ type SRCTargetAsset struct {
 
 // srcTargetAssetValueExpr 按资产类型取「值」列:域名类取 domain,IP 取 ip,
 // 服务/端点取 url,应用取 app_name。前端只关心一个可读的值,不该理解 assets 的列布局。
-const srcTargetAssetValueExpr = `COALESCE(NULLIF(a.domain,''), NULLIF(a.url,''), NULLIF(a.ip,''), NULLIF(a.app_name,''), '')`
+const srcTargetAssetValueExpr = assetValueExpr
 
 const srcTargetAssetCols = `ta.id, ta.platform_id, ta.target_id, ta.asset_id, ta.source, ta.note, ta.created_at,
 	a.type, ` + srcTargetAssetValueExpr + `, COALESCE(a.port,0), a.company_id`

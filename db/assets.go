@@ -1172,6 +1172,72 @@ func (s *AssetStore) CountByCompany(companyID int64, typ string) (int, error) {
 	return n, err
 }
 
+// assetValueExpr 按资产类型取「值」列:域名类取 domain,IP 取 ip,
+// 服务/端点取 url,应用取 app_name。前端只关心一个可读的值,搜索按它匹配。
+const assetValueExpr = `COALESCE(NULLIF(a.domain,''), NULLIF(a.url,''), NULLIF(a.ip,''), NULLIF(a.app_name,''), '')`
+
+// ListCompanyAssets 分页检索企业资产,并返回按 type 的计数。
+// counts 不受 type/kw 过滤影响(分类器铁律:否则选中一类后其他类归零);
+// total 是 type+kw 过滤后的条数,分页器以它为准。kw 匹配资产值或服务名。
+func (s *AssetStore) ListCompanyAssets(companyID int64, typ, kw string, limit, offset int) ([]*Asset, int, map[string]int, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	counts := map[string]int{}
+	crows, err := s.db.Query(`SELECT a.type, COUNT(*) FROM assets a WHERE a.company_id=$1 GROUP BY a.type`, companyID)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	for crows.Next() {
+		var t string
+		var n int
+		if err := crows.Scan(&t, &n); err != nil {
+			crows.Close()
+			return nil, 0, nil, err
+		}
+		counts[t] = n
+	}
+	crows.Close()
+	if err := crows.Err(); err != nil {
+		return nil, 0, nil, err
+	}
+
+	where := `a.company_id=$1`
+	args := []any{companyID}
+	if t := strings.TrimSpace(typ); t != "" && t != "all" {
+		args = append(args, t)
+		where += fmt.Sprintf(` AND a.type=$%d`, len(args))
+	}
+	if k := strings.TrimSpace(kw); k != "" {
+		args = append(args, "%"+k+"%")
+		where += fmt.Sprintf(` AND (`+assetValueExpr+` ILIKE $%d OR COALESCE(a.service_name,'') ILIKE $%d)`, len(args), len(args))
+	}
+	var total int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM assets a WHERE `+where, args...).Scan(&total); err != nil {
+		return nil, 0, nil, err
+	}
+
+	// assetSelectCols 以 "FROM assets" 结尾,这里只补表别名 a(值表达式里带 a. 前缀)。
+	rows, err := s.db.Query(assetSelectCols+` a WHERE `+where+pageClause(&args, limit, offset), args...)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	defer rows.Close()
+	assets, err := scanAssets(rows)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	if assets == nil {
+		// 越界 offset 等空页场景:返回空切片而不是 nil(nil 会序列化成 JSON null)。
+		assets = []*Asset{}
+	}
+	return assets, total, counts, nil
+}
+
 func pageClause(args *[]any, limit, offset int) string {
 	q := ` ORDER BY last_seen DESC, id DESC`
 	if limit > 0 {

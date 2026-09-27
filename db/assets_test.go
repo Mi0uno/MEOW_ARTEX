@@ -1124,3 +1124,107 @@ func TestQueryDSLInScopeMembership(t *testing.T) {
 		t.Fatalf("taskID<=0 should fall back to global and include out-of-scope asset %d", outIDs[0])
 	}
 }
+
+// 企业资产列表统一入口:counts 是全量按类型聚合(不受 type/kw 过滤影响,分类器铁律),
+// total 是过滤后条数(分页依据),kw 匹配资产值或服务名。
+func TestListCompanyAssets(t *testing.T) {
+	d, av2, cs := testSetup(t)
+	defer d.Close()
+
+	companyID, _, err := cs.UpsertCompany("ListCompanyAssetsCorp", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanupCompany(d, companyID)
+
+	if added, _, _, errs := cs.AddScope(companyID, []string{"lca-test.io"}, "test"); added != 1 {
+		t.Fatalf("AddScope: added=%d, errors=%v", added, errs)
+	}
+	defer d.Exec(`DELETE FROM assets WHERE root_domain = 'lca-test.io'`)
+
+	mk := func(domain string) int64 {
+		id, err := av2.UpsertSubdomain(UpsertSubdomainReq{Domain: domain})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	rootID, err := av2.UpsertRootDomain(UpsertRootDomainReq{Domain: "lca-test.io"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mk("alpha.lca-test.io")
+	mk("beta.lca-test.io")
+	svcID, err := av2.UpsertHTTPService(UpsertHTTPServiceReq{URL: "https://gamma.lca-test.io:9443/app"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 服务名默认从 URL 提取不出独立词,手动给一个可搜索的词,锁住 service_name 匹配分支。
+	if _, err := d.Exec(`UPDATE assets SET service_name = 'lca-unique-svc' WHERE id = $1`, svcID); err != nil {
+		t.Fatal(err)
+	}
+	_ = rootID
+
+	base, totalBase, counts, err := av2.ListCompanyAssets(companyID, "", "", 50, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// UpsertHTTPService 会连带建子域名/根域名链,行数只增不减,所以全部按 >= 断言。
+	if totalBase < 4 || len(base) < 4 {
+		t.Fatalf("ListCompanyAssets base: total=%d len=%d, want >= 4", totalBase, len(base))
+	}
+	if counts["root_domain"] < 1 || counts["subdomain"] < 3 {
+		t.Fatalf("counts = %v, want root_domain>=1 subdomain>=3", counts)
+	}
+
+	// 铁律①:type 过滤改变 total,但不改变 counts(否则选中一类后其他页签归零)。
+	if _, totalTyp, countsTyp, err := av2.ListCompanyAssets(companyID, "subdomain", "", 50, 0); err != nil {
+		t.Fatal(err)
+	} else if totalTyp != counts["subdomain"] {
+		t.Fatalf("type=subdomain total=%d, want %d", totalTyp, counts["subdomain"])
+	} else if countsTyp["root_domain"] < 1 {
+		t.Fatalf("type 过滤后 counts 丢了 root_domain: %v", countsTyp)
+	}
+
+	// 铁律②:kw 过滤同样不改变 counts;q 按资产值命中。
+	if _, totalQ, countsQ, err := av2.ListCompanyAssets(companyID, "", "beta.lca-test.io", 50, 0); err != nil {
+		t.Fatal(err)
+	} else if totalQ < 1 {
+		t.Fatalf("q=beta.lca-test.io total=%d, want >= 1", totalQ)
+	} else if countsQ["subdomain"] != counts["subdomain"] {
+		t.Fatalf("kw 过滤改变了 counts: %v != %v", countsQ, counts)
+	}
+
+	// q 按服务名命中。
+	if _, totalSvc, _, err := av2.ListCompanyAssets(companyID, "", "lca-unique-svc", 50, 0); err != nil {
+		t.Fatal(err)
+	} else if totalSvc < 1 {
+		t.Fatalf("q=service_name total=%d, want >= 1", totalSvc)
+	}
+
+	// 分页:翻页无重复、越界页为空。
+	seen := map[int64]bool{}
+	for offset := 0; offset < totalBase; offset += 2 {
+		page, _, _, err := av2.ListCompanyAssets(companyID, "", "", 2, offset)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page) > 2 {
+			t.Fatalf("limit=2 got %d rows", len(page))
+		}
+		for _, a := range page {
+			if seen[a.ID] {
+				t.Fatalf("asset %d returned twice", a.ID)
+			}
+			seen[a.ID] = true
+		}
+	}
+	if len(seen) != totalBase {
+		t.Fatalf("paged through %d assets, want %d", len(seen), totalBase)
+	}
+	if beyond, totalBeyond, _, err := av2.ListCompanyAssets(companyID, "", "", 2, totalBase+10); err != nil {
+		t.Fatal(err)
+	} else if len(beyond) != 0 || totalBeyond != totalBase {
+		t.Fatalf("offset beyond end: rows=%d total=%d, want 0/%d", len(beyond), totalBeyond, totalBase)
+	}
+}
