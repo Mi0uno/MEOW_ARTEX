@@ -26,6 +26,7 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectVa
 import { Skeleton } from "@/components/ui/skeleton";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { api } from "@/lib/api";
+import { extractScriptSections } from "@/lib/approval-script";
 import type {
   InterceptApprovalFilter,
   InterceptApprovalRow,
@@ -54,6 +55,9 @@ function source(row: InterceptApprovalRow) {
 }
 
 function originLabel(row: InterceptApprovalRow) {
+  // 审批台行经 LEFT JOIN 带出任务名时优先显示任务名，而不是裸编号
+  // （契约 APPROVAL_CONSOLE_CONTRACTS §2/§4.6）。
+  if (row.task_name) return row.task_name;
   if (row.task_id) return row.task_id;
   if (row.conversation_id) return `对话 #${row.conversation_id}`;
   return "—";
@@ -61,7 +65,7 @@ function originLabel(row: InterceptApprovalRow) {
 
 function ApprovalOrigin({ row, detail = false }: { row: InterceptApprovalRow; detail?: boolean }) {
   const [locating, setLocating] = React.useState(false);
-  const label = detail && row.task_id ? `任务 ${row.task_id}` : originLabel(row);
+  const label = detail && row.task_id ? row.task_name || `任务 ${row.task_id}` : originLabel(row);
   const query = new URLSearchParams({ approval: String(row.id) });
   let href: string | undefined;
   if (row.conversation_id) {
@@ -361,7 +365,9 @@ export function ApprovalDetail({
   // execution_status='awaiting_result'),直接复用 executionLabels 会显示成
   // "已允许，等待执行结果",读起来像用户批准过;这里改成判疑口径。
   if (flagged && audit?.execution_status === "awaiting_result") execution = "已判疑放通，等待执行结果";
-  const command = typeof row.tool_input?.command === "string" ? row.tool_input.command : undefined;
+  // 脚本提取不止 command 一个键（契约 APPROVAL_CONSOLE_CONTRACTS §5）；helper 对
+  // 任意 tool_input 形态安全（非对象返回空数组），与下方 Collapsible 的展示条件一致。
+  const scriptSections = extractScriptSections(row.tool_name, row.tool_input);
   let initialLabel = source(row) === "model" ? "模型初判" : "规则初判";
   if (audit?.model_fallback) initialLabel = "模型异常回退";
 
@@ -373,16 +379,18 @@ export function ApprovalDetail({
             label={`${current.agent_name || current.conv_agent_key || "Agent"} · 工具请求`}
             text={JSON.stringify(row.tool_input ?? {}, null, 2)}
           />
-          {command ? (
+          {scriptSections.length ? (
             <Collapsible>
               <CollapsibleTrigger asChild>
                 <Button variant="ghost" size="sm">
                   <ChevronDownIcon data-icon="inline-start" />
-                  查看命令内容
+                  查看脚本内容（{scriptSections.length} 段）
                 </Button>
               </CollapsibleTrigger>
-              <CollapsibleContent className="pt-2">
-                <CodeBlock label="命令内容" text={command} />
+              <CollapsibleContent className="flex min-w-0 flex-col gap-3 pt-2">
+                {scriptSections.map((section) => (
+                  <CodeBlock key={section.label} label={section.label} text={section.text} />
+                ))}
               </CollapsibleContent>
             </Collapsible>
           ) : null}

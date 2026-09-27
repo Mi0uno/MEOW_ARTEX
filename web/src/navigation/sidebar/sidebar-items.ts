@@ -138,7 +138,7 @@ export const sidebarItems: NavGroup[] = [
           { id: "intercept", title: "拦截规则", url: "/system/intercept", icon: ShieldAlert },
           // AI监管 = 操作审查 AI 流水线(决策引擎 + 监管模型)编排,从拦截规则独立出来。
           { id: "ai-guard", title: "AI监管", url: "/system/ai-guard", icon: Bot },
-          { id: "approvals", title: "审批记录", url: "/system/intercept/approvals", icon: ClipboardList },
+          { id: "approvals", title: "审批台", url: "/system/intercept/approvals", icon: ClipboardList },
           { id: "traffic", title: "流量", url: "/function/traffic", icon: Activity },
           { id: "logs", title: "日志", url: "/system/logs", icon: ScrollText },
         ],
@@ -152,6 +152,8 @@ export const sidebarItems: NavGroup[] = [
           { id: "proxy-dashboard", title: "流量与调度", url: "/function/proxy", icon: Activity },
           // 代理池 = 代理组列表(网络流量核心);进入组后接入代理池 API、搜集在野代理、自动测活。
           { id: "proxy-groups", title: "代理池", url: "/function/proxy/groups", icon: Network },
+          // 调度规则 = 各组调度策略与自动升降级规则的控制页(高质量代理自动提优先级)。
+          { id: "proxy-schedule", title: "调度规则", url: "/function/proxy/schedule", icon: SlidersHorizontal },
         ],
       },
       {

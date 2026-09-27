@@ -55,7 +55,8 @@ func (d *DB) GetInterceptDetail(id int64) (*InterceptDetail, error) {
 	err := d.QueryRow(approvalRowSelectWithAudit+` WHERE ip.id=$1`, id).Scan(
 		&out.ID, &out.RuleID, &out.ConversationID, &out.TaskID, &out.AgentName,
 		&out.ToolName, &out.ToolInput, &out.Status, &out.Reason, &out.DecidedAt, &out.CreatedAt,
-		&out.DecisionSource, &out.ConvTitle, &out.ConvAgentKey, &out.RuleName, &raw,
+		&out.DecisionSource, &out.ConvTitle, &out.ConvAgentKey, &out.RuleName,
+		&out.TaskName, &out.TaskStage, &out.TaskKind, &out.TaskSrc, &raw,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil

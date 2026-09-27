@@ -232,6 +232,12 @@ type InterceptApprovalRow struct {
 	ConvTitle    string `json:"conv_title"`
 	ConvAgentKey string `json:"conv_agent_key"`
 	RuleName     string `json:"rule_name"`
+	// 审批台扩展(APPROVAL_CONSOLE_CONTRACTS §2):LEFT JOIN tasks 带出的任务来源
+	// 四元组。task_name 为 "" 表示无关联任务或任务已删;task_src 是 tasks.src_mode。
+	TaskName  string `json:"task_name"`
+	TaskStage string `json:"task_stage"`
+	TaskKind  string `json:"task_kind"`
+	TaskSrc   bool   `json:"task_src"`
 }
 
 func scanInterceptApprovalRow(rows interface{ Scan(...any) error }, r *InterceptApprovalRow) error {
@@ -239,6 +245,7 @@ func scanInterceptApprovalRow(rows interface{ Scan(...any) error }, r *Intercept
 		&r.ID, &r.RuleID, &r.ConversationID, &r.TaskID, &r.AgentName,
 		&r.ToolName, &r.ToolInput, &r.Status, &r.Reason, &r.DecidedAt, &r.CreatedAt,
 		&r.DecisionSource, &r.ConvTitle, &r.ConvAgentKey, &r.RuleName,
+		&r.TaskName, &r.TaskStage, &r.TaskKind, &r.TaskSrc,
 	)
 }
 
@@ -251,12 +258,17 @@ const approvalRowColumns = `ip.id, ip.rule_id, ip.conversation_id, ip.task_id, i
        ip.tool_name, ip.tool_input, ip.status, ip.reason, ip.decided_at, ip.created_at, ` + approvalDecisionSource + `,
        COALESCE(c.title,'') AS conv_title,
        COALESCE(c.agent_key,'') AS conv_agent_key,
-       COALESCE(ir.name,'') AS rule_name`
+       COALESCE(ir.name,'') AS rule_name,
+       COALESCE(t.name,'') AS task_name,
+       COALESCE(t.stage,'') AS task_stage,
+       COALESCE(t.kind,'') AS task_kind,
+       COALESCE(t.src_mode,false) AS task_src`
 
 const approvalRowJoins = `
 FROM intercept_pending ip
 LEFT JOIN conversations c ON c.id = ip.conversation_id
-LEFT JOIN intercept_rules ir ON ir.id = ip.rule_id`
+LEFT JOIN intercept_rules ir ON ir.id = ip.rule_id
+LEFT JOIN tasks t ON t.id::text = ip.task_id`
 
 const approvalRowSelect = `SELECT ` + approvalRowColumns + approvalRowJoins
 const approvalRowSelectWithAudit = `SELECT ` + approvalRowColumns + `, ip.audit` + approvalRowJoins
@@ -306,10 +318,15 @@ func (d *DB) ListAllIntercepts(limit int) ([]InterceptApprovalRow, error) {
 }
 
 // InterceptApprovalFilter combines exact status and decision-source filters.
-// Empty fields include all values.
+// Empty fields include all values. Q/TaskID/Tool 是审批台扩展(APPROVAL_CONSOLE_
+// CONTRACTS §2):Q 模糊搜索 tool_name/reason/任务名/会话标题/tool_input 原文,
+// TaskID 与 Tool 是精确匹配。
 type InterceptApprovalFilter struct {
 	Status         string
 	DecisionSource string
+	Q              string
+	TaskID         string
+	Tool           string
 }
 
 // ListAllInterceptsPage returns one 1-based page and the total matching count.
@@ -395,34 +412,14 @@ func (d *DB) CountInterceptPendingByStatus() (map[string]int, error) {
 }
 
 func (d *DB) listInterceptsPage(taskID string, page, size int, filter InterceptApprovalFilter) ([]InterceptApprovalRow, int, error) {
-	if page < 1 {
-		page = 1
-	}
-	if size <= 0 {
-		size = 20
-	}
-	if size > 100 {
-		size = 100
-	}
+	page, size = clampInterceptPage(page, size)
 	offset := (page - 1) * size
 
-	conditions := []string{}
-	args := []any{}
-	add := func(column, value string) {
-		if value != "" {
-			args = append(args, value)
-			conditions = append(conditions, column+"=$"+fmt.Sprint(len(args)))
-		}
-	}
-	add("ip.task_id", taskID)
-	add("ip.status", filter.Status)
-	add(approvalDecisionSource, filter.DecisionSource)
-	where := ""
-	if len(conditions) > 0 {
-		where = " WHERE " + strings.Join(conditions, " AND ")
-	}
+	where, args := interceptApprovalConds(taskID, filter, true, true)
+	// 计数与 Q 搜索共用带 c/t JOIN 的 FROM:Q 会搜任务名与会话标题。两个 JOIN
+	// 都是 PK 对一,不放大行数,旧调用(新筛选项全空)的 total 与之前完全一致。
 	var total int
-	if err := d.QueryRow("SELECT COUNT(*) FROM intercept_pending ip"+where, args...).Scan(&total); err != nil {
+	if err := d.QueryRow("SELECT COUNT(*)"+approvalCountFrom+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 

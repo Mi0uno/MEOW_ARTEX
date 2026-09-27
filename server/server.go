@@ -1121,6 +1121,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/intercept/history/{id}", s.interceptDetail)
 	mux.HandleFunc("GET /api/intercept/history/{id}/execution", s.interceptExecution)
 	mux.HandleFunc("GET /api/intercept/task/{taskID}", s.interceptListTaskItems)
+	mux.HandleFunc("GET /api/intercept/console", s.interceptConsole)
 	mux.HandleFunc("GET /api/intercept/tool-config", s.interceptGetToolConfig)
 	mux.HandleFunc("PUT /api/intercept/tool-config", s.interceptSetToolConfig)
 	mux.HandleFunc("GET /api/intercept/judge", s.interceptGetJudgeConfig)
