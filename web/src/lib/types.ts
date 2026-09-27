@@ -1115,14 +1115,39 @@ export interface TaskGoal {
   ts: string;
 }
 
-// 约束管理卡片用的操作约束(allow=允许 / deny=禁止)。
-export type ConstraintKind = "allow" | "deny";
+// 约束管理卡片用的操作约束(allow=允许 / deny=禁止 / note=背景参考)。
+// note 不构成操作边界,仅在规范合规审查时作为上下文(评分/奖励标准等)。
+export type ConstraintKind = "allow" | "deny" | "note";
 export interface TaskConstraint {
   id: string;
   kind: ConstraintKind;
   text: string;
   origin?: string;
   ts?: string;
+}
+
+// 规范合规审查统计(decision 模型逐操作对照约束的裁决计数)。
+export interface ComplianceStats {
+  checked: number;
+  allowed: number;
+  denied: number;
+  flagged: number;
+  asked: number;
+  errors: number;
+}
+
+// 规范合规审查单条记录;violated 是被违反约束的 task_constraints.id(字符串形式)。
+export interface ComplianceEntry {
+  id: number;
+  ts?: string;
+  tool: string;
+  agent: string;
+  source: "hook" | "tool"; // hook=拦截链自动审 | tool=check_compliance 主动自查
+  decision: "allow" | "deny" | "ask" | "flag" | "error";
+  confidence: number;
+  violated: string[];
+  reason: string;
+  args_preview: string;
 }
 
 // 创建任务时随任务一起写入的操作约束(建任务表单「AI 识别拆分」与手填共用)。
@@ -1636,13 +1661,28 @@ export interface Settings {
 
 // ---- 代理中心 ----
 // 代理组:调度的单位,承载策略、监听端口与测活参数。
+
+/** 组级调度规则(存 proxy_groups.sched_rules):测活/调度结果驱动的自动升降级。 */
+export interface ProxySchedRules {
+  /** 自动升降级开关:连续存活到阈值自动提优先级,失败自动降 */
+  auto_boost: boolean;
+  /** 每连续存活 N 次提升一级(默认 5) */
+  boost_every: number;
+  /** 每次提升的优先级增量(默认 1) */
+  boost_step: number;
+  /** 自动提升的优先级上限(默认 50;手动置顶不受此限) */
+  boost_cap: number;
+  /** 每次测活/调度失败的降级量(默认 2;0=不降) */
+  demote_on_fail: number;
+}
+
 export interface ProxyGroup {
   id: number;
   name: string;
   /** manual(纯手工) / api(接入代理池 API) / wild(全网在野搜集) / mixed(混合) */
   kind: "manual" | "api" | "wild" | "mixed" | string;
-  /** round_robin / random / least_latency / failover */
-  strategy: "round_robin" | "random" | "least_latency" | "failover" | string;
+  /** round_robin / random / least_latency / failover / quality(质量加权) */
+  strategy: "round_robin" | "random" | "least_latency" | "failover" | "quality" | string;
   /** 本地代理池监听端口;0=启用时自动分配 */
   listen_port: number;
   enabled: boolean;
@@ -1653,6 +1693,8 @@ export interface ProxyGroup {
   max_failures: number;
   concurrency: number;
   remark: string;
+  /** 组级调度规则(自动升降级) */
+  sched_rules: ProxySchedRules;
   created_at: string;
   updated_at: string;
   // 派生计数(列表页展示)
@@ -1694,8 +1736,20 @@ export interface ProxyEntry {
   exit_ip: string;
   /** 累计被调度次数 */
   use_count: number;
+  /** 调度优先级(越大越优先;手动置顶与自动升降级共用) */
+  priority: number;
+  /** 连续测活/调度成功次数(一次失败清零) */
+  streak: number;
   created_at: string;
   updated_at: string;
+}
+
+/** 调度规则总览里的单组视图:组字段 + 提升级代理样本。 */
+export interface ProxyScheduleGroup extends ProxyGroup {
+  /** 优先级 > 0 的代理数(已提升/置顶) */
+  boosted_count: number;
+  /** 按优先级排序的前几条代理(alive 优先) */
+  top: ProxyEntry[];
 }
 
 /** 挂在组上的一个代理池 API 接入配置。 */
@@ -2198,16 +2252,52 @@ export interface JudgeConfig {
   ask_timeout_action: "allow" | "deny"; // 审批超时后的默认动作
 }
 
+// 审批台（契约 APPROVAL_CONSOLE_CONTRACTS §3）：q/task_id/tool 为审批台新增筛选，
+// 旧端点（/intercept/history 等）同样接受并生效。
 export interface InterceptApprovalFilter {
   status?: InterceptPending["status"];
   decision_source?: "rule" | "model" | "unknown";
+  q?: string; // 搜索：工具名/理由/任务名/会话标题/tool_input 原文（含脚本）
+  task_id?: string; // 任务来源精确过滤
+  tool?: string; // 工具名精确过滤
 }
 
 // InterceptApprovalRow enriches InterceptPending with conversation/task and rule context.
+// task_* 四字段仅审批台/分页端点恒返回（LEFT JOIN tasks）；/intercept/pending 裸端点
+// 不带——所以是可选的，消费方渲染时按空兜底（契约 APPROVAL_CONSOLE_CONTRACTS §2/§3）。
 export interface InterceptApprovalRow extends InterceptPending {
   conv_title: string; // "" if no linked conversation
   conv_agent_key: string; // "" if no linked conversation
   rule_name: string; // "" if rule was deleted
+  task_name?: string; // 关联任务名；""/undefined=无关联任务或任务已删
+  task_stage?: string; // ""|recon|exploit|post|report
+  task_kind?: string; // tasks.kind（agent/recon/...）
+  task_src?: boolean; // tasks.src_mode
+}
+
+// 审批台分类页签计数（五档恒全量返回，缺失档=0）。
+export interface InterceptConsoleCounts {
+  pending: number;
+  allowed: number;
+  denied: number;
+  timeout: number;
+  flagged: number;
+}
+
+// 审批台工具筛选下拉的一行（GROUP BY tool_name，最多 50，按 count 降序）。
+export interface InterceptToolCount {
+  tool: string;
+  count: number;
+}
+
+// GET /api/intercept/console 的响应体（契约 APPROVAL_CONSOLE_CONTRACTS §1）。
+export interface InterceptConsolePage {
+  items: InterceptApprovalRow[];
+  total: number;
+  page: number;
+  page_size: number;
+  counts: InterceptConsoleCounts;
+  tools: InterceptToolCount[];
 }
 
 // ── 资产同步 (ScopeSentry 数据源) ──────────────────────────────────────────────

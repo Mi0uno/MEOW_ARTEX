@@ -21,6 +21,8 @@ import type {
   ChatAttachment,
   CollectorRun,
   CommandRecord,
+  ComplianceEntry,
+  ComplianceStats,
   Company,
   CompanyScopeMutation,
   CompanyScopeRule,
@@ -55,6 +57,7 @@ import type {
   IntentAsset,
   InterceptApprovalFilter,
   InterceptApprovalRow,
+  InterceptConsolePage,
   InterceptDetail,
   InterceptPending,
   InterceptRule,
@@ -122,6 +125,8 @@ import type {
   ProxyEgressStatus,
   ProxyEntry,
   ProxyGroup,
+  ProxyScheduleGroup,
+  ProxySchedRules,
   ProxyProviderDef,
   ProxyRequest,
   ProxySource,
@@ -373,6 +378,10 @@ function interceptPageQuery(page: number, size: number, filter: InterceptApprova
   const query = new URLSearchParams({ page: String(page), size: String(size) });
   if (filter.status) query.set("status", filter.status);
   if (filter.decision_source) query.set("decision_source", filter.decision_source);
+  // 审批台新增三筛选（契约 APPROVAL_CONSOLE_CONTRACTS §3）。
+  if (filter.q) query.set("q", filter.q);
+  if (filter.task_id) query.set("task_id", filter.task_id);
+  if (filter.tool) query.set("tool", filter.tool);
   return query.toString();
 }
 
@@ -722,6 +731,13 @@ export const api = {
   // 删除约束。
   deleteConstraint: (id: string, constraintId: string) =>
     del<{ ok: boolean }>(`/tasks/${id}/constraints/${constraintId}`),
+
+  // ---- 规范合规审查（总览）----
+  // decision 模型逐操作对照约束的审查统计与分页记录（id DESC；?limit= 默认 20 上限 200、?offset=）。
+  taskCompliance: (id: string, limit = 20, offset = 0) =>
+    get<{ enabled: boolean; stats: ComplianceStats; total: number; entries: ComplianceEntry[] | null }>(
+      `/tasks/${id}/compliance?limit=${limit}&offset=${offset}`,
+    ).then((response) => ({ ...response, entries: arr(response.entries) })),
 
   // 本任务测试范围列表（含继承自来源任务的范围）。
   taskScope: (id: string) => get<{ scope: TaskScopeRow[] }>(`/tasks/${id}/scope`),
@@ -2053,6 +2069,9 @@ export const api = {
       items: arr(r.items),
       total: r.total ?? r.items?.length ?? 0,
     })),
+  // 审批台专用端点（契约 APPROVAL_CONSOLE_CONTRACTS §1）：分页 + 分类计数 + 工具清单一次带回。
+  interceptConsole: (page = 1, size = 20, filter: InterceptApprovalFilter = {}) =>
+    get<InterceptConsolePage>(`/intercept/console?${interceptPageQuery(page, size, filter)}`),
 
   // ---- intercept tool-config (全局工具拦截范围) ----
   interceptGetToolConfig: async (): Promise<{ enabled_tools: string[] }> => {
@@ -2180,6 +2199,17 @@ export const api = {
   updateProxyGroup: (id: number, input: Partial<ProxyGroup>) =>
     put<{ group: ProxyGroup }>(`/proxy/groups/${id}`, input),
   deleteProxyGroup: (id: number) => del<{ deleted: boolean }>(`/proxy/groups/${id}`),
+  // 调度规则总览:各组的策略/调度规则/已提升数 + 优先级最高的代理样本。
+  proxySchedule: () =>
+    get<{ groups: ProxyScheduleGroup[] }>(`/proxy/schedule`).then((r) => ({
+      groups: arr(r.groups),
+    })),
+  // 更新组级调度规则(自动升降级参数),返回更新后的组。
+  updateProxySchedRules: (id: number, rules: Partial<ProxySchedRules>) =>
+    put<{ group: ProxyGroup }>(`/proxy/groups/${id}/sched-rules`, rules).then((r) => r.group),
+  // 手动调整单条代理的调度优先级(置顶/提升/降低/归零都走它)。
+  updateProxyPriority: (id: number, priority: number) =>
+    put<{ ok: boolean }>(`/proxy/${id}/priority`, { priority }),
   // 组内代理列表(分页 + 状态/来源/协议/地区筛选 + 搜索)，counts 是各状态总数。
   proxyEntries: (
     groupId: number,
