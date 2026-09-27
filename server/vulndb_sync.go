@@ -616,8 +616,12 @@ func (v *vulnSync) syncExploitDB(ctx context.Context) (pocs int, err error) {
 	return pocs, nil
 }
 
-// syncGitHubPoCs 为近期高危 CVE 在 GitHub 搜 PoC 仓库。
-// GitHub 未认证搜索限速 10 次/分钟,故只对少量最新 critical/high CVE 抽样。
+// syncGitHubPoCs 为无 PoC 条目在 GitHub 搜 PoC 仓库。
+// GitHub 未认证搜索限速 10 次/分钟,队列条数受 settings
+// vulndb_poc_hunt_github_limit 控制(默认 120;无 token 夹回 ≤10 防匿名限流炸)。
+// 采样队列与 trickest 同款三优先级(POC_INTEL_CONTRACTS.md §5.4):
+// KEV 无 PoC → critical/high 无 PoC → 最新无 PoC,保证配额先花在
+// 「确定被人打过」与「严重度最高」的条目上,而不是被最新空壳 CVE 占掉。
 func (v *vulnSync) syncGitHubPoCs(ctx context.Context) (pocs int, err error) {
 	runID, err := v.s.m.PG().StartVulnSyncRun("github_poc")
 	if err != nil {
@@ -632,31 +636,25 @@ func (v *vulnSync) syncGitHubPoCs(ctx context.Context) (pocs int, err error) {
 		_ = v.s.m.PG().FinishVulnSyncRun(runID, status, 0, 0, 0, pocs, errMsg)
 	}()
 
-	// 定向取「最新且还没有 PoC」的条目(无 token 时最多 5 条避免触发 GitHub 限速;
-	// 配置了 vulndb_github_token 则放大到 60 条,搜索配额 30 次/分钟)。
-	// 按 created 倒序 = 最新发布的优先;HasPoc="0" 保证配额花在没有 PoC 的条目上,
-	// 而不是被「最近刚被其它源更新过」的条目占掉(2026-09-26 用户报「最新 CVE 都没 PoC」)。
 	token := ""
 	if val, _, err := v.s.m.PG().GetSetting(settingVulnGitHubToken); err == nil {
 		token = strings.TrimSpace(val)
 	}
-	sample := 5
-	if token != "" {
-		sample = 60
+	limit := vulnPocHuntGHLimitSetting(v.s.m.PG())
+	if token == "" && limit > 10 {
+		// 无 token:匿名搜索 10 次/分钟,队列夹回 ≤10(配额就是每轮这几次,
+		// 优先级靠队列序保证:KEV → critical → high → 最新)。
+		limit = 10
 	}
-	items, _, _, err := v.s.m.PG().ListVulnEntries(db.VulnEntryFilter{
-		Category: db.VulnCategoryCVE, HasPoc: "0", Sort: "created", Limit: sample,
-	})
-	if err != nil {
-		return 0, err
-	}
+	items := v.vulnPocHuntQueue(limit)
+
 	ctx, cancel := context.WithTimeout(ctx, vulnSyncTimeout)
 	defer cancel()
 	for _, e := range items {
 		if e.CVEID == "" {
 			continue
 		}
-		// 已有 PoC 的跳过,省配额。
+		// 队列构建后其它源可能已挂上 PoC:复查省配额。
 		if e.PocCount > 0 {
 			continue
 		}
@@ -679,6 +677,11 @@ func (v *vulnSync) syncGitHubPoCs(ctx context.Context) (pocs int, err error) {
 			headers["Authorization"] = "Bearer " + token
 		}
 		if err := fetchJSON(ctx, api, headers, &result); err != nil {
+			msg := err.Error()
+			if strings.HasSuffix(msg, "HTTP 401") || strings.HasSuffix(msg, "HTTP 403") {
+				// token 失效/无权限:后续请求必然同样失败,快速失败保住剩余配额。
+				return pocs, fmt.Errorf("GitHub 搜索鉴权失败(%s),中止本轮: %w", msg, err)
+			}
 			log.Printf("[vulndb-sync] GitHub PoC 搜索 %s 失败: %v", e.CVEID, err)
 			continue
 		}
@@ -696,6 +699,9 @@ func (v *vulnSync) syncGitHubPoCs(ctx context.Context) (pocs int, err error) {
 			}
 		}
 	}
+	// 存量 content 为空的 github 源 PoC 补抓 README(每轮 cap 20 条防超时,
+	// 契约 §5.6;失败只记日志不影响本轮)。
+	v.pocReadmeBackfillBatch(ctx)
 	return pocs, nil
 }
 
