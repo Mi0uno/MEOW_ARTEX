@@ -25,6 +25,39 @@ import (
 	"time"
 )
 
+// SchedRules 是组级调度规则(与 db.SchedRules 镜像;包边界:本包不 import db)。
+//
+// 语义:alive 且连续成功每满 boost_every 次 → priority + boost_step(封顶 boost_cap);
+// 失败一次 → streak 清零,priority - demote_on_fail(下限 0,0 = 不降级)。
+type SchedRules struct {
+	AutoBoost    bool
+	BoostEvery   int
+	BoostStep    int
+	BoostCap     int
+	DemoteOnFail int
+}
+
+// NormalizeSchedRules 填默认值并钳位(默认值与 db 侧保持一致,两处必须成对改)。
+// 零值视为「未配置」,给全套默认(含 AutoBoost=true);任一字段非零则尊重存储值只钳位。
+func NormalizeSchedRules(r *SchedRules) {
+	if *r == (SchedRules{}) {
+		*r = SchedRules{AutoBoost: true, BoostEvery: 5, BoostStep: 1, BoostCap: 50, DemoteOnFail: 2}
+		return
+	}
+	if r.BoostEvery < 1 || r.BoostEvery > 200 {
+		r.BoostEvery = 5
+	}
+	if r.BoostStep < 1 || r.BoostStep > 50 {
+		r.BoostStep = 1
+	}
+	if r.BoostCap < 1 || r.BoostCap > 1000 {
+		r.BoostCap = 50
+	}
+	if r.DemoteOnFail < 0 || r.DemoteOnFail > 100 {
+		r.DemoteOnFail = 2
+	}
+}
+
 // Group 是 Manager 视角下的一个代理组配置(与 db.ProxyGroup 同形,避免本包依赖 db)。
 type Group struct {
 	ID                   int64
@@ -39,6 +72,8 @@ type Group struct {
 	TimeoutMs            int
 	MaxFailures          int
 	Concurrency          int
+	// Rules 是组级调度规则,测活/调度失败回写时透传给 Store.ApplyCheck。
+	Rules SchedRules
 }
 
 // SourceConfig 是 Manager 视角下的一个源站配置(含明文凭据,仅在进程内传递)。
@@ -64,8 +99,9 @@ type Store interface {
 	ListCandidates(groupID int64) ([]Candidate, error)
 	// ListTargets 取某组待测活的代理(statuses 为空=全部)。
 	ListTargets(groupID int64, statuses []string) ([]CheckTarget, error)
-	// ApplyCheck 回写一条测活结果。
-	ApplyCheck(groupID int64, out CheckOutcome, maxFailures int) error
+	// ApplyCheck 回写一条测活结果。rules 是组级调度规则(自动升降级参数),
+	// 由调用方从 Group 透传,持久化侧据此更新 priority/streak。
+	ApplyCheck(groupID int64, out CheckOutcome, maxFailures int, rules SchedRules) error
 	// RecordRequest 写一条出网流水。
 	RecordRequest(rec RequestRecord) error
 	// BumpUse 累加代理被调度次数。
@@ -315,7 +351,8 @@ func (m *Manager) EnsurePool(groupID int64) error {
 		OnProxyFailure: func(proxyID int64) {
 			// 调度路径上的失败也计入失败次数,让「能连上但出不了网」的代理
 			// 也会被降级(否则只靠测活发现不了这类代理)。
-			_ = m.store.ApplyCheck(g.ID, CheckOutcome{ProxyID: proxyID, Err: "调度出网失败"}, g.MaxFailures)
+			// rules 取组配置当前值:监听器重建(改组配置)时闭包随之刷新。
+			_ = m.store.ApplyCheck(g.ID, CheckOutcome{ProxyID: proxyID, Err: "调度出网失败"}, g.MaxFailures, g.Rules)
 		},
 	})
 	if err := pool.Start(m.ctx); err != nil {
@@ -523,7 +560,7 @@ func (m *Manager) runCheck(runID int64, g Group, targets []CheckTarget) {
 	// 这里刚拿到真实出口 IP,顺手解析地区,用户不必再手动点一次。
 	seenExit := map[string]bool{}
 	checker.Check(m.ctx, targets, func(out CheckOutcome) {
-		if err := m.store.ApplyCheck(g.ID, out, g.MaxFailures); err != nil {
+		if err := m.store.ApplyCheck(g.ID, out, g.MaxFailures, g.Rules); err != nil {
 			log.Printf("[proxy-center] 回写测活结果失败(#%d): %v", out.ProxyID, err)
 		}
 		if out.Alive && strings.TrimSpace(out.ExitIP) != "" {

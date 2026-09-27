@@ -69,6 +69,15 @@ type ProviderDef struct {
 	// Params 是该源支持的额外参数说明(展示用,不参与逻辑)。
 	Params []string `json:"params,omitempty"`
 
+	// UserAgent 覆盖 Fetch 的默认 bot UA。HTML 清单站普遍按 UA 拦截非浏览器
+	// (实测 proxy5.net 对 bot UA 直接 403),表格站必须伪装浏览器才有内容。
+	// json:"-":/api/proxy/providers 直接序列化 ProviderDef,多出来的可见字段
+	// 会破坏前端契约,wire 结构保持冻结。
+	UserAgent string `json:"-"`
+	// Headers 是附加请求头(如 Accept-Language),在 Fetch 默认头之后设置、可覆盖。
+	// 同样只存在于进程内,不进 wire。
+	Headers map[string]string `json:"-"`
+
 	// BuildURL 按凭据与参数拼出实际请求地址。
 	// 商业源需要把 key / 用户名密码 / 数量等拼进 query,公益源多数直接用 DefaultURL。
 	BuildURL func(p SourceAuth) string `json:"-"`
@@ -552,15 +561,100 @@ var providers = func() map[string]*ProviderDef {
 			Parse:   ParseTextLines,
 			Extract: linesExtract,
 		},
+		{
+			// Proxy5 的免费清单 API(页面版表格端口要登录才能看,API 版全量开放):
+			// JSON,字段是 ip_address/port/protocols 三元组,条目按协议过滤。
+			// 响应 ~9MB,会被 Fetch 的 8MB 上限截尾(实测约剩 95% 条目),可接受;
+			// 提取器用正则直扫文本而非 Unmarshal,对截断免疫(见 providers_html.go)。
+			// 页面用 bot UA 直接 403,必须带浏览器 UA。
+			Key: "proxy5_http", Title: "Proxy5 · HTTP", Kind: ProviderKindPublic,
+			Docs: "https://proxy5.net/api/free-proxies.php", Homepage: "https://proxy5.net/cn/free-proxy",
+			DefaultURL: "https://proxy5.net/api/free-proxies.php",
+			Protocol:   "http", Region: "全球",
+			UserAgent: chromeUA,
+			Headers:   browserHeaders(),
+			Parse:     ParseJSONObject,
+			Extract:   proxy5APIExtract("http"),
+			Params:    []string{"无参数;全量清单,已按 HTTP 协议过滤"},
+		},
+		{
+			Key: "proxy5_socks5", Title: "Proxy5 · SOCKS5", Kind: ProviderKindPublic,
+			Docs: "https://proxy5.net/api/free-proxies.php", Homepage: "https://proxy5.net/cn/free-proxy",
+			DefaultURL: "https://proxy5.net/api/free-proxies.php",
+			Protocol:   "socks5", Region: "全球",
+			UserAgent: chromeUA,
+			Headers:   browserHeaders(),
+			Parse:     ParseJSONObject,
+			Extract:   proxy5APIExtract("socks5"),
+			Params:    []string{"无参数;全量清单,已按 SOCKS5 协议过滤"},
+		},
+		{
+			// ProxySpace 的 txt 直排清单,零参数直出;清单里混有 0.0.0.0 一类占位行,
+			// 由 cleanHostPorts 的本地地址过滤兜掉。
+			Key: "proxyspace_http", Title: "ProxySpace · HTTP", Kind: ProviderKindPublic,
+			Docs: "https://proxyspace.pro/", Homepage: "https://proxyspace.pro/",
+			DefaultURL: "https://proxyspace.pro/http.txt",
+			Protocol:   "http", Region: "全球",
+			Parse:   ParseTextLines,
+			Extract: linesExtract,
+		},
+		{
+			Key: "proxyspace_socks5", Title: "ProxySpace · SOCKS5", Kind: ProviderKindPublic,
+			Docs: "https://proxyspace.pro/", Homepage: "https://proxyspace.pro/",
+			DefaultURL: "https://proxyspace.pro/socks5.txt",
+			Protocol:   "socks5", Region: "全球",
+			Parse:   ParseTextLines,
+			Extract: linesExtract,
+		},
+		{
+			// vakhov/fresh-proxy-list:定时跑验证脚本后落盘的清单,文件小但新鲜度高
+			// (只留验活的条目);https.txt 实测只有个位数条目,不值得单独开源。
+			Key: "vakhov_http", Title: "Vakhov Fresh List · HTTP", Kind: ProviderKindPublic,
+			Docs: "https://github.com/vakhov/fresh-proxy-list", Homepage: "https://github.com/vakhov/fresh-proxy-list",
+			DefaultURL: "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
+			Protocol:   "http", Region: "全球",
+			Parse:   ParseTextLines,
+			Extract: linesExtract,
+		},
+		{
+			// hideip.me 的仓库镜像:行格式是 ip:port:国家,正则取前两段即可;
+			// 清单只保留验活条目,量少(几十条)但相对可靠。
+			Key: "hideip_http", Title: "HideIP.me · HTTP", Kind: ProviderKindPublic,
+			Docs: "https://github.com/zloi-user/hideip.me", Homepage: "https://hideip.me/",
+			DefaultURL: "https://raw.githubusercontent.com/zloi-user/hideip.me/main/http.txt",
+			Protocol:   "http", Region: "全球",
+			Parse:   ParseTextLines,
+			Extract: linesExtract,
+		},
+		{
+			Key: "hideip_socks5", Title: "HideIP.me · SOCKS5", Kind: ProviderKindPublic,
+			Docs: "https://github.com/zloi-user/hideip.me", Homepage: "https://hideip.me/",
+			DefaultURL: "https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks5.txt",
+			Protocol:   "socks5", Region: "全球",
+			Parse:   ParseTextLines,
+			Extract: linesExtract,
+		},
+		{
+			// casals-ar/proxy-list:聚合型超大清单(~9MB/数十万行,多协议混编的 http 卷),
+			// 超过 8MB 读取上限会截尾,量极大不心疼;无验证,存活率低靠数量补。
+			Key: "casals_http", Title: "Casals Aggregate · HTTP", Kind: ProviderKindPublic,
+			Docs: "https://github.com/casals-ar/proxy-list", Homepage: "https://github.com/casals-ar/proxy-list",
+			DefaultURL: "https://raw.githubusercontent.com/casals-ar/proxy-list/main/http",
+			Protocol:   "http", Region: "全球",
+			Parse:   ParseTextLines,
+			Extract: linesExtract,
+		},
 
 		// ============ 全网在野代理搜集(公开清单站,HTML 抓取) ============
+		// 下面四家是同一引擎(hidemyarms 系)的服务端渲染表格:IP 一格、端口一格,
+		// 全文正则扫不到(两个值不相邻),必须走表格感知提取,否则常年 0 条。
 		{
 			Key: "free_proxy_list_net", Title: "free-proxy-list.net", Kind: ProviderKindWild,
 			Homepage:   "https://free-proxy-list.net/",
 			DefaultURL: "https://free-proxy-list.net/",
 			Protocol:   "http", Region: "全球",
 			Parse:   ParseHTML,
-			Extract: htmlExtract,
+			Extract: htmlTableExtract,
 		},
 		{
 			Key: "sslproxies", Title: "SSL Proxies", Kind: ProviderKindWild,
@@ -568,7 +662,7 @@ var providers = func() map[string]*ProviderDef {
 			DefaultURL: "https://www.sslproxies.org/",
 			Protocol:   "http", Region: "全球",
 			Parse:   ParseHTML,
-			Extract: htmlExtract,
+			Extract: htmlTableExtract,
 		},
 		{
 			Key: "us_proxy", Title: "US Proxy", Kind: ProviderKindWild,
@@ -576,8 +670,20 @@ var providers = func() map[string]*ProviderDef {
 			DefaultURL: "https://www.us-proxy.org/",
 			Protocol:   "http", Region: "美国",
 			Parse:   ParseHTML,
-			Extract: htmlExtract,
+			Extract: htmlTableExtract,
 		},
+		{
+			Key: "hidemy_name", Title: "HideMy.name Free", Kind: ProviderKindWild,
+			Homepage:   "https://hidemy.name/en/proxy-list/",
+			DefaultURL: "https://hidemy.name/en/proxy-list/",
+			Protocol:   "http", Region: "全球",
+			Parse:   ParseHTML,
+			Extract: htmlTableExtract, // 同 hidemyarms 引擎,IP/端口分列
+		},
+		// 以下几家保持全文正则,不换表格提取,原因:
+		//   proxy-list.org 把代理 Base64 编码后嵌表格,原文里根本没有明文 host;
+		//   spys.one 的端口列被 JS 按页面种子混淆,表格里取到的是假端口,
+		//   配出来也是错的——宁缺毋滥,不当有效数据源期待。
 		{
 			Key: "proxy_list_org", Title: "proxy-list.org", Kind: ProviderKindWild,
 			Homepage:   "https://proxy-list.org/english/index.php",
@@ -626,6 +732,35 @@ var providers = func() map[string]*ProviderDef {
 			Parse:   ParseTextLines,
 			Extract: linesExtract,
 		},
+		{
+			// 站大爷免费页:真实结构是 <li class="ul-cell"> 里 <p class="proxy_ip"> +
+			// <p class="proxy_port">(不是 table),表格感知提取器按 li 行配对。
+			// 已知限制:免费列表 20 条/页、分页到 /free/24/,这里只抓第一页;
+			// 部分出口 IP 会命中加速乐/EdgeOne 类 JS 挑战,拿到挑战页时行提取 0 条
+			// + fallback 全文扫描也 0 条,自然按「本轮无数据」处理,不会误报。
+			// bot UA 会被拦,必须带浏览器 UA + 中文 Accept-Language。
+			Key: "zdaye", Title: "站大爷 · 免费代理", Kind: ProviderKindWild,
+			Homepage: "https://www.zdaye.com/free/", Docs: "https://www.zdaye.com/free/",
+			DefaultURL: "https://www.zdaye.com/free/",
+			Protocol:   "http", Region: "国内",
+			UserAgent: chromeUA,
+			Headers:   browserHeaders(),
+			Parse:     ParseHTML,
+			Extract:   htmlTableExtract,
+		},
+		{
+			// 89ip 免费页:www.89ip.cn/tqdl.html 是服务端渲染的 ip:port<br> 直排
+			// (旧 API api.89ip.cn 已返回空体,弃用)。无表格行时 htmlTableExtract
+			// 自动退回全文正则,正好覆盖这种直排形态。带浏览器 UA 更稳。
+			Key: "ip89", Title: "89IP 免费代理", Kind: ProviderKindWild,
+			Homepage: "https://www.89ip.cn/", Docs: "https://www.89ip.cn/",
+			DefaultURL: "https://www.89ip.cn/tqdl.html?num=300",
+			Protocol:   "http", Region: "国内",
+			UserAgent: chromeUA,
+			Headers:   browserHeaders(),
+			Parse:     ParseHTML,
+			Extract:   htmlTableExtract,
+		},
 	}
 
 	m := make(map[string]*ProviderDef, len(defs))
@@ -670,6 +805,10 @@ func ProvidersByKind(kind ProviderKind) []*ProviderDef {
 	return out
 }
 
+// defaultFetchUA 是未配置 UserAgent 时的默认 bot UA:API 类源(公益池/商业池)
+// 不挑 UA,主动亮明身份也便于对方日志归因;HTML 清单站则应在源上配浏览器 UA。
+const defaultFetchUA = "Mozilla/5.0 (compatible; MEOWFUCK-ProxyCenter/1.0)"
+
 // Fetch 按源定义拉取代理清单。
 // 返回归一化后的 "host:port" 列表(协议由调用方按 def.Protocol 补全)。
 //
@@ -706,8 +845,17 @@ func (d *ProviderDef) Fetch(client *http.Client, auth SourceAuth, apiURLOverride
 	if err != nil {
 		return nil, fmt.Errorf("构造请求失败: %w", err)
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; MEOWFUCK-ProxyCenter/1.0)")
+	ua := d.UserAgent
+	if ua == "" {
+		ua = defaultFetchUA
+	}
+	req.Header.Set("User-Agent", ua)
 	req.Header.Set("Accept", "*/*")
+	// 源自带头最后设置:HTML 清单站用它换掉 Accept 默认值、补 Accept-Language,
+	// 让请求看起来像浏览器;同时保留用户在 Headers 里覆盖任意默认头的能力。
+	for k, v := range d.Headers {
+		req.Header.Set(k, v)
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("拉取失败: %w", err)

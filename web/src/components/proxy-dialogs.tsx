@@ -66,6 +66,7 @@ const STRATEGY_LABEL: Record<string, string> = {
   random: "随机",
   least_latency: "最低延迟优先",
   failover: "故障转移",
+  quality: "质量加权",
 };
 
 const SOURCE_LABEL: Record<string, string> = {
@@ -245,11 +246,13 @@ export function ProxyGroupDialog({
                     <SelectItem value="random">随机</SelectItem>
                     <SelectItem value="least_latency">最低延迟优先</SelectItem>
                     <SelectItem value="failover">故障转移</SelectItem>
+                    <SelectItem value="quality">质量加权</SelectItem>
                   </SelectGroup>
                 </SelectContent>
               </Select>
               <p className="text-muted-foreground text-xs">
-                轮询=按顺序依次取用;随机=每次随机挑一个;最低延迟优先=优先用最近测活延迟最低的;故障转移=当前可用就持续用,失败才切下一个
+                轮询=按顺序依次取用;随机=每次随机挑一个;最低延迟优先=优先用最近测活延迟最低的;故障转移=当前可用就持续用,失败才切下一个;质量加权=按权重随机:优先级×2
+                + 连续存活加成(封顶20) + 低延迟加成
               </p>
             </div>
             <div className="grid gap-1.5">

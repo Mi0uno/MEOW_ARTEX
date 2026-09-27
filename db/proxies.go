@@ -45,15 +45,68 @@ const (
 	ProxyStrategyRandom       = "random"
 	ProxyStrategyLeastLatency = "least_latency"
 	ProxyStrategyFailover     = "failover"
+	ProxyStrategyQuality      = "quality"
 )
 
 // ValidProxyStrategy 校验调度策略。
 func ValidProxyStrategy(s string) bool {
 	switch s {
-	case ProxyStrategyRoundRobin, ProxyStrategyRandom, ProxyStrategyLeastLatency, ProxyStrategyFailover:
+	case ProxyStrategyRoundRobin, ProxyStrategyRandom, ProxyStrategyLeastLatency, ProxyStrategyFailover,
+		ProxyStrategyQuality:
 		return true
 	}
 	return false
+}
+
+// ---- 调度规则 ----
+
+// SchedRules 是组级调度规则:测活结果如何自动升降代理优先级。
+//
+// 语义:alive 且连续成功每满 boost_every 次 → priority + boost_step(封顶 boost_cap);
+// 失败一次 → streak 清零,priority - demote_on_fail(下限 0,0 = 不降级)。
+type SchedRules struct {
+	AutoBoost    bool `json:"auto_boost"`
+	BoostEvery   int  `json:"boost_every"`
+	BoostStep    int  `json:"boost_step"`
+	BoostCap     int  `json:"boost_cap"`
+	DemoteOnFail int  `json:"demote_on_fail"`
+}
+
+// NormalizeSchedRules 填默认值并钳位。
+//
+// 库里存量行是 '{}',反序列化后全零——「整个结构体为零值」视为未配置,给全套
+// 默认值(含 AutoBoost=true,让老组开箱即有自动升降级);只要任一字段非零就视为
+// 用户显式配置过,尊重存储值只做范围钳位。UpdateSchedRules 落库前也走这里,
+// 所以「显式关掉 auto_boost」的行其余字段必是归一化后的非零值,不会被误判为零值行。
+func NormalizeSchedRules(r *SchedRules) {
+	if *r == (SchedRules{}) {
+		*r = SchedRules{AutoBoost: true, BoostEvery: 5, BoostStep: 1, BoostCap: 50, DemoteOnFail: 2}
+		return
+	}
+	if r.BoostEvery < 1 || r.BoostEvery > 200 {
+		r.BoostEvery = 5
+	}
+	if r.BoostStep < 1 || r.BoostStep > 50 {
+		r.BoostStep = 1
+	}
+	if r.BoostCap < 1 || r.BoostCap > 1000 {
+		r.BoostCap = 50
+	}
+	// 0 是合法值(显式关闭降级),只有越界才回默认。
+	if r.DemoteOnFail < 0 || r.DemoteOnFail > 100 {
+		r.DemoteOnFail = 2
+	}
+}
+
+// parseSchedRules 从 jsonb 列值还原 SchedRules 并归一化。
+// jsonb NOT NULL 不会返回 NULL,但对空/坏 JSON 保持钝感,别让一条脏数据炸掉整个列表查询。
+func parseSchedRules(raw []byte) SchedRules {
+	var r SchedRules
+	if len(raw) > 0 {
+		_ = json.Unmarshal(raw, &r)
+	}
+	NormalizeSchedRules(&r)
+	return r
 }
 
 const (
@@ -116,8 +169,10 @@ type ProxyGroup struct {
 	MaxFailures          int       `json:"max_failures"`
 	Concurrency          int       `json:"concurrency"`
 	Remark               string    `json:"remark"`
-	CreatedAt            time.Time `json:"created_at"`
-	UpdatedAt            time.Time `json:"updated_at"`
+	// Rules 是组级调度规则(sched_rules JSONB)。扫描侧已归一化,读出来永远是完整配置。
+	Rules     SchedRules `json:"sched_rules"`
+	CreatedAt time.Time  `json:"created_at"`
+	UpdatedAt time.Time  `json:"updated_at"`
 
 	// 派生计数(列表页展示,非表字段)。
 	ProxyCount  int `json:"proxy_count"`
@@ -128,7 +183,13 @@ type ProxyGroup struct {
 
 const proxyGroupCols = `g.id, g.name, g.kind, g.strategy, g.listen_port, g.enabled, g.auto_check,
 	g.check_interval_minutes, g.test_url, g.timeout_ms, g.max_failures, g.concurrency, g.remark,
-	g.created_at, g.updated_at`
+	g.sched_rules, g.created_at, g.updated_at`
+
+// 不带表别名的列清单,仅供 INSERT ... RETURNING 使用(RETURNING 处没有 FROM,带别名即 42P01)。
+// sched_rules 不在 INSERT 列清单里,RETURNING 返回的是 DEFAULT '{}'——列数与 Scan 目标数一致,合法。
+const proxyGroupColsBare = `id, name, kind, strategy, listen_port, enabled, auto_check,
+	check_interval_minutes, test_url, timeout_ms, max_failures, concurrency, remark,
+	sched_rules, created_at, updated_at`
 
 // proxyGroupCountCols 附带组内代理与源站计数(列表页一次查完,避免 N+1)。
 const proxyGroupCountCols = `,
@@ -139,15 +200,17 @@ const proxyGroupCountCols = `,
 
 func scanProxyGroup(sc interface{ Scan(...any) error }, withCounts bool) (*ProxyGroup, error) {
 	var g ProxyGroup
+	var rawRules []byte
 	dest := []any{&g.ID, &g.Name, &g.Kind, &g.Strategy, &g.ListenPort, &g.Enabled, &g.AutoCheck,
 		&g.CheckIntervalMinutes, &g.TestURL, &g.TimeoutMs, &g.MaxFailures, &g.Concurrency, &g.Remark,
-		&g.CreatedAt, &g.UpdatedAt}
+		&rawRules, &g.CreatedAt, &g.UpdatedAt}
 	if withCounts {
 		dest = append(dest, &g.ProxyCount, &g.AliveCount, &g.DeadCount, &g.SourceCount)
 	}
 	if err := sc.Scan(dest...); err != nil {
 		return nil, err
 	}
+	g.Rules = parseSchedRules(rawRules)
 	return &g, nil
 }
 
@@ -319,7 +382,7 @@ func (d *DB) CreateProxyGroup(in ProxyGroupInput) (*ProxyGroup, error) {
 INSERT INTO proxy_groups(name, kind, strategy, listen_port, enabled, auto_check, check_interval_minutes,
 	test_url, timeout_ms, max_failures, concurrency, remark)
 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-RETURNING `+proxyGroupCols,
+RETURNING `+proxyGroupColsBare,
 		in.Name, in.Kind, in.Strategy, in.ListenPort, in.Enabled, in.AutoCheck, in.CheckIntervalMinutes,
 		in.TestURL, in.TimeoutMs, in.MaxFailures, in.Concurrency, in.Remark), false)
 	if err != nil {
@@ -352,6 +415,18 @@ func (d *DB) DeleteProxyGroup(id int64) (bool, error) {
 	return n > 0, nil
 }
 
+// UpdateSchedRules 更新组级调度规则。落库前强制归一化:
+// 存量值永远是归一化后的完整配置,下次扫描才不会被误判成「未配置的零值行」。
+func (d *DB) UpdateSchedRules(id int64, r SchedRules) error {
+	NormalizeSchedRules(&r)
+	b, err := json.Marshal(r)
+	if err != nil {
+		return err
+	}
+	_, err = d.Exec(`UPDATE proxy_groups SET sched_rules=$2, updated_at=now() WHERE id=$1`, id, string(b))
+	return err
+}
+
 // ListEnabledProxyGroups 取全部启用的代理组(调度器装载用)。
 func (d *DB) ListEnabledProxyGroups() ([]*ProxyGroup, error) {
 	rows, err := d.Query(`SELECT ` + proxyGroupCols + ` FROM proxy_groups g WHERE g.enabled ORDER BY g.id`)
@@ -362,6 +437,25 @@ func (d *DB) ListEnabledProxyGroups() ([]*ProxyGroup, error) {
 	out := []*ProxyGroup{}
 	for rows.Next() {
 		g, err := scanProxyGroup(rows, false)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+// ListAllProxyGroups 取全部代理组,不限启用、不分页(调度总览页全量展示用)。
+// 组数量是个位数到几十,一次查完比前端翻页拼接简单;附带计数子查询与列表页同源。
+func (d *DB) ListAllProxyGroups() ([]*ProxyGroup, error) {
+	rows, err := d.Query(`SELECT ` + proxyGroupCols + proxyGroupCountCols + ` FROM proxy_groups g ORDER BY g.id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*ProxyGroup{}
+	for rows.Next() {
+		g, err := scanProxyGroup(rows, true)
 		if err != nil {
 			return nil, err
 		}
@@ -398,12 +492,17 @@ type Proxy struct {
 	UseCount      int64      `json:"use_count"`
 	CreatedAt     time.Time  `json:"created_at"`
 	UpdatedAt     time.Time  `json:"updated_at"`
+
+	// Priority 是调度优先级(0-10000,越大越优先):手动置顶与自动升降级共用一个值。
+	Priority int `json:"priority"`
+	// Streak 是连续测活/调度成功次数,一次失败即清零;自动升级的判定依据。
+	Streak int `json:"streak"`
 }
 
 const proxyCols = `id, group_id, url, protocol, host, port, label, source, source_ref, region,
 	country_code, country,
 	anonymity, latency_ms, status, fail_count, success_count, last_checked_at, last_ok_at,
-	exit_ip, use_count, created_at, updated_at`
+	exit_ip, use_count, created_at, updated_at, priority, streak`
 
 func scanProxy(sc interface{ Scan(...any) error }) (*Proxy, error) {
 	var p Proxy
@@ -411,7 +510,8 @@ func scanProxy(sc interface{ Scan(...any) error }) (*Proxy, error) {
 	if err := sc.Scan(&p.ID, &p.GroupID, &p.URL, &p.Protocol, &p.Host, &p.Port, &p.Label, &p.Source,
 		&p.SourceRef, &p.Region, &p.CountryCode, &p.Country, &p.Anonymity, &p.LatencyMs, &p.Status,
 		&p.FailCount, &p.SuccessCount,
-		&lastChecked, &lastOk, &p.ExitIP, &p.UseCount, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		&lastChecked, &lastOk, &p.ExitIP, &p.UseCount, &p.CreatedAt, &p.UpdatedAt,
+		&p.Priority, &p.Streak); err != nil {
 		return nil, err
 	}
 	if lastChecked.Valid {
@@ -435,7 +535,7 @@ type ProxyFilter struct {
 	// CountryCode 按识别出的国家码精确筛选(ISO 两位大写,如 CN/US)。
 	CountryCode string
 	Q           string // 地址/标签/出口 IP 关键字
-	Sort        string // latency | checked | used | created
+	Sort        string // latency | checked | used | created | priority
 	Desc        bool
 	Limit       int
 	Offset      int
@@ -516,6 +616,9 @@ func (d *DB) ListProxies(f ProxyFilter) ([]*Proxy, int, map[string]int, error) {
 		order = "use_count DESC, id DESC"
 	case "created":
 		order = "created_at DESC, id DESC"
+	case "priority":
+		// 优先级排序:高优先级在前,同级按延迟;id 兜底保证分页稳定。
+		order = "priority DESC, latency_ms ASC, id DESC"
 	}
 	if !f.Desc && f.Sort != "" {
 		order = strings.Replace(order, " DESC", " ASC", 1)
@@ -664,17 +767,41 @@ RETURNING `+proxyCols,
 	return p, false, nil
 }
 
-// UpdateProxy 更新代理的可编辑字段(地址不可改:改了就是另一条代理)。
-func (d *DB) UpdateProxy(id int64, label, region, status string) error {
+// UpdateProxy 部分更新代理的可编辑字段(地址不可改:改了就是另一条代理)。
+// label/region/priority 传 nil 表示保持原值,status 空串表示保持;priority 做范围兜底。
+// 影响 0 行返回 sql.ErrNoRows,由 handler 转 404(而不是静默 200)。
+func (d *DB) UpdateProxy(id int64, label, region *string, status string, priority *int) error {
 	if status != "" && !ValidProxyStatus(status) {
 		return fmt.Errorf("无效状态: %q", status)
 	}
-	_, err := d.Exec(`UPDATE proxies SET
-	label=$2, region=$3,
-	status=CASE WHEN $4 = '' THEN status ELSE $4 END,
+	if priority != nil && (*priority < 0 || *priority > 10000) {
+		return fmt.Errorf("priority 必须在 0-10000")
+	}
+	var lbl, reg string
+	var pri int
+	if label != nil {
+		lbl = *label
+	}
+	if region != nil {
+		reg = *region
+	}
+	if priority != nil {
+		pri = *priority
+	}
+	res, err := d.Exec(`UPDATE proxies SET
+	label = CASE WHEN $2::boolean THEN $3 ELSE label END,
+	region = CASE WHEN $4::boolean THEN $5 ELSE region END,
+	status = CASE WHEN $6 = '' THEN status ELSE $6 END,
+	priority = CASE WHEN $7::boolean THEN $8 ELSE priority END,
 	updated_at=now()
-WHERE id=$1`, id, label, region, status)
-	return err
+WHERE id=$1`, id, label != nil, lbl, region != nil, reg, status, priority != nil, pri)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // DeleteProxy 删除单条代理。
@@ -1243,30 +1370,50 @@ type ProxyCheckResult struct {
 	Region    string
 	Err       string
 	MaxFail   int // 连续失败阈值:达到即标记 dead
+	// Rules 是所属组的调度规则(自动升降级)。
+	Rules SchedRules
 }
 
 // ApplyProxyCheckResult 把一次测活结果写回代理行:
-// 成功 → alive、延迟/出口 IP/匿名度刷新、fail_count 清零;
-// 失败 → fail_count+1,达到阈值才标 dead(偶发抖动不立即判死)。
+// 成功 → alive、延迟/出口 IP/匿名度刷新、fail_count 清零;streak 恒 +1,
+//        且当 auto_boost 开启且「自增后的 streak」恰为 boost_every 的整数倍、
+//        priority 未到顶时,priority + boost_step(封顶 boost_cap);
+// 失败 → fail_count+1(达到阈值才标 dead,偶发抖动不立即判死)、streak 清零,
+//        且当 auto_boost 开启且 demote_on_fail>0 时 priority 降 demote_on_fail(下限 0)。
+// 也就是说:升级看「连续成功 »,一次失败立即打断连胜并降级——坏代理要尽快掉出高位。
+// rules 先归一化:调用方传零值时不能把 boost_every=0 带进 SQL(取模会除零)。
 func (d *DB) ApplyProxyCheckResult(res ProxyCheckResult) error {
 	maxFail := res.MaxFail
 	if maxFail <= 0 {
 		maxFail = 3
 	}
+	rules := res.Rules
+	NormalizeSchedRules(&rules)
 	if res.Alive {
+		// streak 判定必须用自增后的值:(streak+1) % boost_every = 0,
+		// 与 Go 侧「成功后先 streak++ 再判倍数」的语义一致。
 		_, err := d.Exec(`UPDATE proxies SET
 	status='alive', latency_ms=$2, exit_ip=$3,
 	anonymity = CASE WHEN $4 = '' THEN anonymity ELSE $4 END,
 	region = CASE WHEN $5 = '' THEN region ELSE $5 END,
-	fail_count=0, success_count=success_count+1, last_checked_at=now(), last_ok_at=now(), updated_at=now()
-WHERE id=$1`, res.ProxyID, res.LatencyMs, res.ExitIP, res.Anonymity, res.Region)
+	fail_count=0, success_count=success_count+1,
+	streak = streak + 1,
+	priority = CASE WHEN $6 AND (streak + 1) % $7 = 0 AND priority < $8
+	            THEN LEAST(priority + $9, $8) ELSE priority END,
+	last_checked_at=now(), last_ok_at=now(), updated_at=now()
+WHERE id=$1`,
+			res.ProxyID, res.LatencyMs, res.ExitIP, res.Anonymity, res.Region,
+			rules.AutoBoost, rules.BoostEvery, rules.BoostCap, rules.BoostStep)
 		return err
 	}
 	_, err := d.Exec(`UPDATE proxies SET
 	status = CASE WHEN fail_count + 1 >= $2 THEN 'dead' ELSE status END,
 	latency_ms = CASE WHEN fail_count + 1 >= $2 THEN 0 ELSE latency_ms END,
-	fail_count = fail_count + 1, last_checked_at=now(), updated_at=now()
-WHERE id=$1`, res.ProxyID, maxFail)
+	fail_count = fail_count + 1,
+	streak = 0,
+	priority = CASE WHEN $3 AND $4 > 0 THEN GREATEST(priority - $4, 0) ELSE priority END,
+	last_checked_at=now(), updated_at=now()
+WHERE id=$1`, res.ProxyID, maxFail, rules.AutoBoost, rules.DemoteOnFail)
 	return err
 }
 
@@ -1308,11 +1455,11 @@ func (d *DB) ListProxiesForCheck(groupID int64, statuses []string, limit int) ([
 // 延迟好的代理本就该优先被选中,长尾没必要进内存。
 const dispatchCandidateLimit = 500
 
-// ListDispatchableProxies 取可用于调度的代理:alive 优先,延迟升序。
+// ListDispatchableProxies 取可用于调度的代理:alive 优先,优先级优先,同级按延迟。
 // 没有任何 alive 时返回全部未标记 dead 的(冷启动阶段让调度器仍能试)。
 func (d *DB) ListDispatchableProxies(groupID int64) ([]*Proxy, error) {
 	rows, err := d.Query(`SELECT `+proxyCols+` FROM proxies
-WHERE group_id=$1 AND status='alive' ORDER BY latency_ms = 0, latency_ms ASC, id LIMIT $2`,
+WHERE group_id=$1 AND status='alive' ORDER BY priority DESC, latency_ms = 0, latency_ms ASC, id LIMIT $2`,
 		groupID, dispatchCandidateLimit)
 	if err != nil {
 		return nil, err
@@ -1331,7 +1478,7 @@ WHERE group_id=$1 AND status='alive' ORDER BY latency_ms = 0, latency_ms ASC, id
 	}
 	// 冷启动:还没测活过(alive=0)时不能把整组判死,退回「非 dead」集合。
 	rows2, err := d.Query(`SELECT `+proxyCols+` FROM proxies
-WHERE group_id=$1 AND status <> 'dead' ORDER BY latency_ms = 0, latency_ms ASC, id LIMIT $2`,
+WHERE group_id=$1 AND status <> 'dead' ORDER BY priority DESC, latency_ms = 0, latency_ms ASC, id LIMIT $2`,
 		groupID, dispatchCandidateLimit)
 	if err != nil {
 		return nil, err
@@ -1345,6 +1492,51 @@ WHERE group_id=$1 AND status <> 'dead' ORDER BY latency_ms = 0, latency_ms ASC, 
 		out = append(out, p)
 	}
 	return out, rows2.Err()
+}
+
+// SetProxyPriority 手动设置代理优先级(钳 0-10000,越大越优先)。
+// 代理不存在时返回 sql.ErrNoRows(接口层据此回 404)。
+func (d *DB) SetProxyPriority(id int64, priority int) error {
+	if priority < 0 {
+		priority = 0
+	}
+	if priority > 10000 {
+		priority = 10000
+	}
+	res, err := d.Exec(`UPDATE proxies SET priority=$2, updated_at=now() WHERE id=$1`, id, priority)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// CountBoostedProxies 统计组内已被自动升级(priority>0)的代理数(调度页徽标用)。
+func (d *DB) CountBoostedProxies(groupID int64) (int, error) {
+	var n int
+	err := d.QueryRow(`SELECT COUNT(*) FROM proxies WHERE group_id=$1 AND priority > 0`, groupID).Scan(&n)
+	return n, err
+}
+
+// ListTopProxies 返回组内最值得调度的前 limit 条(调度页 TOP 榜):
+// alive 优先、优先级降序,同级未测的(延迟 0)排最后、快的在前。
+func (d *DB) ListTopProxies(groupID int64, limit int) ([]*Proxy, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	return d.queryProxies(`SELECT `+proxyCols+` FROM proxies
+WHERE group_id=$1
+ORDER BY (status = 'alive') DESC, priority DESC, latency_ms = 0, latency_ms ASC, id
+LIMIT $2`, groupID, limit)
 }
 
 // BumpProxyUse 累加代理被调度次数(每次成功调度调用)。

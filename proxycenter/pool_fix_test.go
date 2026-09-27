@@ -111,7 +111,6 @@ func TestConnectRetriesOtherCandidates(t *testing.T) {
 	p := NewPool(PoolOptions{GroupID: 1, Strategy: "round_robin", Timeout: 3 * time.Second})
 	p.candidates.Store(&list)
 
-
 	var recMu sync.Mutex
 	var records []RequestRecord
 	p.opts.OnRequest = func(rec RequestRecord) {

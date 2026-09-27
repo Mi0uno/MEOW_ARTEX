@@ -40,6 +40,7 @@ func (p *proxyStore) ListGroups() ([]proxycenter.Group, error) {
 			ID: g.ID, Name: g.Name, Kind: g.Kind, Strategy: g.Strategy, ListenPort: g.ListenPort,
 			Enabled: g.Enabled, AutoCheck: g.AutoCheck, CheckIntervalMinutes: g.CheckIntervalMinutes,
 			TestURL: g.TestURL, TimeoutMs: g.TimeoutMs, MaxFailures: g.MaxFailures, Concurrency: g.Concurrency,
+			Rules: schedRulesFromDB(g.Rules),
 		})
 	}
 	return out, nil
@@ -59,6 +60,7 @@ func (p *proxyStore) ListCandidates(groupID int64) ([]proxycenter.Candidate, err
 		}
 		out = append(out, proxycenter.Candidate{
 			ID: r.ID, Raw: r.URL, URL: u, LatencyMs: r.LatencyMs, Region: r.Region, Source: r.Source,
+			Priority: r.Priority, Streak: r.Streak,
 		})
 	}
 	return out, nil
@@ -76,12 +78,29 @@ func (p *proxyStore) ListTargets(groupID int64, statuses []string) ([]proxycente
 	return out, nil
 }
 
-func (p *proxyStore) ApplyCheck(groupID int64, out proxycenter.CheckOutcome, maxFailures int) error {
+func (p *proxyStore) ApplyCheck(groupID int64, out proxycenter.CheckOutcome, maxFailures int, rules proxycenter.SchedRules) error {
 	return p.pg.ApplyProxyCheckResult(pgdb.ProxyCheckResult{
 		ProxyID: out.ProxyID, Alive: out.Alive, LatencyMs: out.LatencyMs,
 		ExitIP: out.ExitIP, Anonymity: out.Anonymity, Region: out.Region,
 		Err: out.Err, MaxFail: maxFailures,
+		Rules: schedRulesToDB(rules),
 	})
+}
+
+// schedRulesFromDB / schedRulesToDB 是 db.SchedRules ⇄ proxycenter.SchedRules 的
+// 逐字段转换(两个类型镜像存在,因为 proxycenter 不 import db)。
+func schedRulesFromDB(r pgdb.SchedRules) proxycenter.SchedRules {
+	return proxycenter.SchedRules{
+		AutoBoost: r.AutoBoost, BoostEvery: r.BoostEvery, BoostStep: r.BoostStep,
+		BoostCap: r.BoostCap, DemoteOnFail: r.DemoteOnFail,
+	}
+}
+
+func schedRulesToDB(r proxycenter.SchedRules) pgdb.SchedRules {
+	return pgdb.SchedRules{
+		AutoBoost: r.AutoBoost, BoostEvery: r.BoostEvery, BoostStep: r.BoostStep,
+		BoostCap: r.BoostCap, DemoteOnFail: r.DemoteOnFail,
+	}
 }
 
 func (p *proxyStore) RecordRequest(rec proxycenter.RequestRecord) error {

@@ -10,7 +10,9 @@ package server
 // 出网切换 /api/proxy/egress 是「本地裸网 ⇄ 代理池」的开关。
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"strconv"
@@ -64,6 +66,10 @@ func (s *Server) registerProxyRoutes(mux *http.ServeMux) {
 	// ---- 测活 ----
 	mux.HandleFunc("POST /api/proxy/groups/{id}/check", s.checkProxies)
 	mux.HandleFunc("GET /api/proxy/check-runs", s.listProxyCheckRuns)
+
+	// ---- 调度规则(优先级升降级) ----
+	mux.HandleFunc("GET /api/proxy/schedule", s.getProxySchedule)
+	mux.HandleFunc("PUT /api/proxy/groups/{id}/sched-rules", s.updateProxySchedRules)
 
 	// ---- 地区识别 ----
 	mux.HandleFunc("POST /api/proxy/groups/{id}/geo", s.resolveProxyGeo)
@@ -532,7 +538,9 @@ func (s *Server) createProxy(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 201, map[string]any{"proxy": p, "existing": existing})
 }
 
-// updateProxy PUT /api/proxy/{id}
+// updateProxy PUT /api/proxy/{id} — 部分更新:label/region/priority 缺省(nil)=保持原值,
+// status 空串=保持。调度规则页的置顶/升降优先级也走这里(带 priority 字段),
+// 不单开 /priority 子路由——ServeMux 下它与 PUT /api/proxy/groups/{id} 互不占优会 panic。
 func (s *Server) updateProxy(w http.ResponseWriter, r *http.Request) {
 	if !s.proxyReady(w) {
 		return
@@ -542,15 +550,24 @@ func (s *Server) updateProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Label  string `json:"label"`
-		Region string `json:"region"`
-		Status string `json:"status"`
+		Label    *string `json:"label"`
+		Region   *string `json:"region"`
+		Status   string  `json:"status"`
+		Priority *int    `json:"priority"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		writeErr(w, 400, "invalid JSON: "+err.Error())
 		return
 	}
-	if err := s.m.PG().UpdateProxy(id, req.Label, req.Region, req.Status); err != nil {
+	if req.Priority != nil && (*req.Priority < 0 || *req.Priority > 10000) {
+		writeErr(w, 400, "priority 必须在 0-10000")
+		return
+	}
+	if err := s.m.PG().UpdateProxy(id, req.Label, req.Region, req.Status, req.Priority); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeErr(w, 404, "代理不存在")
+			return
+		}
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -908,6 +925,96 @@ func (s *Server) listProxyCheckRuns(w http.ResponseWriter, r *http.Request) {
 		runs = []*pgdb.ProxyCheckRun{}
 	}
 	writeJSON(w, 200, map[string]any{"runs": runs})
+}
+
+// ---- 调度规则 ----
+
+// schedGroupEntry 是调度总览里的一行:组配置 + 升级计数 + TOP 候选。
+// 内嵌 *pgdb.ProxyGroup 使 JSON 直接平铺组字段(sched_rules 随之自动带上)。
+type schedGroupEntry struct {
+	*pgdb.ProxyGroup
+	BoostedCount int           `json:"boosted_count"`
+	Top          []*pgdb.Proxy `json:"top"`
+}
+
+// getProxySchedule GET /api/proxy/schedule — 全量组的调度总览:
+// 每组带 boosted_count(已被自动升级的代理数)与 top(最值得调度的前 10 条)。
+// 组数量是个位数到几十,一次查完不分页;top 为空时给 [] 不给 null,前端好渲染。
+func (s *Server) getProxySchedule(w http.ResponseWriter, r *http.Request) {
+	if !s.proxyReady(w) {
+		return
+	}
+	pg := s.m.PG()
+	groups, err := pg.ListAllProxyGroups()
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	out := make([]schedGroupEntry, 0, len(groups))
+	for _, g := range groups {
+		boosted, err := pg.CountBoostedProxies(g.ID)
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		top, err := pg.ListTopProxies(g.ID, 10)
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		if top == nil {
+			top = []*pgdb.Proxy{}
+		}
+		out = append(out, schedGroupEntry{ProxyGroup: g, BoostedCount: boosted, Top: top})
+	}
+	writeJSON(w, 200, map[string]any{"groups": out})
+}
+
+// updateProxySchedRules PUT /api/proxy/groups/{id}/sched-rules — 更新组级调度规则。
+// 越界数值在 db 层归一化为默认值(不报错,响应里的 group.sched_rules 就是归一化结果);
+// 更新后重建监听器:EnsurePool 的失败回调闭包在创建时捕获了旧规则,不重建会一直用旧值。
+func (s *Server) updateProxySchedRules(w http.ResponseWriter, r *http.Request) {
+	if !s.proxyReady(w) {
+		return
+	}
+	id, ok := proxyPathID(w, r)
+	if !ok {
+		return
+	}
+	pg := s.m.PG()
+	g, err := pg.GetProxyGroup(id)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if g == nil {
+		writeErr(w, 404, "代理组不存在")
+		return
+	}
+	var rules pgdb.SchedRules
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&rules); err != nil {
+		writeErr(w, 400, "invalid JSON: "+err.Error())
+		return
+	}
+	if err := pg.UpdateSchedRules(id, rules); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	g, err = pg.GetProxyGroup(id)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	// 与 updateProxyGroup 同一模式:停旧监听器再按需重建,让新规则对调度失败回调生效。
+	if pc := s.m.ProxyCenter(); pc != nil {
+		pc.StopPool(id)
+		if g.Enabled {
+			if err := pc.EnsurePool(id); err != nil {
+				log.Printf("[proxy-center] 重建组 #%d 监听器失败(调度规则已更新): %v", id, err)
+			}
+		}
+	}
+	writeJSON(w, 200, map[string]any{"group": g})
 }
 
 // ---- 地区识别 ----

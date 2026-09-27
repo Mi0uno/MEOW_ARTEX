@@ -53,6 +53,10 @@ type Candidate struct {
 	LatencyMs int
 	Region    string
 	Source    string
+	// Priority 是调度优先级(越大越优先),Streak 是连续成功次数;
+	// 二者由 quality 策略换算成抽签权重,其余策略忽略。
+	Priority int
+	Streak   int
 }
 
 // RequestRecord 是一次出网的流水(异步写库)。
@@ -250,6 +254,7 @@ func (p *Pool) CandidateCount() int {
 //   - random        : 随机(天然分散,且无需维护状态)
 //   - least_latency : 候选已按延迟升序,取第一条
 //   - failover      : 固定取第一条,失败时由上层重试下一条
+//   - quality       : 按质量加权随机(qualityWeight),好代理被更频繁选中
 //
 // 返回 (候选, 是否找到)。exclude 用于 failover 重试时跳过已失败的 id。
 func (p *Pool) pick(exclude map[int64]bool) (*Candidate, bool) {
@@ -266,6 +271,9 @@ func (p *Pool) pick(exclude map[int64]bool) (*Candidate, bool) {
 			}
 		}
 		return nil, false
+	}
+	if p.opts.Strategy == "quality" {
+		return pickWeighted(list, exclude)
 	}
 	if p.opts.Strategy == "random" {
 		// 从随机起点线性探测,避免为了排除几条而全量过滤。
@@ -284,6 +292,60 @@ func (p *Pool) pick(exclude map[int64]bool) (*Candidate, bool) {
 		cand := &list[(start+i)%len(list)]
 		if exclude == nil || !exclude[cand.ID] {
 			return cand, true
+		}
+	}
+	return nil, false
+}
+
+// qualityWeight 把一条候选的质保信号换算成抽签权重(纯函数,便于单测)。
+//
+//	weight = 1 + priority*2 + min(streak,20) + 延迟加成
+//	延迟加成:>0 且 ≤200ms 记 4,≤500ms 记 2,≤1000ms 记 1,未测(0)/更慢记 0。
+//
+// 为什么是加权随机而不是轮转:轮转把好坏代理一视同仁,任务流量会均匀砸在
+// 「刚升级的」和「连败后靠手动救回的」代理上;调度质量的核心诉求是让高优先级、
+// 高连胜、低延迟的代理承担更多流量。加权随机既保住分散性(坏代理权重≥1 仍会被
+// 探测到,失败回写会把它降级),又让质量信号直接兑现成选中概率。
+func qualityWeight(c Candidate) int {
+	w := 1 + c.Priority*2 + min(c.Streak, 20)
+	switch {
+	case c.LatencyMs > 0 && c.LatencyMs <= 200:
+		w += 4
+	case c.LatencyMs > 0 && c.LatencyMs <= 500:
+		w += 2
+	case c.LatencyMs > 0 && c.LatencyMs <= 1000:
+		w += 1
+	}
+	return w
+}
+
+// pickWeighted 按权重有放回抽一条(加权随机),跳过 exclude 的候选。
+// 随机源复用 randIntN(crypto/rand):与 random 策略同理,调度结果不可预测才有分散价值。
+func pickWeighted(list []Candidate, exclude map[int64]bool) (*Candidate, bool) {
+	total := 0
+	for i := range list {
+		if exclude != nil && exclude[list[i].ID] {
+			continue
+		}
+		total += qualityWeight(list[i])
+	}
+	if total <= 0 {
+		return nil, false
+	}
+	target := randIntN(total)
+	for i := range list {
+		if exclude != nil && exclude[list[i].ID] {
+			continue
+		}
+		target -= qualityWeight(list[i])
+		if target < 0 {
+			return &list[i], true
+		}
+	}
+	// 理论不可达(整数权重总和恰等于 target 上界),兜底返回第一条可用候选。
+	for i := range list {
+		if exclude == nil || !exclude[list[i].ID] {
+			return &list[i], true
 		}
 	}
 	return nil, false
