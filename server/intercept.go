@@ -373,7 +373,8 @@ func (s *Server) interceptHistory(w http.ResponseWriter, r *http.Request) {
 }
 
 func interceptFilterParams(q url.Values) (db.InterceptApprovalFilter, error) {
-	filter := db.InterceptApprovalFilter{Status: q.Get("status"), DecisionSource: q.Get("decision_source")}
+	filter := db.InterceptApprovalFilter{Status: q.Get("status"), DecisionSource: q.Get("decision_source"),
+		Q: q.Get("q"), TaskID: q.Get("task_id"), Tool: q.Get("tool")}
 	// flagged = AI判疑放通(标记但放行),审批记录页要能按它筛选,所以进白名单。
 	switch filter.Status {
 	case "", "pending", "allowed", "denied", "timeout", "flagged":

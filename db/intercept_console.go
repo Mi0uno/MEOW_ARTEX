@@ -142,9 +142,11 @@ func (d *DB) ConsoleInterceptsPage(page, size int, filter InterceptApprovalFilte
 		return nil, 0, nil, nil, err
 	}
 
-	// counts:一条 GROUP BY status 出五档,再补零。
+	// counts:一条 GROUP BY status 出五档,再补零。列必须 ip.status 限定:
+	// approvalCountFrom 带 tasks JOIN,它也有 status 列,裸写是 42702 歧义
+	// (冒烟抓到;列名一律带 ip./t./c. 前缀是本文件铁律)。
 	countWhere, countArgs := interceptApprovalConds("", filter, false, true)
-	countRows, err := d.Query(`SELECT status, COUNT(*)`+approvalCountFrom+countWhere+` GROUP BY status`, countArgs...)
+	countRows, err := d.Query(`SELECT ip.status, COUNT(*)`+approvalCountFrom+countWhere+` GROUP BY ip.status`, countArgs...)
 	if err != nil {
 		return nil, 0, nil, nil, err
 	}

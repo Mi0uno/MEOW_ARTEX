@@ -299,14 +299,14 @@ function ConsoleTable({
           <TableHead className="w-10">
             <span className="sr-only">展开详情</span>
           </TableHead>
-          <TableHead className="w-14">#</TableHead>
-          <TableHead className="w-28">工具</TableHead>
-          <TableHead className="w-36">任务来源</TableHead>
+          <TableHead className="w-12">#</TableHead>
+          <TableHead className="w-24">工具</TableHead>
+          <TableHead className="w-32">任务来源</TableHead>
           <TableHead>内容意图</TableHead>
-          <TableHead className="w-36">匹配规则</TableHead>
-          <TableHead className="w-24">状态</TableHead>
-          <TableHead className="w-36">申请时间</TableHead>
-          <TableHead className="w-36">决定时间</TableHead>
+          <TableHead className="w-28">匹配规则</TableHead>
+          <TableHead className="w-20">状态</TableHead>
+          <TableHead className="w-28">申请时间</TableHead>
+          <TableHead className="w-28">决定时间</TableHead>
         </TableRow>
       </TableHeader>
       <TableBody>
