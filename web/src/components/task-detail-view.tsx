@@ -36,7 +36,7 @@ import { RetestsTab } from "@/app/(main)/function/tasks/detail/_tabs/retests-tab
 import { SessionsTab } from "@/app/(main)/function/tasks/detail/_tabs/sessions-tab";
 import { TaskVpsTab } from "@/app/(main)/function/tasks/detail/_tabs/vps-tab";
 import { TaskMemoryBriefingCard } from "@/components/memory-briefing-dialog";
-import { VulnBriefingDialog } from "@/components/vuln-briefing-dialog";
+import { TaskVulnBriefingCard } from "@/components/vuln-briefing-dialog";
 import {
   ReconAssetsPanel,
   ReconEvidencePanel,
@@ -610,9 +610,7 @@ export function TaskDetailView() {
               {/* 记忆简报卡(AI 记忆库,契约 §9)与 CVE 情报卡(POC_INTEL 契约):拉取失败时静默不渲染,不影响总览其余卡片。 */}
               <div className="flex flex-col gap-4">
                 <TaskMemoryBriefingCard taskId={id} />
-                <div>
-                  <VulnBriefingDialog taskId={id} />
-                </div>
+                <TaskVulnBriefingCard taskId={id} />
                 <OverviewTab taskId={id} />
               </div>
             </TabsContent>
