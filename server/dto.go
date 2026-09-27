@@ -30,41 +30,43 @@ func rawString(raw json.RawMessage) string {
 
 // ---- Task (frontend "Task") ---- created_at as RFC3339, plus a derived status.
 type TaskDTO struct {
-	ID                 string          `json:"id"`
-	ExplorationID      int64           `json:"exploration_id"`
-	Name               string          `json:"name"` // 可选任务名称;空=未命名
-	CategoryID         *int64          `json:"category_id,omitempty"`
-	CategoryName       string          `json:"category_name,omitempty"`
-	Pinned             bool            `json:"pinned"`
-	PinnedAt           string          `json:"pinned_at,omitempty"`
-	Description        string          `json:"description"`
-	Goal               string          `json:"goal"`
-	Status             string          `json:"status"` // created | running | paused | done | failed
-	CreatedAt          string          `json:"created_at"`
-	CreatedUnix        int64           `json:"created_unix"`       // created_at as unix seconds (for run-duration calc)
-	CompletedAt        string          `json:"completed_at"`       // RFC3339 finish time (done/failed); "" if unfinished
-	CompletedUnix      int64           `json:"completed_unix"`     // completed_at as unix seconds (0 if unfinished)
-	LastActivity       int64           `json:"last_activity_unix"` // unix seconds of the last activity (0 if none)
-	Paused             bool            `json:"paused"`
-	Queued             bool            `json:"queued"`
-	Tokens             TokenTotalDTO   `json:"tokens"` // whole-task token consumption
-	GoalsTotal         int             `json:"goals_total"`
-	GoalsMet           int             `json:"goals_met"`
-	InFlight           int             `json:"in_flight"`                // 运行中 Worker 数（state=running 的意图）
-	LLMProfileID       *int64          `json:"llm_profile_id,omitempty"` // LLM profile used for this task; nil = default
-	LLMProfileIDs      []int64         `json:"llm_profile_ids"`
-	ActiveLLMProfileID *int64          `json:"active_llm_profile_id,omitempty"`
-	LLMFailoverState   string          `json:"llm_failover_state"`
-	LLMFailoverReason  string          `json:"llm_failover_reason,omitempty"`
-	SourceTaskIDs      []string        `json:"source_task_ids"`
-	ArchiveBlockedBy   string          `json:"archive_blocked_by_task_id,omitempty"`
-	CompanyIDs         []int64         `json:"company_ids"`
-	CoverageEnabled    bool            `json:"coverage_enabled"` // 资产覆盖度功能开关(创建时定)
-	Stage              string          `json:"stage"`            // recon|exploit|post(三阶段平台)
-	Kind               string          `json:"kind"`             // agent|pipeline
-	Pipeline           json.RawMessage `json:"pipeline,omitempty"`
-	StepKey            string          `json:"step_key,omitempty"` // recon 单步骤任务:收集器 key
-	StepConfig         json.RawMessage `json:"step_config,omitempty"`
+	ID                 string        `json:"id"`
+	ExplorationID      int64         `json:"exploration_id"`
+	Name               string        `json:"name"` // 可选任务名称;空=未命名
+	CategoryID         *int64        `json:"category_id,omitempty"`
+	CategoryName       string        `json:"category_name,omitempty"`
+	Pinned             bool          `json:"pinned"`
+	PinnedAt           string        `json:"pinned_at,omitempty"`
+	Description        string        `json:"description"`
+	Goal               string        `json:"goal"`
+	Status             string        `json:"status"` // created | running | paused | done | failed
+	CreatedAt          string        `json:"created_at"`
+	CreatedUnix        int64         `json:"created_unix"`       // created_at as unix seconds (for run-duration calc)
+	CompletedAt        string        `json:"completed_at"`       // RFC3339 finish time (done/failed); "" if unfinished
+	CompletedUnix      int64         `json:"completed_unix"`     // completed_at as unix seconds (0 if unfinished)
+	LastActivity       int64         `json:"last_activity_unix"` // unix seconds of the last activity (0 if none)
+	Paused             bool          `json:"paused"`
+	Queued             bool          `json:"queued"`
+	Tokens             TokenTotalDTO `json:"tokens"` // whole-task token consumption
+	GoalsTotal         int           `json:"goals_total"`
+	GoalsMet           int           `json:"goals_met"`
+	InFlight           int           `json:"in_flight"`                // 运行中 Worker 数（state=running 的意图）
+	LLMProfileID       *int64        `json:"llm_profile_id,omitempty"` // LLM profile used for this task; nil = default
+	LLMProfileIDs      []int64       `json:"llm_profile_ids"`
+	ActiveLLMProfileID *int64        `json:"active_llm_profile_id,omitempty"`
+	LLMFailoverState   string        `json:"llm_failover_state"`
+	LLMFailoverReason  string        `json:"llm_failover_reason,omitempty"`
+	SourceTaskIDs      []string      `json:"source_task_ids"`
+	ArchiveBlockedBy   string        `json:"archive_blocked_by_task_id,omitempty"`
+	CompanyIDs         []int64       `json:"company_ids"`
+	CoverageEnabled    bool          `json:"coverage_enabled"` // 资产覆盖度功能开关(创建时定)
+	// VulnBrief 是「CVE 情报简报联动」任务级三态回显:nil=跟随全局。
+	VulnBrief  *bool           `json:"vuln_brief,omitempty"`
+	Stage      string          `json:"stage"` // recon|exploit|post(三阶段平台)
+	Kind       string          `json:"kind"`  // agent|pipeline
+	Pipeline   json.RawMessage `json:"pipeline,omitempty"`
+	StepKey    string          `json:"step_key,omitempty"` // recon 单步骤任务:收集器 key
+	StepConfig json.RawMessage `json:"step_config,omitempty"`
 	// SRC 模式:产出计入 SRC 成果,并按平台/目标规范约束 AI 边界。
 	// SRCProfileID 是旧「企业模式」的规范 id,仅为存量任务回显保留。
 	SRCMode       bool  `json:"src_mode,omitempty"`
@@ -161,6 +163,7 @@ func taskDTO(t *Task, status string) TaskDTO {
 		SourceTaskIDs:      sourceIDs,
 		CompanyIDs:         lifecycle.CompanyIDs,
 		CoverageEnabled:    t.CoverageEnabled,
+		VulnBrief:          t.VulnBrief,
 		Stage:              t.Stage,
 		Kind:               t.Kind,
 		Pipeline:           t.Pipeline,

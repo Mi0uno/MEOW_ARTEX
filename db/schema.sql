@@ -532,6 +532,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     timeout_seconds INTEGER NOT NULL DEFAULT 0,
     plan_heartbeat_seconds INTEGER NOT NULL DEFAULT 300,
     coverage_enabled BOOLEAN NOT NULL DEFAULT true,
+    -- CVE 情报简报联动开关(POC_INTEL_CONTRACTS.md):NULL=跟随全局开关
+    -- (settings vulndb_task_brief);true/false=本任务强制开/关。
+    vuln_brief     BOOLEAN,
     pinned_at      TIMESTAMPTZ,
     first_run_at   TIMESTAMPTZ,
     deadline_at    TIMESTAMPTZ,
@@ -554,6 +557,8 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS queued BOOLEAN NOT NULL DEFAULT false
 -- 给 agent 开放 add_task_scope/list_untested_assets;false=全部关闭(见 task_scope.go)。
 -- 存量任务默认 true 保持原行为;company 关联(task_scope kind=company)不受此开关影响。
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS coverage_enabled BOOLEAN NOT NULL DEFAULT true;
+-- CVE 情报简报联动开关(任务级三态):补旧库。NULL=跟随全局。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS vuln_brief BOOLEAN;
 -- queued_at makes admission FIFO reflect the actual enqueue order rather than the
 -- task creation order. queue_mode distinguishes first bootstrap from resuming an
 -- exploration that already owns goals/history.
@@ -1549,10 +1554,23 @@ CREATE TABLE IF NOT EXISTS vulndb_pocs (
     source      TEXT NOT NULL DEFAULT 'manual',
     source_url  TEXT NOT NULL DEFAULT '',
     verified    BOOLEAN NOT NULL DEFAULT false,
+    -- PoC 审核软质检层(POC_INTEL_CONTRACTS.md):自动源入库=pending,LLM 异步审核打标
+    -- approved(可信)/rejected(存疑);rejected 不删除只标记,人工可改判。
+    review_status TEXT NOT NULL DEFAULT 'pending',
+    review_note   TEXT NOT NULL DEFAULT '',
+    reviewed_at   TIMESTAMPTZ,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_vulndb_pocs_entry ON vulndb_pocs(entry_id, id);
+-- 存量库补审核三列(新建库由上方 CREATE TABLE 直接带出)。
+ALTER TABLE vulndb_pocs ADD COLUMN IF NOT EXISTS review_status TEXT NOT NULL DEFAULT 'pending';
+ALTER TABLE vulndb_pocs ADD COLUMN IF NOT EXISTS review_note TEXT NOT NULL DEFAULT '';
+ALTER TABLE vulndb_pocs ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;
+-- 存量人工建的 PoC 视为已核(幂等:只补 reviewed_at 为空的行,不覆盖人工改判)。
+UPDATE vulndb_pocs SET review_status='approved', reviewed_at=now()
+    WHERE source='manual' AND reviewed_at IS NULL AND review_status='pending';
+CREATE INDEX IF NOT EXISTS idx_vulndb_pocs_review ON vulndb_pocs(review_status) WHERE review_status = 'pending';
 -- 同一来源 URL 不重复入库(自动发现时靠它去重)。
 CREATE UNIQUE INDEX IF NOT EXISTS idx_vulndb_pocs_url_unique
     ON vulndb_pocs(entry_id, source_url) WHERE source_url <> '';

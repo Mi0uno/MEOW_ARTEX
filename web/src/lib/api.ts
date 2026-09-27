@@ -171,6 +171,9 @@ import type {
   VulnEntry,
   VulnPoc,
   VulnSyncRun,
+  VulnBriefDTO,
+  PocReviewStats,
+  PocBackfillStatus,
   TaskArchive,
   TaskArchivePage,
   TaskAssetMutation,
@@ -402,6 +405,7 @@ export const api = {
     seedFirstIntent?: boolean;
     planHeartbeatSeconds?: number;
     coverageEnabled?: boolean;
+    vulnBrief?: boolean | null; // CVE 情报简报联动:null=跟随全局 / true=强制开 / false=强制关
     stage?: "recon" | "exploit" | "post" | "report"; // recon=信息搜集步骤任务;report=报告中心 AI 识别任务(系统创建)
     srcMode?: boolean; // SRC 模式:产出计入 SRC 成果,并按平台/目标规范约束 AI 边界
     srcPlatformId?: number; // SRC 平台归属:决定注入哪套平台规范(奖励/评分/守则)
@@ -430,6 +434,7 @@ export const api = {
       seed_first_intent: input.seedFirstIntent ?? false,
       plan_heartbeat_seconds: input.planHeartbeatSeconds ?? 0, // 0 = 后端归一到默认 600(10min)
       coverage_enabled: input.coverageEnabled ?? true, // 默认开;false=关闭资产覆盖度功能
+      vuln_brief: input.vulnBrief === undefined ? null : input.vulnBrief, // null=跟随全局
       stage: input.stage,
       src_mode: input.srcMode ?? false,
       src_platform_id: input.srcPlatformId ?? 0,
@@ -1236,6 +1241,10 @@ export const api = {
       enabled: boolean;
       interval_hours: number;
       cnvd_url?: string;
+      task_brief?: boolean; // CVE 情报简报联动全局开关(缺省开)
+      poc_review?: boolean; // PoC LLM 审核全局开关(缺省开)
+      poc_hunt_github_limit?: number; // GitHub PoC 搜索每轮条数
+      trickest_limit?: number; // trickest 定向聚合每轮条数
     }>(`/vulndb/sync?${p.toString()}`).then((r) => ({
       runs: arr(r.runs),
       total: r.total ?? 0,
@@ -1246,11 +1255,22 @@ export const api = {
       enabled: r.enabled,
       interval_hours: r.interval_hours,
       cnvd_url: r.cnvd_url ?? "",
+      task_brief: r.task_brief ?? true,
+      poc_review: r.poc_review ?? true,
+      poc_hunt_github_limit: r.poc_hunt_github_limit ?? 120,
+      trickest_limit: r.trickest_limit ?? 200,
     }));
   },
   triggerVulnSync: () => post<{ status: string }>("/vulndb/sync", {}),
-  setVulnSyncConfig: (input: { enabled?: boolean; interval_hours?: number; cnvd_url?: string }) =>
-    put<{ ok: boolean }>("/vulndb/sync/config", input),
+  setVulnSyncConfig: (input: {
+    enabled?: boolean;
+    interval_hours?: number;
+    cnvd_url?: string;
+    task_brief?: boolean;
+    poc_review?: boolean;
+    poc_hunt_github_limit?: number;
+    trickest_limit?: number;
+  }) => put<{ ok: boolean }>("/vulndb/sync/config", input),
   // NVD 历史回填:启动/进度/取消(断点续跑,进度存 settings)。
   vulnBackfillStatus: () =>
     get<{ running: boolean; phase: string; start_year: number; window_end: string; done: boolean; error: string }>(
@@ -1259,6 +1279,25 @@ export const api = {
   startVulnBackfill: (input: { start_year?: number }) =>
     post<{ status: string }>("/vulndb/backfill", input ?? {}),
   cancelVulnBackfill: () => del<{ status: string }>("/vulndb/backfill"),
+  // ---- POC_INTEL_CONTRACTS:任务↔漏洞库联动 + PoC 猎取 + nuclei 回填 + LLM 审核 ----
+  taskVulnBrief: (taskId: string | number) =>
+    get<VulnBriefDTO>(`/tasks/${taskId}/vuln-brief`),
+  pocReviewStats: () =>
+    get<PocReviewStats>("/vulndb/review/stats").then((r) => ({
+      pending: r.pending ?? 0,
+      approved: r.approved ?? 0,
+      rejected: r.rejected ?? 0,
+    })),
+  // 重审单条(走与自动审核同一 LLM 判定,LLM 不可用 503)。
+  reviewPoc: (id: number) => post<{ poc: VulnPoc }>(`/vulndb/pocs/${id}/review`, {}),
+  // 批量送审:ids 缺省=全部 pending(cap 200)。
+  reviewPocsBatch: (ids?: number[]) => post<{ queued: number }>("/vulndb/pocs/review", { ids: ids ?? [] }),
+  nucleiBackfillStatus: () => get<PocBackfillStatus>("/vulndb/nuclei-backfill"),
+  startNucleiBackfill: () => post<{ status: string }>("/vulndb/nuclei-backfill", {}),
+  cancelNucleiBackfill: () => del<{ status: string }>("/vulndb/nuclei-backfill"),
+  trickestBackfillStatus: () => get<PocBackfillStatus>("/vulndb/trickest-backfill"),
+  startTrickestBackfill: () => post<{ status: string }>("/vulndb/trickest-backfill", {}),
+  cancelTrickestBackfill: () => del<{ status: string }>("/vulndb/trickest-backfill"),
   // ---- SRC 平台选择(平台 → 目标 → 资产) ----
   srcPlatforms: (input?: { q?: string; enabled?: string; limit?: number; offset?: number }) => {
     const p = new URLSearchParams();

@@ -96,6 +96,11 @@ type Worker struct {
 	// 记忆简报/检索回调(契约 §7,setter 在 agent/memory.go);nil = 不注入/工具不可用。
 	memoryBriefFn  func(taskID string) string
 	memoryRecallFn func(ctx context.Context, taskID, query, scope string) (string, error)
+
+	// CVE 情报简报/漏洞库检索回调(契约 POC_INTEL_CONTRACTS.md,setter 在 agent/vulndb_tool.go);
+	// nil = 不注入/工具不可用。
+	vulnBriefFn  func(taskID string) string
+	vulnSearchFn func(ctx context.Context, query, severity, kev, hasPoc string, limit int) (string, error)
 }
 
 // VPSRunContext is the per-run remote-execution environment a host hands the
@@ -417,6 +422,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	tsx.SetEnrich(enr)                  // async DNS/HTTP auto-completion for assets this worker writes
 	tsx.SetNotifyFinding(notifyFinding) // report_finding 落库时当场唤醒 planner，带上「哪个意图+finding」
 	wireMemoryRecall(tsx, taskID, w.memoryRecallFn) // 跨任务记忆检索(契约 §7):nil 时工具自然降级
+	wireVulndbSearch(tsx, w.vulnSearchFn)           // 漏洞库检索(POC_INTEL_CONTRACTS):nil 时工具自然降级
 	// base = built-in worker tools ∪ host tools (traffic) ∪ default tools (incl. Bash);
 	// then augment with the agent's visible skills/MCP. During the SDK settlement
 	// phase, Bash is hidden via Settlement.DisabledTools (no local gating needed).
@@ -452,6 +458,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,worker 执行时严格遵守
 	}
 	sysBody = appendMemoryBrief(sysBody, w.memoryBriefFn, taskID) // 记忆简报(契约 §7.2):约束同层、vps 块之前
+	sysBody = appendVulnBrief(sysBody, w.vulnBriefFn, taskID)     // CVE 情报简报(POC_INTEL_CONTRACTS):同层、vps 块之前
 	if vps != nil {
 		sysBody += vps.SystemBlock // 远程执行环境:机器档案 + Bash 走 SSH 的使用规约(与约束注入同一层追加)
 	}

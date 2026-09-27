@@ -583,6 +583,8 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		t.nodeDetail(),
 		// memory_recall：跨任务记忆检索(契约 §7)——执行前先查历史结论,防重复枚举。
 		t.memoryRecallTool(),
+		// vulndb_search：漏洞库检索(POC_INTEL_CONTRACTS)——拿到目标指纹后查已知漏洞与 PoC。
+		t.vulndbSearchTool(),
 		// 以下工具仍【不给】worker，只留给 planner/main（读上下文、跨 work 复盘是规划职责，
 		// worker 只做单条意图的执行与写回）：list_facts / list_companies / list_worker_traces。
 	}

@@ -56,11 +56,13 @@ type Task struct {
 	CompanyIDs         []int64 `json:"company_ids,omitempty"`
 	Status             string  `json:"status"` // persisted lifecycle status (done/failed/timeout 为终态；空/其它则由运行态推导)
 	// 任务级超时(见 docs/任务级超时与收尾设计.md)。DeadlineAt/FirstRunAt 为 unix 秒,0=未设/未运行。
-	TimeoutSeconds       int   `json:"timeout_seconds"`
-	PlanHeartbeatSeconds int   `json:"plan_heartbeat_seconds"` // planner 心跳触发间隔(秒)
-	CoverageEnabled      bool  `json:"coverage_enabled"`       // 资产覆盖度功能开关(创建时定,默认开)
-	FirstRunAt           int64 `json:"first_run_at,omitempty"`
-	DeadlineAt           int64 `json:"deadline_at,omitempty"`
+	TimeoutSeconds       int  `json:"timeout_seconds"`
+	PlanHeartbeatSeconds int  `json:"plan_heartbeat_seconds"` // planner 心跳触发间隔(秒)
+	CoverageEnabled      bool `json:"coverage_enabled"`       // 资产覆盖度功能开关(创建时定,默认开)
+	// VulnBrief 是「CVE 情报简报联动」任务级三态(POC_INTEL_CONTRACTS.md):nil=跟随全局。
+	VulnBrief  *bool `json:"vuln_brief,omitempty"`
+	FirstRunAt int64 `json:"first_run_at,omitempty"`
+	DeadlineAt int64 `json:"deadline_at,omitempty"`
 	// 三阶段字段(创建后不变,无需 lifecycle 锁):recon/exploit/post + agent/pipeline。
 	Stage    string          `json:"stage"`
 	Kind     string          `json:"kind"`
@@ -209,6 +211,15 @@ type taskLLMState struct {
 }
 
 func cloneInt64Ptr(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+// cloneBoolPtr 复制三态布尔指针(nil=跟随全局的语义随指针透传)。
+func cloneBoolPtr(value *bool) *bool {
 	if value == nil {
 		return nil
 	}
@@ -1011,13 +1022,14 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		CompanyIDs:     append([]int64(nil), pt.CompanyIDs...),
 		TimeoutSeconds: pt.TimeoutSeconds, PlanHeartbeatSeconds: pt.PlanHeartbeatSeconds,
 		CoverageEnabled: pt.CoverageEnabled,
+		VulnBrief:       cloneBoolPtr(pt.VulnBrief),
 		FirstRunAt:      unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
 		Stage: pt.Stage, Kind: pt.Kind, Pipeline: append(json.RawMessage(nil), pt.Pipeline...),
 		StepKey: pt.StepKey, StepConfig: append(json.RawMessage(nil), pt.StepConfig...),
 		SRCMode: pt.SRCMode, SRCProfileID: pt.SRCProfileID,
 		SRCPlatformID: pt.SRCPlatformID, SRCTargetID: pt.SRCTargetID,
 		RewardNote: pt.RewardNote,
-		ProxyMode: pt.ProxyMode, ProxyGroupID: pt.ProxyGroupID,
+		ProxyMode:  pt.ProxyMode, ProxyGroupID: pt.ProxyGroupID,
 		guardMode: pgdb.NormalizeTaskGuardMode(pt.GuardMode), guardRuleIDs: pgdb.NormalizeTaskGuardRuleIDs(pt.GuardRuleIDs),
 		Store: store, Guard: guard.NewWithInterceptor(ic), notify: make(chan struct{}, 1),
 	}

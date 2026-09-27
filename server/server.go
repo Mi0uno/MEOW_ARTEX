@@ -837,6 +837,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/vulndb/backfill", s.vulnBackfillStatus)
 	mux.HandleFunc("POST /api/vulndb/backfill", s.vulnBackfillStart)
 	mux.HandleFunc("DELETE /api/vulndb/backfill", s.vulnBackfillCancel)
+	// POC_INTEL_CONTRACTS.md 四组新路由(骨架见各自文件,四 agent 并行实现)。
+	registerVulnTaskRoutes(mux, s)         // 任务↔漏洞库联动(Agent A,vulndb_task_api.go)
+	registerTrickestBackfillRoutes(mux, s) // trickest 回填(Agent B,vulndb_trickest_api.go)
+	registerNucleiBackfillRoutes(mux, s)   // nuclei 正文回填(Agent C,vulndb_nuclei_api.go)
+	registerPocReviewRoutes(mux, s)        // PoC LLM 审核(Agent D,vulndb_poc_review_api.go)
 	// ---- SRC 平台选择(平台 → 目标 → 资产) ----
 	mux.HandleFunc("GET /api/src/platforms", s.listSRCPlatforms)
 	mux.HandleFunc("POST /api/src/platforms", s.createSRCPlatform)
@@ -1733,6 +1738,7 @@ type createTaskReq struct {
 	PlanHeartbeatSeconds int      `json:"plan_heartbeat_seconds"`      // planner 心跳触发间隔(秒);0/省略=默认600(10min);下限=默认=600,低于自动抬到600
 	SeedFirstIntent      *bool    `json:"seed_first_intent,omitempty"` // 创建时直接下发一条种子意图(内容=描述+目标),让 worker 免等首轮 planner 直接开跑;省略/null=默认关闭,走标准先规划再执行。显式传 true 才开(CTF 常一 work 解决时可省掉开跑前的 planner 轮)。
 	CoverageEnabled      *bool    `json:"coverage_enabled,omitempty"`  // 资产覆盖度功能;省略/null=默认开(true)。false=关闭覆盖度计算/展示/自动累积范围+隐藏 add_task_scope/list_untested_assets。company 关联不受影响。
+	VulnBrief            *bool    `json:"vuln_brief,omitempty"`        // CVE 情报简报联动;省略/null=跟随全局(settings vulndb_task_brief)。true/false=本任务强制开/关。
 	// 三阶段扩展:stage=recon 时任务走信息搜集收集器流水线(无需 LLM 配置)。
 	// 单步骤任务模型:step_key=收集器 key,step_config=该步骤配置(推荐);
 	// pipeline 为兼容保留的多步编排(与新模型互斥,step_key 优先)。
@@ -1874,6 +1880,7 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		SourceTaskIDs: sourceIDs, CompanyIDs: req.CompanyIDs, LLMProfileIDs: req.LLMProfileIDs,
 		TimeoutSeconds: req.TimeoutSeconds, PlanHeartbeatSeconds: req.PlanHeartbeatSeconds,
 		CoverageEnabled: req.CoverageEnabled,
+		VulnBrief:       req.VulnBrief,
 		Stage:           req.Stage, Pipeline: req.Pipeline,
 		StepKey: req.StepKey, StepConfig: req.StepConfig,
 		SRCMode:       req.SRCMode,

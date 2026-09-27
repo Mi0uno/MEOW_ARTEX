@@ -11,6 +11,15 @@ import (
 	"github.com/Autumn-27/artex/db"
 )
 
+// POC_INTEL_CONTRACTS.md 新增的 settings 键(与 vulndb_sync.go 的既有键并列;
+// 声明在本文件避免采集器文件被多方触碰)。
+const (
+	settingVulnTaskBrief      = "vulndb_task_brief"            // 任务 CVE 简报联动,缺省开
+	settingVulnPocHuntGHLimit = "vulndb_poc_hunt_github_limit" // GitHub PoC 搜索每轮条数,默认 120
+	settingVulnTrickestLimit  = "vulndb_trickest_limit"        // trickest 定向聚合每轮条数,默认 200
+	settingVulnPocReview      = "vulndb_poc_review"            // PoC LLM 审核,缺省开
+)
+
 // listVulnEntries GET /api/vulndb/entries?category=&categories=&severity=&status=&source=&q=&has_poc=&kev=&sort=&desc=&limit=&offset=
 // categories 支持逗号分隔多分类(如 categories=0day,nday = 漏洞库页排除 CVE)。
 func (s *Server) listVulnEntries(w http.ResponseWriter, r *http.Request) {
@@ -47,14 +56,14 @@ func (s *Server) listVulnEntries(w http.ResponseWriter, r *http.Request) {
 	}
 	// 严重度分类计数(CVE 页严重度页签):受除严重度外其它筛选影响。
 	sevCounts, err := s.m.PG().CountVulnEntriesBySeverity(db.VulnEntryFilter{
-		Category: strings.TrimSpace(q.Get("category")),
+		Category:   strings.TrimSpace(q.Get("category")),
 		Categories: cats,
-		Status:   strings.TrimSpace(q.Get("status")),
-		Source:   strings.TrimSpace(q.Get("source")),
-		Q:        strings.TrimSpace(q.Get("q")),
-		TaskID:   taskID,
-		HasPoc:   strings.TrimSpace(q.Get("has_poc")),
-		Kev:      strings.TrimSpace(q.Get("kev")),
+		Status:     strings.TrimSpace(q.Get("status")),
+		Source:     strings.TrimSpace(q.Get("source")),
+		Q:          strings.TrimSpace(q.Get("q")),
+		TaskID:     taskID,
+		HasPoc:     strings.TrimSpace(q.Get("has_poc")),
+		Kev:        strings.TrimSpace(q.Get("kev")),
 	})
 	if err != nil {
 		sevCounts = map[string]int{}
@@ -206,7 +215,8 @@ func (s *Server) reclassifyVulnEntry(w http.ResponseWriter, r *http.Request) {
 
 // ---- PoC ----
 
-// listVulnPocs GET /api/vulndb/entries/{id}/pocs?content=1
+// listVulnPocs GET /api/vulndb/entries/{id}/pocs?content=1&review_status=
+// review_status=pending|approved|rejected(空=全部;前端「隐藏存疑」用 rejected 取反在客户端做)。
 func (s *Server) listVulnPocs(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil || id <= 0 {
@@ -214,7 +224,7 @@ func (s *Server) listVulnPocs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	withContent := r.URL.Query().Get("content") == "1"
-	pocs, err := s.m.PG().ListVulnPocs(id, withContent)
+	pocs, err := s.m.PG().ListVulnPocsFilter(id, withContent, strings.TrimSpace(r.URL.Query().Get("review_status")))
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -233,6 +243,9 @@ type vulnPocPayload struct {
 	Content   string `json:"content"`
 	SourceURL string `json:"source_url"`
 	Verified  bool   `json:"verified"`
+	// 审核改判(仅 PUT 用):pending/approved/rejected,空=不改审核状态。
+	ReviewStatus string `json:"review_status"`
+	ReviewNote   string `json:"review_note"`
 }
 
 // createVulnPoc POST /api/vulndb/entries/{id}/pocs
@@ -247,9 +260,11 @@ func (s *Server) createVulnPoc(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "invalid JSON: "+err.Error())
 		return
 	}
+	// 人工录入视为已核:手工路径直接置 approved(自动源经 db 层默认 pending)。
 	poc, created, err := s.m.PG().CreateVulnPoc(db.VulnPocInput{
 		EntryID: id, Name: p.Name, Kind: p.Kind, Language: p.Language,
 		Content: p.Content, Source: "manual", SourceURL: p.SourceURL, Verified: p.Verified,
+		ReviewStatus: "approved",
 	})
 	if err != nil {
 		writeErr(w, 400, err.Error())
@@ -279,6 +294,13 @@ func (s *Server) updateVulnPoc(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		writeErr(w, 400, err.Error())
 		return
+	}
+	// 人工改判审核状态(与 LLM 审核同一落库口,reviewed_at 由 db 层置 now)。
+	if rs := strings.TrimSpace(p.ReviewStatus); rs != "" {
+		if err := s.m.PG().SetVulnPocReview(id, rs, strings.TrimSpace(p.ReviewNote)); err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
@@ -347,11 +369,34 @@ func (s *Server) vulnDBSyncStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	cnvdURL, _, _ := s.m.PG().GetSetting(settingVulnCNVDFeedURL)
+	// POC_INTEL_CONTRACTS 新增配置:任务简报/GitHub 搜索扩量/trickest 限额/PoC 审核。
+	taskBrief := true
+	if v, _, _ := s.m.PG().GetSetting(settingVulnTaskBrief); v == "false" {
+		taskBrief = false
+	}
+	pocReview := true
+	if v, _, _ := s.m.PG().GetSetting(settingVulnPocReview); v == "false" {
+		pocReview = false
+	}
+	huntGHLimit := 120
+	if v, _, _ := s.m.PG().GetSetting(settingVulnPocHuntGHLimit); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			huntGHLimit = n
+		}
+	}
+	trickestLimit := 200
+	if v, _, _ := s.m.PG().GetSetting(settingVulnTrickestLimit); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			trickestLimit = n
+		}
+	}
 	writeJSON(w, 200, map[string]any{
 		"runs": runs, "total": total, "status_counts": statusCounts, "latest": latest,
 		"counts": counts, "total_entries": totalEntries,
 		"enabled": enabled, "interval_hours": intervalH,
-		"cnvd_url": cnvdURL,
+		"cnvd_url":   cnvdURL,
+		"task_brief": taskBrief, "poc_review": pocReview,
+		"poc_hunt_github_limit": huntGHLimit, "trickest_limit": trickestLimit,
 	})
 }
 
@@ -368,12 +413,17 @@ func (s *Server) triggerVulnDBSync(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 202, map[string]any{"status": "started"})
 }
 
-// setVulnDBSyncConfig PUT /api/vulndb/sync/config — 开关、间隔与 CNVD 数据端点。
+// setVulnDBSyncConfig PUT /api/vulndb/sync/config — 开关、间隔、CNVD 数据端点与
+// POC_INTEL_CONTRACTS 新增配置(任务简报/GitHub 搜索扩量/trickest 限额/PoC 审核)。
 func (s *Server) setVulnDBSyncConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Enabled       *bool   `json:"enabled"`
 		IntervalHours *int    `json:"interval_hours"`
 		CNVDURL       *string `json:"cnvd_url"`
+		TaskBrief     *bool   `json:"task_brief"`
+		PocReview     *bool   `json:"poc_review"`
+		HuntGHLimit   *int    `json:"poc_hunt_github_limit"`
+		TrickestLimit *int    `json:"trickest_limit"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
 		writeErr(w, 400, "invalid JSON: "+err.Error())
@@ -398,6 +448,47 @@ func (s *Server) setVulnDBSyncConfig(w http.ResponseWriter, r *http.Request) {
 	if req.CNVDURL != nil {
 		// 允许置空 = 停用 CNVD 数据端点。
 		if err := s.m.PG().SetSetting(settingVulnCNVDFeedURL, strings.TrimSpace(*req.CNVDURL)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.TaskBrief != nil {
+		v := "false"
+		if *req.TaskBrief {
+			v = "true"
+		}
+		if err := s.m.PG().SetSetting(settingVulnTaskBrief, v); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.PocReview != nil {
+		v := "false"
+		if *req.PocReview {
+			v = "true"
+		}
+		if err := s.m.PG().SetSetting(settingVulnPocReview, v); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	// 限额类:0=恢复代码内默认(抓取函数对 0 回落默认值),负数拒绝。
+	if req.HuntGHLimit != nil {
+		if *req.HuntGHLimit < 0 {
+			writeErr(w, 400, "poc_hunt_github_limit 不能为负")
+			return
+		}
+		if err := s.m.PG().SetSetting(settingVulnPocHuntGHLimit, strconv.Itoa(*req.HuntGHLimit)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.TrickestLimit != nil {
+		if *req.TrickestLimit < 0 {
+			writeErr(w, 400, "trickest_limit 不能为负")
+			return
+		}
+		if err := s.m.PG().SetSetting(settingVulnTrickestLimit, strconv.Itoa(*req.TrickestLimit)); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}

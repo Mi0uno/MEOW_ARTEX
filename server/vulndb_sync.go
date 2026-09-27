@@ -184,6 +184,17 @@ func (v *vulnSync) runOnce(ctx context.Context) {
 	} else {
 		totalNew += n
 	}
+	// 10) trickest/cve 全网 PoC 聚合(POC_INTEL_CONTRACTS.md,实现见 vulndb_trickest.go):
+	// 每轮给无 PoC 条目定向拉 trickest 聚合页,挂 PoC 链接。
+	if p, err := v.syncTrickest(ctx); err != nil {
+		log.Printf("[vulndb-sync] trickest 聚合失败: %v", err)
+	} else {
+		totalPocs += p
+	}
+
+	// 本轮新入库的 PoC 送去 LLM 审核(POC_INTEL_CONTRACTS.md;实现见 vulndb_poc_review.go,
+	// 异步、sem 限流,LLM 未配置时内部直接返回)。
+	go v.s.maybeTriggerPocReview()
 
 	log.Printf("[vulndb-sync] 采集完成:新增 %d 更新 %d PoC %d,耗时 %s",
 		totalNew, totalUpd, totalPocs, time.Since(start).Round(time.Second))

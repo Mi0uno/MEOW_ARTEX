@@ -76,6 +76,9 @@ type ToolSet struct {
 	findingRecorder FindingRecorder
 	// memoryRecall 跨任务记忆检索回调(契约 §7,接线见 agent/memory.go);nil = 工具报「记忆功能不可用」。
 	memoryRecall func(ctx context.Context, query, scope string) (string, error)
+	// vulndbSearch 漏洞库检索回调(契约 POC_INTEL_CONTRACTS.md,接线见 agent/vulndb_tool.go);
+	// nil = 工具报「漏洞库查询不可用」。
+	vulndbSearch func(ctx context.Context, query, severity, kev, hasPoc string, limit int) (string, error)
 	as              *db.AssetStore   // asset store (optional; nil = asset tools not available)
 	cs              *db.CompanyStore // company store (optional)
 	ts              *db.ExplorationStore
@@ -2209,5 +2212,7 @@ func (t *ToolSet) PlannerTools() []actool.CoreTool {
 		t.listUntestedAssets(),
 		// memory_recall：跨任务记忆检索(契约 §7)——规划前先查历史沉淀,防重复探索。
 		t.memoryRecallTool(),
+		// vulndb_search：漏洞库检索(POC_INTEL_CONTRACTS)——规划时按指纹查已知漏洞/PoC 定攻击面。
+		t.vulndbSearchTool(),
 	}
 }

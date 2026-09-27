@@ -41,6 +41,11 @@ type MainAgent struct {
 	// 记忆简报/检索回调(契约 §7,setter 在 agent/memory.go);nil = 不注入/工具不可用。
 	memoryBriefFn  func(taskID string) string
 	memoryRecallFn func(ctx context.Context, taskID, query, scope string) (string, error)
+
+	// CVE 情报简报/漏洞库检索回调(契约 POC_INTEL_CONTRACTS.md,setter 在 agent/vulndb_tool.go);
+	// nil = 不注入/工具不可用。
+	vulnBriefFn  func(taskID string) string
+	vulnSearchFn func(ctx context.Context, query, severity, kev, hasPoc string, limit int) (string, error)
 }
 
 // SetNoaEnabled wires a resolver deciding whether runs use the experimental noa
@@ -135,6 +140,7 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	tsx.SetNotifyHint(notifyHint) // add_hint 新增提示 → 给 planner 记一条「人新增了 N 条战略提示：…」触发
 	tsx.steerWork = m.steerWork   // enable steer_work tool (nil = unavailable)
 	wireMemoryRecall(tsx, taskID, m.memoryRecallFn) // 跨任务记忆检索(契约 §7):nil 时工具自然降级
+	wireVulndbSearch(tsx, m.vulnSearchFn)           // 漏洞库检索(POC_INTEL_CONTRACTS):nil 时工具自然降级
 	// 领域工具 + 基础默认工具集（Read/Write/Edit/MultiEdit/LS/Glob/Grep/Bash）
 	// 资产覆盖度功能关闭时剔除 add_task_scope/list_untested_assets（不入 prompt）。
 	// 远程执行环境(每次 Chat 解析一次):任务指派了 VPS 时,主 agent 对话里的 Bash
@@ -152,6 +158,7 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	ctx = intercept.WithReviewWorkingDirectory(ctx, mainDir)
 	sysBody := mainAgentSystem(goal, m.workDir, mainDir)
 	sysBody = appendMemoryBrief(sysBody, m.memoryBriefFn, taskID) // 记忆简报(契约 §7.2):vps 块之前追加
+	sysBody = appendVulnBrief(sysBody, m.vulnBriefFn, taskID)     // CVE 情报简报(POC_INTEL_CONTRACTS):同层、vps 块之前
 	if vps != nil {
 		sysBody += vps.SystemBlock // 远程执行环境:机器档案 + Bash 走 SSH 的使用规约
 	}

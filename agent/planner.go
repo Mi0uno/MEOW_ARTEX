@@ -49,6 +49,11 @@ type Planner struct {
 	memoryBriefFn  func(taskID string) string
 	memoryRecallFn func(ctx context.Context, taskID, query, scope string) (string, error)
 
+	// CVE 情报简报/漏洞库检索回调(契约 POC_INTEL_CONTRACTS.md,setter 在 agent/vulndb_tool.go);
+	// nil = 不注入/工具不可用。
+	vulnBriefFn  func(taskID string) string
+	vulnSearchFn func(ctx context.Context, query, severity, kev, hasPoc string, limit int) (string, error)
+
 	// todos keeps ONE plan-scratchpad per task (keyed by exploration id) so the
 	// planner's multi-step plan survives across wake-ups — each Plan() is a fresh
 	// session, but the shared store lets it record a serial exploit chain once and
@@ -381,6 +386,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	tsx.killWork = p.killWork   // enable kill_work tool (nil = unavailable)
 	tsx.steerWork = p.steerWork // enable steer_work tool (nil = unavailable)
 	wireMemoryRecall(tsx, taskID, p.memoryRecallFn) // 跨任务记忆检索(契约 §7):nil 时工具自然降级
+	wireVulndbSearch(tsx, p.vulnSearchFn)           // 漏洞库检索(POC_INTEL_CONTRACTS):nil 时工具自然降级
 	if origin, _ := ts.OriginFactID(); origin > 0 {
 		tsx.SetOwnerNode(origin) // planner-side anchors default to the task root (origin fact)
 	}
@@ -415,6 +421,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,框定探索边界
 	}
 	sysBody = appendMemoryBrief(sysBody, p.memoryBriefFn, taskID) // 记忆简报(契约 §7.2):约束同层、vps 块之前
+	sysBody = appendVulnBrief(sysBody, p.vulnBriefFn, taskID)     // CVE 情报简报(POC_INTEL_CONTRACTS):同层、vps 块之前
 	if vps != nil {
 		sysBody += vps.SystemBlock // 远程执行环境:机器档案 + Bash 走 SSH 的使用规约(与约束注入同一层追加)
 	}

@@ -62,17 +62,41 @@ type VulnEntry struct {
 
 // VulnPoc 是漏洞库条目下的一条 PoC。
 type VulnPoc struct {
-	ID        int64     `json:"id"`
-	EntryID   int64     `json:"entry_id"`
-	Name      string    `json:"name"`
-	Kind      string    `json:"kind"` // poc | exp | nuclei | script
-	Language  string    `json:"language"`
-	Content   string    `json:"content,omitempty"`
-	Source    string    `json:"source"` // manual | github | exploitdb | ai_generated
-	SourceURL string    `json:"source_url"`
-	Verified  bool      `json:"verified"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID        int64  `json:"id"`
+	EntryID   int64  `json:"entry_id"`
+	Name      string `json:"name"`
+	Kind      string `json:"kind"` // poc | exp | nuclei | script
+	Language  string `json:"language"`
+	Content   string `json:"content,omitempty"`
+	Source    string `json:"source"` // manual | github | exploitdb | pocorexp | nuclei | web | trickest | ai_generated
+	SourceURL string `json:"source_url"`
+	Verified  bool   `json:"verified"`
+	// PoC 审核软质检层(POC_INTEL_CONTRACTS.md):pending/approved/rejected。
+	// 自动源入库恒为 pending;LLM 审核与人工改判都会写 reviewed_at。
+	ReviewStatus string     `json:"review_status"`
+	ReviewNote   string     `json:"review_note"`
+	ReviewedAt   *time.Time `json:"reviewed_at,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
+}
+
+// vulnPocListCols 列表不带 content(大文本只详情读)。
+const vulnPocListCols = `id, entry_id, name, kind, language, source, source_url, verified,
+	review_status, review_note, reviewed_at, created_at, updated_at`
+
+const vulnPocFullCols = vulnPocListCols + `, content`
+
+func scanVulnPoc(sc interface{ Scan(...any) error }, full bool) (*VulnPoc, error) {
+	var p VulnPoc
+	dest := []any{&p.ID, &p.EntryID, &p.Name, &p.Kind, &p.Language, &p.Source, &p.SourceURL, &p.Verified,
+		&p.ReviewStatus, &p.ReviewNote, &p.ReviewedAt, &p.CreatedAt, &p.UpdatedAt}
+	if full {
+		dest = append(dest, &p.Content)
+	}
+	if err := sc.Scan(dest...); err != nil {
+		return nil, err
+	}
+	return &p, nil
 }
 
 // vulnEntryListCols 列表不带 description/exploitation/remediation(可能很长)。
@@ -377,45 +401,125 @@ func (d *DB) DeleteVulnEntry(id int64) (bool, error) {
 // ---- PoC ----
 
 // ListVulnPocs 列出某条目的全部 PoC(正文只在需要时读,列表可带 content=false)。
+// ListVulnPocs 列出条目下全部 PoC(withContent=true 带正文)。
 func (d *DB) ListVulnPocs(entryID int64, withContent bool) ([]*VulnPoc, error) {
-	cols := `id, entry_id, name, kind, language, source, source_url, verified, created_at, updated_at`
+	return d.ListVulnPocsFilter(entryID, withContent, "")
+}
+
+// ListVulnPocsFilter 按 PoC 审核状态筛选列出(reviewStatus: pending/approved/rejected,
+// 空=不限)。前端「隐藏存疑」与审核工作台共用。
+func (d *DB) ListVulnPocsFilter(entryID int64, withContent bool, reviewStatus string) ([]*VulnPoc, error) {
+	cols := vulnPocListCols
 	if withContent {
-		cols = `id, entry_id, name, kind, language, source, source_url, verified, created_at, updated_at, content`
+		cols = vulnPocFullCols
 	}
-	rows, err := d.Query(`SELECT `+cols+` FROM vulndb_pocs WHERE entry_id=$1 ORDER BY id`, entryID)
+	where := "WHERE entry_id=$1"
+	args := []any{entryID}
+	if reviewStatus != "" {
+		where += " AND review_status=$2"
+		args = append(args, reviewStatus)
+	}
+	rows, err := d.Query(`SELECT `+cols+` FROM vulndb_pocs `+where+` ORDER BY id`, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	out := []*VulnPoc{}
 	for rows.Next() {
-		var p VulnPoc
-		dest := []any{&p.ID, &p.EntryID, &p.Name, &p.Kind, &p.Language, &p.Source, &p.SourceURL, &p.Verified, &p.CreatedAt, &p.UpdatedAt}
-		if withContent {
-			dest = append(dest, &p.Content)
-		}
-		if err := rows.Scan(dest...); err != nil {
+		p, err := scanVulnPoc(rows, withContent)
+		if err != nil {
 			return nil, err
 		}
-		out = append(out, &p)
+		out = append(out, p)
 	}
 	return out, rows.Err()
 }
 
-// GetVulnPoc 读取单条 PoC 全文。
+// VulnPocReviewStats 返回审核三态的全库计数(审核工作台徽标用)。
+func (d *DB) VulnPocReviewStats() (pending, approved, rejected int, err error) {
+	rows, err := d.Query(`SELECT review_status, COUNT(*) FROM vulndb_pocs GROUP BY review_status`)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var status string
+		var n int
+		if err := rows.Scan(&status, &n); err != nil {
+			return 0, 0, 0, err
+		}
+		switch status {
+		case "pending":
+			pending = n
+		case "approved":
+			approved = n
+		case "rejected":
+			rejected = n
+		}
+	}
+	return pending, approved, rejected, rows.Err()
+}
+
+// SetVulnPocReview 写审核结论(LLM 审核与人工改判共用):status 必须是三态之一,
+// note 为空则保留原值。reviewed_at 置 now()。
+func (d *DB) SetVulnPocReview(id int64, status, note string) error {
+	switch status {
+	case "pending", "approved", "rejected":
+	default:
+		return fmt.Errorf("非法审核状态 %q", status)
+	}
+	if note == "" {
+		_, err := d.Exec(`UPDATE vulndb_pocs SET review_status=$2, reviewed_at=now(), updated_at=now() WHERE id=$1`, id, status)
+		return err
+	}
+	_, err := d.Exec(`UPDATE vulndb_pocs SET review_status=$2, review_note=$3, reviewed_at=now(), updated_at=now() WHERE id=$1`, id, status, note)
+	return err
+}
+
+// SetVulnPocContent 按 (entry_id, source_url) 定位 PoC 写入正文(幂等):
+// 行存在则 UPDATE content/language;不存在则补建最小行(回填挂载用)。
+// 返回是否实际写库(false=entry 不存在等)。
+func (d *DB) SetVulnPocContent(entryID int64, sourceURL, content, language string) (bool, error) {
+	if entryID <= 0 {
+		return false, fmt.Errorf("entry_id 必填")
+	}
+	sourceURL = strings.TrimSpace(sourceURL)
+	if sourceURL == "" {
+		return false, fmt.Errorf("source_url 必填")
+	}
+	res, err := d.Exec(`UPDATE vulndb_pocs SET content=$3, language=CASE WHEN $4<>'' THEN $4 ELSE language END,
+		updated_at=now() WHERE entry_id=$1 AND source_url=$2`, entryID, sourceURL, content, language)
+	if err != nil {
+		return false, err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		return true, nil
+	}
+	// 行不存在:确认 entry 还在,再补建最小行(与 CreateVulnPoc 同幂等键)。
+	var ok bool
+	if err := d.QueryRow(`SELECT EXISTS(SELECT 1 FROM vulndb_entries WHERE id=$1)`, entryID).Scan(&ok); err != nil || !ok {
+		return false, err
+	}
+	_, wasCreated, err := d.CreateVulnPoc(VulnPocInput{
+		EntryID: entryID, Name: "nuclei", Kind: "nuclei", Language: language,
+		Content: content, Source: "nuclei", SourceURL: sourceURL,
+	})
+	if err != nil || !wasCreated {
+		return false, err
+	}
+	return true, nil
+}
+
+// GetVulnPoc 读取单条 PoC 全文。无行返回 (nil, nil)。
 func (d *DB) GetVulnPoc(id int64) (*VulnPoc, error) {
-	var p VulnPoc
-	err := d.QueryRow(`SELECT id, entry_id, name, kind, language, source, source_url, verified,
-		created_at, updated_at, content FROM vulndb_pocs WHERE id=$1`, id).
-		Scan(&p.ID, &p.EntryID, &p.Name, &p.Kind, &p.Language, &p.Source, &p.SourceURL, &p.Verified,
-			&p.CreatedAt, &p.UpdatedAt, &p.Content)
+	p, err := scanVulnPoc(d.QueryRow(`SELECT `+vulnPocFullCols+` FROM vulndb_pocs WHERE id=$1`, id), true)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	return &p, nil
+	return p, nil
 }
 
 // VulnPocInput 是新建/更新 PoC 的输入。
@@ -428,6 +532,8 @@ type VulnPocInput struct {
 	Source    string
 	SourceURL string
 	Verified  bool
+	// ReviewStatus:空="pending";手工建 PoC 的调用方传 "approved"(人工录入视为已核)。
+	ReviewStatus string
 }
 
 // CreateVulnPoc 新增一条 PoC 并刷新条目的 poc_count。
@@ -445,14 +551,19 @@ func (d *DB) CreateVulnPoc(in VulnPocInput) (*VulnPoc, bool, error) {
 	if strings.TrimSpace(in.Name) == "" {
 		in.Name = in.Kind
 	}
+	reviewStatus := "pending"
+	if in.ReviewStatus == "approved" || in.ReviewStatus == "rejected" {
+		reviewStatus = in.ReviewStatus
+	}
 	var p VulnPoc
 	err := d.QueryRow(`
-INSERT INTO vulndb_pocs(entry_id, name, kind, language, content, source, source_url, verified)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+INSERT INTO vulndb_pocs(entry_id, name, kind, language, content, source, source_url, verified, review_status, reviewed_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,CASE WHEN $9='approved' THEN now() ELSE NULL END)
 ON CONFLICT (entry_id, source_url) WHERE source_url <> '' DO NOTHING
-RETURNING id, entry_id, name, kind, language, source, source_url, verified, created_at, updated_at`,
-		in.EntryID, strings.TrimSpace(in.Name), in.Kind, in.Language, in.Content, in.Source, in.SourceURL, in.Verified).
-		Scan(&p.ID, &p.EntryID, &p.Name, &p.Kind, &p.Language, &p.Source, &p.SourceURL, &p.Verified, &p.CreatedAt, &p.UpdatedAt)
+RETURNING `+vulnPocListCols,
+		in.EntryID, strings.TrimSpace(in.Name), in.Kind, in.Language, in.Content, in.Source, in.SourceURL, in.Verified, reviewStatus).
+		Scan(&p.ID, &p.EntryID, &p.Name, &p.Kind, &p.Language, &p.Source, &p.SourceURL, &p.Verified,
+			&p.ReviewStatus, &p.ReviewNote, &p.ReviewedAt, &p.CreatedAt, &p.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, false, nil // 同来源 URL 已存在,跳过
 	}
@@ -897,6 +1008,47 @@ func (d *DB) LatestVulnSyncRuns() ([]*VulnSyncRun, error) {
 			r.FinishedAt = &t
 		}
 		out = append(out, &r)
+	}
+	return out, rows.Err()
+}
+
+// MatchVulnEntriesForFingerprints 按资产指纹词(技术栈/服务名/页面标题关键词)匹配
+// 漏洞库条目——任务启动时的 CVE 情报简报数据源。只返回有 PoC 的 active 条目,
+// 排序:KEV 在前 → 严重度高在前 → PoC 多在前 → 更新时间新在前。
+// terms 为空或全为噪声词时返回空列表(不报错)。
+func (d *DB) MatchVulnEntriesForFingerprints(terms []string, limit int) ([]*VulnEntry, error) {
+	patterns := []any{}
+	for _, t := range terms {
+		t = strings.TrimSpace(t)
+		if len(t) < 3 { // 过短词误配率极高(如 "go"/"php" 单独出现),兜底过滤
+			continue
+		}
+		patterns = append(patterns, "%"+t+"%")
+	}
+	if len(patterns) == 0 {
+		return []*VulnEntry{}, nil
+	}
+	if limit <= 0 {
+		limit = 30
+	}
+	rows, err := d.Query(`SELECT `+vulnEntryListCols+` FROM vulndb_entries
+		WHERE status='active' AND poc_count > 0
+		AND (vendor ILIKE ANY($1) OR product ILIKE ANY($1) OR title ILIKE ANY($1) OR affected ILIKE ANY($1))
+		ORDER BY kev DESC,
+			CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,
+			poc_count DESC, updated_at DESC
+		LIMIT $2`, patterns, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*VulnEntry{}
+	for rows.Next() {
+		e, err := scanVulnEntry(rows, false)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
 	}
 	return out, rows.Err()
 }

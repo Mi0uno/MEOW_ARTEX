@@ -58,6 +58,8 @@ export interface Task {
   archive_blocked_by_task_id?: string; // live direct dependent that must be archived first
   company_ids?: number[]; // associated company scopes; current company assets join the task at creation
   coverage_enabled?: boolean; // 资产覆盖度功能开关(创建时定,默认开)；false=不计算/不展示覆盖度
+  /** CVE 情报简报联动(任务级三态):null/缺省=跟随全局(settings vulndb_task_brief);true/false=强制开/关 */
+  vuln_brief?: boolean | null;
   /** 奖励标准(创建时 AI 识别拆分或人工填写,创建后不可改);空=无;任务详情总览有内容才渲染卡片 */
   reward_note?: string;
 }
@@ -296,11 +298,42 @@ export interface VulnPoc {
   kind: "poc" | "exp" | "nuclei" | "script" | string;
   language: string;
   content?: string;
-  source: "manual" | "github" | "exploitdb" | "ai_generated" | string;
+  source: "manual" | "github" | "exploitdb" | "pocorexp" | "nuclei" | "trickest" | "ai_generated" | string;
   source_url: string;
   verified: boolean;
+  // PoC 审核软质检层(POC_INTEL_CONTRACTS):自动源=pending,LLM/人工打标。
+  review_status: "pending" | "approved" | "rejected" | string;
+  review_note: string; // 审核理由(LLM 或人工);空=未写
+  reviewed_at?: string;
   created_at: string;
   updated_at: string;
+}
+
+// 任务 CVE 情报简报(GET /api/tasks/{id}/vuln-brief,按任务资产指纹自动匹配库内漏洞)。
+export interface VulnBriefDTO {
+  task_id: string;
+  enabled: boolean; // 本任务是否启用联动(任务级三态 or 全局开关)
+  generated_at: string;
+  fingerprints: string[]; // 参与匹配的资产指纹词
+  entries: VulnEntry[]; // 命中条目(kev/severity 已排序;前端按 kev 分组渲染)
+}
+
+// PoC 审核三态计数(GET /api/vulndb/review/stats)。
+export interface PocReviewStats {
+  pending: number;
+  approved: number;
+  rejected: number;
+}
+
+// PoC 历史回填作业状态(nuclei/trickest 共形)。
+export interface PocBackfillStatus {
+  running: boolean;
+  done: boolean;
+  processed: number;
+  matched: number;
+  error: string;
+  started_at: string;
+  finished_at: string;
 }
 
 export interface VulnSyncRun {
