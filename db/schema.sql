@@ -1537,6 +1537,38 @@ DROP TRIGGER IF EXISTS trg_vulndb_upd ON vulndb_entries;
 CREATE TRIGGER trg_vulndb_upd BEFORE UPDATE ON vulndb_entries
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
+-- finding 唯一(非空时):同一 finding 只允许一条漏洞库条目。
+-- ⚠️ 必须排在下方「去重三连」之后:存量库已有并发双入库的历史重复行
+-- (report_finding 钩子与 update_finding_report 双触发,守卫先查后插的竞态),
+-- 不先清理,建唯一索引会让启动 schema 应用整体失败。
+-- 三连均幂等:首轮清理落索引,之后每轮 0 行命中。
+-- ① 重复行(每组较旧者)上的 PoC 先并到保留行(保留行已有同 source_url 的
+--    PoC 时留在原地,随重复行级联删除);
+UPDATE vulndb_pocs p SET entry_id = d.keep_id
+FROM (
+    SELECT a.id AS dup_id, max(b.id) AS keep_id
+    FROM vulndb_entries a
+    JOIN vulndb_entries b
+      ON a.finding_id IS NOT NULL AND a.finding_id = b.finding_id AND a.id < b.id
+    GROUP BY a.id
+) d
+WHERE p.entry_id = d.dup_id
+  AND NOT EXISTS (
+      SELECT 1 FROM vulndb_pocs q
+      WHERE q.entry_id = d.keep_id AND q.source_url <> '' AND q.source_url = p.source_url
+  );
+-- ② 保留行重算 PoC 计数(PoC 并入后冗余计数已失真);
+UPDATE vulndb_entries e SET poc_count = (
+    SELECT count(*) FROM vulndb_pocs p WHERE p.entry_id = e.id
+) WHERE e.finding_id IS NOT NULL
+  AND EXISTS (SELECT 1 FROM vulndb_entries b WHERE b.finding_id = e.finding_id AND b.id < e.id);
+-- ③ 删重复行(每组保留最新一条——后一轮归类看到了完整报告,内容更全);
+DELETE FROM vulndb_entries a
+USING vulndb_entries b
+WHERE a.finding_id IS NOT NULL AND a.finding_id = b.finding_id AND a.id < b.id;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vulndb_finding_unique
+    ON vulndb_entries(finding_id) WHERE finding_id IS NOT NULL;
+
 -- ============================================================
 -- 漏洞 PoC(vulndb_pocs):一条漏洞可挂多个 PoC(多来源/多语言)。
 -- kind 区分 poc(验证) / exp(利用) / nuclei / script。

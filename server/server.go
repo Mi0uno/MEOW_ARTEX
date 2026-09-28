@@ -51,6 +51,12 @@ type Server struct {
 	templateMu sync.Mutex
 	// vulnSync 是 CVE 定时采集器(定时从公开漏洞源拉取情报 + 自动发现 PoC)。
 	vulnSync *vulnSync
+	// classifyMu/classifyLocks 串行化同一 finding 的漏洞库自动归类:report_finding
+	// 登记钩子与 update_finding_report 都会异步入库,而幂等守卫(FindVulnEntryByFinding)
+	// 是「先查后插」——归类要跑搜索取证+AI(分钟级),并发双触发会双双通过守卫,
+	// 同一 finding 入库两条(2026-09-28 用户报「漏洞库条目全部重复」的根因)。
+	classifyMu    sync.Mutex
+	classifyLocks map[int64]*sync.Mutex
 	// reconMonitor 是资产监控调度器(有域名范围的企业按间隔持续被动子域测绘 +
 	// 新子域探活,直写资产图;实现在 recon_monitor.go)。
 	reconMonitor *reconMonitor

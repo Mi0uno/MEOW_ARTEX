@@ -23,6 +23,7 @@ import (
 	"log"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Autumn-27/artex/db"
@@ -63,6 +64,26 @@ func matchNDayHint(hay string) string {
 	return ""
 }
 
+// lockFinding 对同一 finding 的自动归类做进程内互斥:report_finding 登记钩子与
+// update_finding_report 都会异步入库,而幂等守卫(FindVulnEntryByFinding)是
+// 「先查后插」——归类要跑搜索取证+AI(分钟级),两次触发落在竞态窗口内会双双
+// 通过守卫,同一 finding 入库两条。锁住整个归类过程,后到者等前者落库后复查守卫
+// 自然跳过。返回解锁函数。
+func (s *Server) lockFinding(findingID int64) func() {
+	s.classifyMu.Lock()
+	defer s.classifyMu.Unlock()
+	if s.classifyLocks == nil {
+		s.classifyLocks = map[int64]*sync.Mutex{}
+	}
+	mu, ok := s.classifyLocks[findingID]
+	if !ok {
+		mu = &sync.Mutex{}
+		s.classifyLocks[findingID] = mu
+	}
+	mu.Lock()
+	return mu.Unlock
+}
+
 // AutoClassifyFinding 把一个 finding 自动归类入漏洞库。
 // ctx 用于 HTTP 同步调用(reclassify)时跟随请求取消;异步调用传 context.Background()。
 func (s *Server) autoClassifyFinding(ctx context.Context, findingID int64) {
@@ -74,6 +95,12 @@ func (s *Server) autoClassifyFinding(ctx context.Context, findingID int64) {
 		return
 	}
 	// 已有条目关联则跳过(幂等:同一 finding 只入库一次)。
+	if e, err := s.m.PG().FindVulnEntryByFinding(findingID); err == nil && e != nil {
+		return
+	}
+	unlock := s.lockFinding(findingID)
+	defer unlock()
+	// 锁内复查:等锁期间并发的第一次归类可能已经落库。
 	if e, err := s.m.PG().FindVulnEntryByFinding(findingID); err == nil && e != nil {
 		return
 	}
@@ -146,6 +173,13 @@ func (s *Server) autoClassifyFinding(ctx context.Context, findingID int64) {
 		Status:       "active",
 	})
 	if err != nil {
+		// finding_id 唯一索引冲突(idx_vulndb_finding_unique,跨实例/残余竞态兜底):
+		// 已有条目占了该 finding → 改关联到它,不报错。
+		if existing, e2 := s.m.PG().FindVulnEntryByFinding(findingID); e2 == nil && existing != nil {
+			s.linkFindingToEntry(findingID, existing.ID, f.TaskID)
+			log.Printf("[vulndb] 发现 %d 命中已有条目 #%d(finding 唯一索引兜底)", findingID, existing.ID)
+			return
+		}
 		// CVE 唯一索引冲突 = 该 CVE 已在库中(定时搜集先入了):改为关联到已有条目。
 		if res.CVEID != "" {
 			if existing, e2 := s.m.PG().FindVulnEntryByCVE(res.CVEID); e2 == nil && existing != nil {
