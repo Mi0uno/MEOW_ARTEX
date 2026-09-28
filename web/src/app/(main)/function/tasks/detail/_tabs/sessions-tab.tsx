@@ -924,6 +924,15 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     };
   }, [taskId]);
 
+  // A task whose reviews all predate this page open never sees them via SSE (it only
+  // tails the live stream), so the first poll hit loads the review history once.
+  React.useEffect(() => {
+    if (!latestReview) return;
+    const s = store.review;
+    if (s && (s.loaded || s.loading || s.items.length > 0 || s.lastTs !== "")) return;
+    loadSession("review");
+  }, [latestReview, store, loadSession]);
+
   // Re-render on a timer so "streaming" liveness recomputes as activity goes stale.
   const [, setTick] = React.useState(0);
   React.useEffect(() => {
@@ -1266,9 +1275,12 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   const currentMainKey = mainSessionKey(currentSeg);
   const plannerLive = recentLive("plan");
   // Review group appears only after the task has goal-review activity: SSE cold-session
-  // tails (unread accounting) or a loaded history page both establish the store entry.
+  // tails (unread accounting), a loaded history page, or a latest-review poll hit (the
+  // probe effect loads history when reviews predate this page open — SSE never replays
+  // historical frames, so without it the group could never become visible).
   const reviewState = store.review;
-  const reviewSeen = !!reviewState && (reviewState.lastTs !== "" || reviewState.items.length > 0);
+  const reviewSeen =
+    (!!reviewState && (reviewState.lastTs !== "" || reviewState.items.length > 0)) || !!latestReview;
   const reviewLive = recentLive("review");
 
   // Which main segment is streaming RIGHT NOW. A main turn is serialized per task, so at
