@@ -367,7 +367,11 @@ export function ApprovalDetail({
   if (flagged && audit?.execution_status === "awaiting_result") execution = "已判疑放通，等待执行结果";
   // 脚本提取不止 command 一个键（契约 APPROVAL_CONSOLE_CONTRACTS §5）；helper 对
   // 任意 tool_input 形态安全（非对象返回空数组），与下方 Collapsible 的展示条件一致。
+  // 审计懒加载完成后追加命令引用的脚本文件快照（审批时刻的磁盘内容）——转人工的
+  // 理由常是「无法确认脚本内容」，审核人必须能看到脚本本身。
   const scriptSections = extractScriptSections(row.tool_name, row.tool_input);
+  const scriptFiles = audit?.script_files ?? [];
+  const scriptCount = scriptSections.length + scriptFiles.length;
   let initialLabel = source(row) === "model" ? "模型初判" : "规则初判";
   if (audit?.model_fallback) initialLabel = "模型异常回退";
 
@@ -379,18 +383,31 @@ export function ApprovalDetail({
             label={`${current.agent_name || current.conv_agent_key || "Agent"} · 工具请求`}
             text={JSON.stringify(row.tool_input ?? {}, null, 2)}
           />
-          {scriptSections.length ? (
+          {scriptCount ? (
             <Collapsible>
               <CollapsibleTrigger asChild>
                 <Button variant="ghost" size="sm">
                   <ChevronDownIcon data-icon="inline-start" />
-                  查看脚本内容（{scriptSections.length} 段）
+                  查看脚本内容（{scriptCount} 段）
                 </Button>
               </CollapsibleTrigger>
               <CollapsibleContent className="flex min-w-0 flex-col gap-3 pt-2">
                 {scriptSections.map((section) => (
                   <CodeBlock key={section.label} label={section.label} text={section.text} />
                 ))}
+                {scriptFiles.map((file) => (
+                  <CodeBlock
+                    key={`file-${file.path}`}
+                    label={`脚本文件快照 · ${file.path}`}
+                    text={file.missing ? "读取失败：文件不存在或不可读，快照未取到内容。" : file.content ?? ""}
+                    truncated={file.truncated}
+                  />
+                ))}
+                {scriptFiles.length ? (
+                  <p className="text-muted-foreground text-xs">
+                    脚本文件快照取自审批时刻的磁盘内容；此后文件如有变更，以快照为准。
+                  </p>
+                ) : null}
               </CollapsibleContent>
             </Collapsible>
           ) : null}

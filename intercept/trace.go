@@ -162,6 +162,9 @@ func auditFor(ctx context.Context, dec Decision, input []byte, status string) *d
 	a.ModelInput, a.ModelInputDigest = dec.ModelInput, dec.ModelInputDigest
 	a.RuleName, a.ConfigDigest, a.ProfileID = dec.RuleName, dec.ConfigDigest, dec.ProfileID
 	a.ExecutionStatus = "not_started"
+	// 命令引用的解释器脚本在审批时刻抓快照:转人工的理由常是「无法确认脚本内容」,
+	// 审核人必须看到脚本本身而不是只有引用它的一行命令。只读旁路,失败静默降级。
+	a.ScriptFiles = captureScriptFiles(ctx, input)
 	if status == "allowed" {
 		a.EffectiveAction, a.ExecutionStatus = "allow", "awaiting_result"
 		if a.Correlation != "exact" {

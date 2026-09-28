@@ -16,6 +16,16 @@ type InterceptContextEntry struct {
 	Truncated bool   `json:"truncated,omitempty"`
 }
 
+// InterceptScriptFile 是审批时刻命令引用的本地脚本文件快照(审计附件):
+// 转人工的理由常是「无法确认脚本内容」,审核人必须能看到要审的脚本本身,
+// 而不是只有引用它的一行命令。快照在审批时抓取,之后文件的变更不改历史记录。
+type InterceptScriptFile struct {
+	Path      string `json:"path"`
+	Content   string `json:"content,omitempty"`
+	Truncated bool   `json:"truncated,omitempty"`
+	Missing   bool   `json:"missing,omitempty"` // 快照读取失败(文件不存在或不可读)
+}
+
 // InterceptAudit is captured at review time. It is deliberately excluded from
 // polling/list responses; old rows have no audit instead of reconstructed data.
 type InterceptAudit struct {
@@ -27,21 +37,24 @@ type InterceptAudit struct {
 	UserTruncated    bool                    `json:"user_truncated,omitempty"`
 	Context          []InterceptContextEntry `json:"context"`
 	ContextTruncated bool                    `json:"context_truncated,omitempty"`
-	CapturedAt       time.Time               `json:"captured_at"`
-	ModelFallback    bool                    `json:"model_fallback,omitempty"`
-	ModelInput       json.RawMessage         `json:"model_input,omitempty"`
-	ModelInputDigest string                  `json:"model_input_digest,omitempty"`
-	InitialAction    string                  `json:"initial_action"`
-	InitialReason    string                  `json:"initial_reason"`
-	EffectiveAction  string                  `json:"effective_action,omitempty"`
-	DecisionReason   string                  `json:"decision_reason,omitempty"`
-	RuleName         string                  `json:"rule_name,omitempty"`
-	ConfigDigest     string                  `json:"config_digest,omitempty"`
-	ProfileID        int64                   `json:"profile_id,omitempty"`
-	ExecutionStatus  string                  `json:"execution_status"`
-	Output           string                  `json:"output,omitempty"`
-	OutputTruncated  bool                    `json:"output_truncated,omitempty"`
-	ExecutionEndedAt *time.Time              `json:"execution_ended_at,omitempty"`
+	// ScriptFiles 汇总命令引用的解释器脚本内容快照(python x.py / bash x.sh 等),
+	// 供审核台展示;读取失败记 Missing,绝不因快照失败改变审批流程。
+	ScriptFiles      []InterceptScriptFile `json:"script_files,omitempty"`
+	CapturedAt       time.Time             `json:"captured_at"`
+	ModelFallback    bool                  `json:"model_fallback,omitempty"`
+	ModelInput       json.RawMessage       `json:"model_input,omitempty"`
+	ModelInputDigest string                `json:"model_input_digest,omitempty"`
+	InitialAction    string                `json:"initial_action"`
+	InitialReason    string                `json:"initial_reason"`
+	EffectiveAction  string                `json:"effective_action,omitempty"`
+	DecisionReason   string                `json:"decision_reason,omitempty"`
+	RuleName         string                `json:"rule_name,omitempty"`
+	ConfigDigest     string                `json:"config_digest,omitempty"`
+	ProfileID        int64                 `json:"profile_id,omitempty"`
+	ExecutionStatus  string                `json:"execution_status"`
+	Output           string                `json:"output,omitempty"`
+	OutputTruncated  bool                  `json:"output_truncated,omitempty"`
+	ExecutionEndedAt *time.Time            `json:"execution_ended_at,omitempty"`
 }
 
 type InterceptDetail struct {

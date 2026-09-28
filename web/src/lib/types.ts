@@ -2449,6 +2449,8 @@ export interface InterceptAudit {
     | { kind: string; tool?: string; tool_use_id?: string; text: string; is_error?: boolean; truncated?: boolean }[]
     | null;
   context_truncated?: boolean;
+  /** 命令引用的解释器脚本文件快照(审批时抓取),供审核人查看脚本内容。 */
+  script_files?: { path: string; content?: string; truncated?: boolean; missing?: boolean }[];
   captured_at: string;
   model_fallback?: boolean;
   initial_action: "allow" | "ask" | "deny";

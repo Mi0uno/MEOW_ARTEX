@@ -513,7 +513,33 @@ export function ApprovalConsole() {
   };
 
   const openScript = (row: InterceptApprovalRow, sections: ApprovalScriptSection[]) => {
-    setScriptView({ title: `${row.tool_name} · 审批 #${row.id}`, sections });
+    const title = `${row.tool_name} · 审批 #${row.id}`;
+    setScriptView({ title, sections });
+    // 快捷查看器懒加载审计,把命令引用的脚本文件快照并进同一次查看(转人工的理由
+    // 常是「无法确认脚本内容」,只给命令不够)。加载失败静默:命令段本身已可用。
+    void api
+      .interceptDetail(row.id)
+      .then((detail) => {
+        const files = detail.audit?.script_files ?? [];
+        if (!files.length) return;
+        setScriptView((prev) =>
+          prev && prev.title === title
+            ? {
+                ...prev,
+                sections: [
+                  ...prev.sections,
+                  ...files.map((file) => ({
+                    label: `脚本文件快照 · ${file.path}`,
+                    text: file.missing
+                      ? "读取失败：文件不存在或不可读，快照未取到内容。"
+                      : `${file.content ?? ""}${file.truncated ? "\n…（内容已截断）" : ""}`,
+                  })),
+                ],
+              }
+            : prev,
+        );
+      })
+      .catch(() => {});
   };
 
   const rowById = new Map(rows.map((row) => [row.id, row]));
