@@ -1013,6 +1013,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/report-templates/{id}", s.deleteReportTemplate)
 	mux.HandleFunc("POST /api/report-templates/{id}/analyze", s.analyzeReportTemplate)
 	registerReportExportRoutes(mux) // 报告生成作业:AI 按模板导出 / 作业进度与产物下载
+	registerGoalReviewRoutes(mux)  // 目标审核:prove_goal 复核记录与配置(契约 GOAL_REVIEW_CONTRACTS.md)
 	mux.HandleFunc("GET /api/chat/mentions", s.searchChatMentions)
 	mux.HandleFunc("POST /api/chat", s.chat)
 	mux.HandleFunc("POST /api/chat/upload", s.chatUpload) // 方式1 文件上传:落到会话/任务工作目录 uploads/
@@ -3092,6 +3093,8 @@ func parseActivitySession(sess string) (db.ActivitySessionFilter, bool) {
 		return db.ActivitySessionFilter{Main: true, MainSeg: &seg}, true
 	case sess == "plan":
 		return db.ActivitySessionFilter{Worker: "planner"}, true
+	case sess == "review": // 目标审核会话(worker=goal_auditor 的复核活动,契约 GOAL_REVIEW_CONTRACTS.md)
+		return db.ActivitySessionFilter{Worker: "goal_auditor"}, true
 	case strings.HasPrefix(sess, "intent:"):
 		id, err := strconv.ParseInt(strings.TrimPrefix(sess, "intent:"), 10, 64)
 		if err != nil {

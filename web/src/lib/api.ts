@@ -39,6 +39,7 @@ import type {
   EvidenceBodyPreview,
   ExplorationNodePage,
   ExplorationNodeQuery,
+  GoalReview,
   JevThresholds,
   JevThresholdsResponse,
   ExternalAPIConfig,
@@ -1144,6 +1145,19 @@ export const api = {
     return get<{ items: TaskNode[]; has_more: boolean }>(`/exploration/intents?${q.toString()}`).then((r) => ({
       items: arr(r.items),
       hasMore: !!r.has_more,
+    }));
+  },
+
+  // 目标审核记录（契约 GOAL_REVIEW_CONTRACTS.md）。按任务列出 prove_goal 复核结论，
+  // total 为当前过滤条件下总数。goal_id 缺省 = 全部目标。
+  goalReviews: (task: string, opts?: { goal_id?: number; limit?: number; offset?: number }) => {
+    const q = new URLSearchParams({ task });
+    if (opts?.goal_id) q.set("goal_id", String(opts.goal_id));
+    if (opts?.limit) q.set("limit", String(opts.limit));
+    if (opts?.offset) q.set("offset", String(opts.offset));
+    return get<{ items: GoalReview[]; total: number }>(`/goal-reviews?${q.toString()}`).then((r) => ({
+      items: arr(r.items),
+      total: r.total ?? 0,
     }));
   },
 

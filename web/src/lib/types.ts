@@ -1464,7 +1464,24 @@ export interface LogLine {
   text: string;
 }
 
-export type SessionRole = "mainagent" | "planner" | "worker" | "system";
+export type SessionRole = "mainagent" | "planner" | "worker" | "system" | "review";
+
+// 目标审核记录（GET /api/goal-reviews，契约 GOAL_REVIEW_CONTRACTS.md）。
+export interface GoalReview {
+  id: number;
+  task_id: number;
+  goal_id: number;
+  evidence_id: number;
+  reason: string;
+  verdict: "approved" | "rejected" | "unverified";
+  confidence: number;
+  reasons: string;
+  gaps: string[];
+  reviewer: string;
+  duration_ms: number;
+  fail_note: string;
+  created_at: string;
+}
 export type SessionStatus = "running" | "paused" | "done" | "blocked" | "exhausted" | "pending" | "stopped" | "deleted";
 
 // Daily token aggregate bucket (GET /api/tokens/daily).

@@ -2631,3 +2631,27 @@ CREATE TABLE IF NOT EXISTS asset_extract_runs (
 DROP TRIGGER IF EXISTS trg_asset_extract_runs_upd ON asset_extract_runs;
 CREATE TRIGGER trg_asset_extract_runs_upd BEFORE UPDATE ON asset_extract_runs
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- =====================================================================
+-- 目标审核(契约 GOAL_REVIEW_CONTRACTS.md):prove_goal 闸门的独立复核留痕。
+-- planner 每次提交证明都由 goal_auditor 审核一轮,approved 才真正落 met;
+-- rejected/unverified 也记录(含审核系统不可用的 fail_note),供会话列表「目标审核」
+-- 分组与重复短路(同 goal+evidence 最近 rejected 直接复用)使用。
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS goal_reviews (
+    id            BIGSERIAL PRIMARY KEY,
+    task_id       BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    goal_id       BIGINT NOT NULL,
+    evidence_id   BIGINT NOT NULL,
+    reason        TEXT   NOT NULL DEFAULT '',
+    verdict       TEXT   NOT NULL CHECK (verdict IN ('approved','rejected','unverified')),
+    confidence    DOUBLE PRECISION NOT NULL DEFAULT 0,
+    reasons       TEXT   NOT NULL DEFAULT '',
+    gaps          JSONB,
+    reviewer      TEXT   NOT NULL DEFAULT 'goal_auditor',
+    duration_ms   BIGINT NOT NULL DEFAULT 0,
+    fail_note     TEXT   NOT NULL DEFAULT '',
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_goal_reviews_task ON goal_reviews(task_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_goal_reviews_goal ON goal_reviews(goal_id, id DESC);
