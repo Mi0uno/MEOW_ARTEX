@@ -206,6 +206,21 @@ function ModelReviewContext({ input }: { input: InterceptReviewInput }) {
         label="当前待审查调用"
         text={JSON.stringify({ tool_name: input.tool_name, arguments: input.arguments }, null, 2)}
       />
+      {input.script_files?.length ? (
+        <div className="flex min-w-0 flex-col gap-2">
+          {input.script_files.map((file) => (
+            <CodeBlock
+              key={`review-${file.path}`}
+              label={`审查脚本快照 · ${file.path}`}
+              text={file.missing ? "读取失败：文件不存在或不可读，审查时未取到内容。" : file.content ?? ""}
+              truncated={file.truncated}
+            />
+          ))}
+          <p className="text-muted-foreground text-xs">
+            以上脚本内容已随审查输入一并发给裁判模型，供其核实脚本真实行为。
+          </p>
+        </div>
+      ) : null}
       {input.version >= 2 ? (
         input.background ? (
           <div className="flex min-w-0 flex-col gap-2">
