@@ -81,3 +81,35 @@ func (d *DB) ListTemplateEvents(templateID int64) ([]*ReportEvent, error) {
 	}
 	return out, rows.Err()
 }
+
+// FilterExportedReportIDs 返回 ids 中「此前已导出过」的报告 id 子集(升序;结果永不 nil)。
+// 判定口径 = 任一导出痕迹,两表并联让 v1/v2 导出形态都成立:
+//   - report_events 有 kind='exported' 事件(单份快速导出 / 同步批量导出都记);
+//   - report_jobs 有 kind IN ('export','export_batch') 且 status='done' 的作业
+//     (AI 单份导出 / 后台批量打包作业;export_batch 在旧库无该 kind 值,比较恒假,无害)。
+func (d *DB) FilterExportedReportIDs(ids []int64) ([]int64, error) {
+	out := []int64{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := d.Query(`
+SELECT DISTINCT report_id FROM (
+	SELECT report_id FROM report_events
+	WHERE kind='exported' AND report_id = ANY($1)
+	UNION
+	SELECT report_id FROM report_jobs
+	WHERE status='done' AND kind IN ('export','export_batch') AND report_id = ANY($1)
+) t WHERE report_id > 0 ORDER BY report_id`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}

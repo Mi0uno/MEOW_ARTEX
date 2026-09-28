@@ -61,6 +61,8 @@ import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
 import type { LLMProfile, ReportCompanyCount, ReportSummary, ReportTemplate } from "@/lib/types";
 
+import { useExportedReminder } from "./exported-reminder";
+
 const PAGE_SIZE = 50;
 
 const KIND_META: Record<string, { label: string; badgeClass: string }> = {
@@ -119,6 +121,13 @@ function ReportsCenterInner() {
   const [confirmOpen, setConfirmOpen] = React.useState(false);
   // 批量导出对话框:与批量删除同一勾选集合(导出不清空勾选)。
   const [exportOpen, setExportOpen] = React.useState(false);
+  // 本次要导出的勾选集:经 useExportedReminder 的「已导出过」检查后落定
+  // (仍导出全部 / 只导出没导出过的),对话框只认这份列表。
+  const [pendingExportIds, setPendingExportIds] = React.useState<number[]>([]);
+  const { checkAndProceed, checking, reminder: exportReminder } = useExportedReminder((ids) => {
+    setPendingExportIds(ids);
+    setExportOpen(true);
+  });
 
   const toggleChecked = (id: number, checked: boolean) => {
     setCheckedIds((prev) => {
@@ -503,10 +512,16 @@ function ReportsCenterInner() {
             </Tabs>
             {checkedIds.size > 0 && (
               <>
-                {/* 导出在删除左边:两者同源勾选集,导出是无损操作放外侧不抢眼。 */}
-                <Button variant="outline" size="sm" onClick={() => setExportOpen(true)}>
+                {/* 导出在删除左边:两者同源勾选集,导出是无损操作放外侧不抢眼。
+                    点击先查「已导出过」(exported-reminder),无命中直接进对话框。 */}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={checking}
+                  onClick={() => void checkAndProceed([...checkedIds])}
+                >
                   <DownloadIcon className="size-4" />
-                  导出已选 ({checkedIds.size})
+                  {checking ? "检查中…" : `导出已选 (${checkedIds.size})`}
                 </Button>
                 <Button variant="destructive" size="sm" disabled={deleting} onClick={() => setConfirmOpen(true)}>
                   <Trash2Icon className="size-4" />
@@ -582,7 +597,11 @@ function ReportsCenterInner() {
         }}
       />
 
-      <BatchExportDialog open={exportOpen} onOpenChange={setExportOpen} ids={[...checkedIds]} />
+      {/* ids 只认经「已导出过」检查后的 pendingExportIds(onProceed 必先落定它)。 */}
+      <BatchExportDialog open={exportOpen} onOpenChange={setExportOpen} ids={pendingExportIds} />
+
+      {/* 已导出过提醒:仍导出全部 / 只导出没导出过的。 */}
+      {exportReminder}
     </div>
   );
 }

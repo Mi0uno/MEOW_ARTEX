@@ -1004,6 +1004,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/reports/{id}", s.deleteReportDetail)
 	mux.HandleFunc("GET /api/reports/{id}/export", s.exportReport)
 	mux.HandleFunc("POST /api/reports/export-batch", s.exportReportsBatch) // 批量导出已选报告为 zip
+	mux.HandleFunc("POST /api/reports/export-check", s.checkReportsExported) // 批量导出前查「已导出过」
 	mux.HandleFunc("GET /api/reports/{id}/events", s.listReportEvents)
 	// ---- 报告模板 ----
 	mux.HandleFunc("GET /api/report-templates", s.listReportTemplates)
