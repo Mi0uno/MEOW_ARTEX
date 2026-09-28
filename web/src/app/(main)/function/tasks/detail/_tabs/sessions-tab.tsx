@@ -1274,13 +1274,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   );
   const currentMainKey = mainSessionKey(currentSeg);
   const plannerLive = recentLive("plan");
-  // Review group appears only after the task has goal-review activity: SSE cold-session
-  // tails (unread accounting), a loaded history page, or a latest-review poll hit (the
-  // probe effect loads history when reviews predate this page open — SSE never replays
-  // historical frames, so without it the group could never become visible).
-  const reviewState = store.review;
-  const reviewSeen =
-    (!!reviewState && (reviewState.lastTs !== "" || reviewState.items.length > 0)) || !!latestReview;
+  // Review group is a fixed affordance (always rendered); reviewLive just drives its 实时 badge.
   const reviewLive = recentLive("review");
 
   // Which main segment is streaming RIGHT NOW. A main turn is serialized per task, so at
@@ -1327,16 +1321,16 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     const items = [
       ...mainSessions,
       { ...PLANNER_SESSION, live: plannerLive },
-      // Spliced only once review activity exists, so the rendered `if (!items.length)
-      // return null` hides the group for tasks that never ran a goal review.
-      ...(reviewSeen ? [{ ...REVIEW_SESSION, live: reviewLive }] : []),
+      // Always visible (like Planner/系统审计) — the user expects the group as a fixed
+      // affordance; tasks without reviews just show an empty transcript when opened.
+      { ...REVIEW_SESSION, live: reviewLive },
       ...workerSessions,
       SYSTEM_SESSION,
     ];
     const located = focusSession ?? retainedSession;
     if (located && !items.some((s) => s.id === located.id)) items.push(located);
     return items;
-  }, [mainSessions, workerSessions, plannerLive, reviewSeen, reviewLive, focusSession, retainedSession]);
+  }, [mainSessions, workerSessions, plannerLive, reviewLive, focusSession, retainedSession]);
 
   const grouped = {
     mainagent: sessions.filter((s) => s.role === "mainagent"),
