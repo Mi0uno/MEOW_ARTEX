@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -627,7 +628,45 @@ func (s *Server) interceptDetail(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "not found")
 		return
 	}
+	s.backfillPendingScriptSnapshot(pg, detail)
 	writeJSON(w, 200, detail)
+}
+
+// agentIntentDirRe 从审批行的 agent_name(形如 "work#4 · #27956")提取尾部的
+// 运行意图 id,对应任务运行目录 tasks/<task>/i<id>。
+var agentIntentDirRe = regexp.MustCompile(`#(\d+)\s*$`)
+
+// backfillPendingScriptSnapshot 给缺脚本快照的 pending 审批按需补抓:快照能力
+// 上线前创建的记录(以及捕获失败的行)audit 里没有 script_files,但审批人此刻
+// 裁决正需要脚本内容。工具调用在 pending 期间被阻塞,磁盘内容与审批时刻一致
+// (偏差概率极低,快照语义仍以「读取当下磁盘」为准)。补抓结果落库,只此一次;
+// 非 pending / 已有快照 / 未引用脚本的行不动。
+func (s *Server) backfillPendingScriptSnapshot(pg *db.DB, detail *db.InterceptDetail) {
+	if detail.Status != "pending" || (detail.Audit != nil && len(detail.Audit.ScriptFiles) > 0) {
+		return
+	}
+	workDir := ""
+	if detail.TaskID != nil && *detail.TaskID != "" && *detail.TaskID != "0" {
+		base := filepath.Join(s.m.dir, "tasks", *detail.TaskID)
+		workDir = base
+		if loc := agentIntentDirRe.FindStringSubmatch(detail.AgentName); loc != nil {
+			workDir = filepath.Join(base, "i"+loc[1])
+		}
+	}
+	files := intercept.CaptureScriptFilesForInput(detail.ToolInput, workDir)
+	if len(files) == 0 {
+		return
+	}
+	// 快照能力上线前的行可能整条 audit 为 NULL:合成最小审计对象承载快照。
+	// correlation=unavailable 如实表达「没有可关联的执行记录」。
+	if detail.Audit == nil {
+		detail.Audit = &db.InterceptAudit{Correlation: "unavailable", CapturedAt: time.Now().UTC()}
+	}
+	detail.Audit.ScriptFiles = files
+	if err := pg.BackfillInterceptScriptFiles(detail.ID, files); err != nil {
+		// 落库失败不拦响应:本次详情仍带快照,下次打开重抓。
+		log.Printf("[intercept] 审批 #%d 脚本快照回填落库失败: %v", detail.ID, err)
+	}
 }
 
 // The navigation endpoint returns only the original call and its paired result.

@@ -85,6 +85,22 @@ func (d *DB) GetInterceptDetail(id int64) (*InterceptDetail, error) {
 	return &out, nil
 }
 
+// BackfillInterceptScriptFiles 把按需补抓的脚本快照并回 pending 行的 audit:
+// 旧版本创建/快照失败的 pending 记录,审批人裁决时仍需要脚本内容。仅 pending
+// 行可补(裁决后的历史记录保持原样);幂等,audit 为 NULL 时先起空对象。
+func (d *DB) BackfillInterceptScriptFiles(id int64, files []InterceptScriptFile) error {
+	if len(files) == 0 {
+		return nil
+	}
+	raw, err := json.Marshal(map[string]any{"script_files": files})
+	if err != nil {
+		return err
+	}
+	_, err = d.Exec(`UPDATE intercept_pending SET audit = COALESCE(audit,'{}'::jsonb) || $2::jsonb
+		WHERE id=$1 AND status='pending'`, id, raw)
+	return err
+}
+
 // ResolveIntercept atomically settles a pending request. A timeout cannot
 // overwrite a human decision and repeat decisions cannot rewrite history.
 func (d *DB) ResolveIntercept(id int64, status, action, reason string) (bool, error) {

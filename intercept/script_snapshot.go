@@ -43,6 +43,17 @@ var cdDirRe = regexp.MustCompile(`(?:^|[;&|]\s*)cd\s+(?:"([^"\n]+)"|'([^'\n]+)'|
 // captureScriptFiles 解析 Bash 类工具输入里的脚本引用并快照。返回 nil 表示
 // 没有可快照的脚本(非命令输入 / 未引用脚本)。
 func captureScriptFiles(ctx context.Context, input []byte) []db.InterceptScriptFile {
+	workDir := ""
+	if dir, _, ok := ReviewEnvironmentFromContext(ctx); ok {
+		workDir = dir
+	}
+	return CaptureScriptFilesForInput(input, workDir)
+}
+
+// CaptureScriptFilesForInput 是快照捕获的显式入口,供详情接口给「审批时刻没抓到
+// 快照的 pending 记录」按需回填使用:回填时没有审查 ctx,工作目录由调用方从任务
+// 运行目录推导(可为空;命令里的 cd 目录始终优先)。
+func CaptureScriptFilesForInput(input []byte, workDir string) []db.InterceptScriptFile {
 	var payload struct {
 		Command string `json:"command"`
 	}
@@ -52,10 +63,6 @@ func captureScriptFiles(ctx context.Context, input []byte) []db.InterceptScriptF
 	command := strings.TrimSpace(payload.Command)
 	if command == "" {
 		return nil
-	}
-	workDir := ""
-	if dir, _, ok := ReviewEnvironmentFromContext(ctx); ok {
-		workDir = dir
 	}
 
 	type cdEntry struct {
