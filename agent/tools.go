@@ -1316,7 +1316,7 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			"evidence_id": idp("证明它的发现/事实节点 id"),
 			"reason":      str("为什么这个证据满足该目标"),
 		}, "goal_id", "evidence_id"),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				GoalID     json.RawMessage `json:"goal_id"`
 				EvidenceID json.RawMessage `json:"evidence_id"`
@@ -1336,29 +1336,61 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 				return actool.Errorf("evidence_id 必须是本任务或直接关联任务的事实/漏洞节点"), nil
 			}
 			_ = t.ts.Link(ev, db.RelProves, goal)
-			_ = t.ts.SetNodeState(goal, "met")
-			// 每标记一个目标 met，就检查本任务是否【所有目标】都已 met；若是，自动判定
-			// 任务完成（置 GoalMet），无需再依赖模型显式调 goal_met。
-			if goals, err := t.ts.ListByKind(db.KindGoal, 1000); err == nil && len(goals) > 0 {
-				allMet := true
-				for _, g := range goals {
-					if g.State != "met" {
-						allMet = false
-						break
-					}
-				}
-				if allMet {
-					t.GoalMet = true
-					t.Reason = fmt.Sprintf("所有 %d 个目标均已 met（最后由 goal %d 触发）", len(goals), goal)
-					return actool.Text(fmt.Sprintf("goal %d marked met；本任务所有目标均已达成，任务自动判定完成", goal)), nil
+			// 目标审核闸门(契约 GOAL_REVIEW_CONTRACTS.md §2.2):proves 边在闸门前落库——
+			// 驳回也保留边=尝试记录。hook==nil(未接线)或 v.Skip(审核未启用) → 旧行为原样;
+			// approved → 旧行为落 met(文案加「已过目标审核」);其余(rejected,含 hook 按
+			// fail_mode 消化后的 unverified-closed) → 不设 met,按缺口退回 planner。
+			// hook 本身报错拿不到 verdict → 防误判优先:保持 open 并注明审核系统异常。
+			// taskID==0 的退化上下文(测试/无任务句柄)无法落审核记录,同样走旧行为。
+			if hook := GoalReviewHook; hook != nil && t.taskID > 0 {
+				v, herr := hook(ctx, GoalReviewRequest{
+					TaskID:     t.taskID,
+					GoalID:     goal,
+					GoalText:   goalTextFromPayload(goalNode.Payload),
+					EvidenceID: ev,
+					Reason:     a.Reason,
+				})
+				switch {
+				case herr != nil:
+					return actool.Text(fmt.Sprintf("目标审核驳回（goal %d 保持 open）：审核系统异常（%s）。为防误判本次未标记 met；请补充更完整的证据后重试，勿重复提交同一证据。", goal, herr.Error())), nil
+				case v.Skip:
+					// 未启用审核——落审核记录与否由 hook 决定(此处 Skip=不落),行为同旧。
+				case v.Verdict == "approved":
+					return t.finishProveGoal(goal, "（已过目标审核）")
+				default: // rejected(含被 hook 消化成 rejected 的 unverified)
+					return actool.Text(goalRejectionText(goal, v)), nil
 				}
 			}
-			return actool.Text(fmt.Sprintf("goal %d marked met", goal)), nil
+			return t.finishProveGoal(goal, "")
 		})
 }
 
+// finishProveGoal marks the goal met and runs the all-goals-met task-completion
+// check — the pre-review prove_goal tail, kept verbatim. note is appended to the
+// reply text ("（已过目标审核）" once the goal review approved the proof).
+func (t *ToolSet) finishProveGoal(goal int64, note string) (actool.Result, error) {
+	_ = t.ts.SetNodeState(goal, "met")
+	// 每标记一个目标 met，就检查本任务是否【所有目标】都已 met；若是，自动判定
+	// 任务完成（置 GoalMet），无需再依赖模型显式调 goal_met。
+	if goals, err := t.ts.ListByKind(db.KindGoal, 1000); err == nil && len(goals) > 0 {
+		allMet := true
+		for _, g := range goals {
+			if g.State != "met" {
+				allMet = false
+				break
+			}
+		}
+		if allMet {
+			t.GoalMet = true
+			t.Reason = fmt.Sprintf("所有 %d 个目标均已 met（最后由 goal %d 触发）", len(goals), goal)
+			return actool.Text(fmt.Sprintf("goal %d marked met%s；本任务所有目标均已达成，任务自动判定完成", goal, note)), nil
+		}
+	}
+	return actool.Text(fmt.Sprintf("goal %d marked met%s", goal, note)), nil
+}
+
 func (t *ToolSet) goalMet() actool.CoreTool {
-	return writeTool("goal_met", "【立即结束整个任务】——仅当你确认任务的【全部目标都已真正达成、整体收官】时才调（注意是任务【整体】完成；仅仅达成了其中某一个目标/某一个 flag/某一个漏洞【不算】——那种情况用 prove_goal 标记该目标即可）。⚠️它不是用来“结束本轮规划”的：本轮没有新意图要派、或在等 worker 产出，都【直接结束本轮即可，不要调本工具】（0 个意图是完全正常的）。正常判定优先用 prove_goal 逐个证明目标；goal_met 只是绕过逐个证明、直接从全局收官的手段。",
+	return writeTool("goal_met", "【立即结束整个任务】——仅当你确认任务的【全部目标都已真正达成、整体收官】时才调（注意是任务【整体】完成；仅仅达成了其中某一个目标/某一个 flag/某一个漏洞【不算】——那种情况用 prove_goal 标记该目标即可）。⚠️它不是用来“结束本轮规划”的：本轮没有新意图要派、或在等 worker 产出，都【直接结束本轮即可，不要调本工具】（0 个意图是完全正常的）。正常判定优先用 prove_goal 逐个证明目标；goal_met 只是绕过逐个证明、直接从全局收官的手段。⚠️本工具绕过目标审核独立复核（prove_goal 会被 goal_auditor 复核），误判风险自担；保持默认未绑定。",
 		obj(map[string]any{"reason": str("达成理由（必须是目标真正达成的证据，不能是“本轮无新方向”这类结束本轮的理由）")}, "reason"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct{ Reason string }

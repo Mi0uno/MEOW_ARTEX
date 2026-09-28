@@ -198,6 +198,7 @@ func BuiltinPromptSeeds() map[string]string {
 		"template_engineer": templateEngineerDefaultTmpl,
 		"src_operator":      srcOperatorDefaultTmpl,
 		"report_writer":     reportWriterDefaultTmpl,
+		"goal_auditor":      goalAuditorDefaultTmpl,
 	}
 }
 

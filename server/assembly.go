@@ -379,3 +379,22 @@ func jsonStrMap(raw json.RawMessage) map[string]string {
 	}
 	return out
 }
+
+// initGoalReview 接线目标审核闸门(契约 GOAL_REVIEW_CONTRACTS.md §3.1/§3.4):
+//   - agent.GoalReviewHook = s.reviewProve(prove_goal 的独立复核闸门;nil=旧行为);
+//   - 幂等播种 goal_auditor agents 行;
+//   - 播种三个审核工具(goal_audit_context/node/verdict,绑 goal_auditor)。
+//
+// 本文件其余函数都是拿 *db.DB 的包级函数拿不到 Server,而 server.go 禁改,故统一
+// 挂在 orchestration.go 的 seedOrchestrationTools 链尾(New() 启动必经)调用本方法。
+func (s *Server) initGoalReview() {
+	if s.m == nil || s.m.PG() == nil {
+		return
+	}
+	bindGoalReviewServer(s)              // goal-review API 路由层按请求解 Server
+	agent.GoalReviewHook = s.reviewProve // prove_goal 审核闸门(agent 包冻结契约变量)
+	if err := ensureGoalAuditorAgent(s.m.PG()); err != nil {
+		log.Printf("[goal-review] goal_auditor agent 行播种失败: %v", err)
+	}
+	seedGoalAuditTools(s.m.PG())
+}

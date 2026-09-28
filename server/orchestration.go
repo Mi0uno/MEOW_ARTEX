@@ -518,11 +518,13 @@ func (s *Server) seedOrchestrationTools() {
 	s.reseedMainAgentPrompt()         // mainagent 提示词加入「目标达成后 add_intent 反问是否建目标」(一次性)
 	s.reseedPlannerPrompt()           // planner 提示词:重写「0 意图」正当理由 + 加量化验收核对(一次性)
 	s.reseedWorkerPrompt()            // worker 提示词:加否定结论证据门槛(一次性)
+	s.reseedGoalReviewPlannerPrompt() // planner 提示词:加 prove_goal 独立复核条款(目标审核,一次性)
 	s.seedReporterAgent()             // 预置「报告撰写」agent + 工具绑定 + finding 触发器(一次性)
 	s.upgradeReporterTriggerMessage() // 老库补迁移:让 reporter 回传 evidence_version(一次性)
 	s.seedFindingTrafficTools()       // 增加可选证据参数及只读证据工具，保留用户配置
 	s.seedFindingWorkflowTools()
 	s.seedVPSAgentTools() // VPS agent 工具(vps_machine_info/vps_install_toolset) seed 进 tools 表,默认绑 worker
+	s.initGoalReview()    // 目标审核:hook 接线 + goal_auditor agent 行 + 三个审核工具(幂等)
 	// 注：报告回填不在这里——它需要任务已加载进内存(renderTaskReport 走内存句柄),
 	// 见 server.go 的 restoreTaskRuntimes() 之后。
 	// 注：pentest 的默认工具绑定无需迁移——BuiltinToolSeeds 在全新初始化时就把
@@ -704,6 +706,39 @@ func (s *Server) reseedWorkerPrompt() {
 		return
 	}
 	log.Printf("[prompts] worker 提示词已追加新默认版本(查上下文段收敛为 list_assets/list_findings,去掉 list_facts/node_detail/asset_neighbors,一次性)")
+}
+
+// reseedGoalReviewPlannerPrompt 把 planner 提示词刷成【当前代码默认】——默认正文追加了
+// 「prove_goal 会被独立的目标审核员复核,通过才会真正标记 met;收到驳回按缺口补证,
+// 严禁重复提交同一证据或凑数弱证据」这句(契约 GOAL_REVIEW_CONTRACTS.md §2.5,由
+// agent/planner.go 的默认模板承载)。SeedPromptIfEmpty 首插 only、既有库的
+// planner_prompt_compact_realistic_v2 已刷过不会再跑,故用独立 flag 让存量旧库
+// 再刷一次;版本管理【追加新版本】并切过去(ResetPromptToDefault),用户自定义过的
+// 版本保留在历史里可找回。settings flag 守卫 → 只做一次。全新库无需处理
+// (SeedPromptIfEmpty 已 seed 最新默认)。与 reseedPlannerPrompt 完全同构。
+func (s *Server) reseedGoalReviewPlannerPrompt() {
+	const flag = "goal_review_planner_prompt_v1"
+	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
+		return
+	}
+	defer func() { _ = s.m.pg.SetSetting(flag, "true") }() // 无论成功与否只尝试一次
+	a, err := s.m.pg.GetAgentByKey("planner")
+	if err != nil || a == nil {
+		return // 全新库尚未建 agent 行时,seedPrompts 会直接 seed 最新默认,无需此迁移
+	}
+	tmpl := agent.BuiltinPromptSeeds()["planner"]
+	if tmpl == "" {
+		return
+	}
+	// 全新库 seedPrompts 已 seed 最新默认 → 当前版本已等于代码默认,不必再追加重复版本。
+	if cur, err := s.m.pg.CurrentPrompt(a.ID); err == nil && cur == tmpl {
+		return
+	}
+	if _, err := s.m.pg.ResetPromptToDefault(a.ID, tmpl); err != nil {
+		log.Printf("[prompts] planner 提示词重刷(目标审核条款)失败: %v", err)
+		return
+	}
+	log.Printf("[prompts] planner 提示词已追加新默认版本(加入 prove_goal 独立目标审核条款,一次性)")
 }
 
 // reporterToolCallMessage 必须无条件要求先读一次 get_finding_traffic 再写报告。

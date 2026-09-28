@@ -18,6 +18,7 @@ import {
   RadioIcon,
   RotateCwIcon,
   ShieldAlertIcon,
+  ShieldCheckIcon,
   SquareIcon,
   Trash2Icon,
   UserIcon,
@@ -58,6 +59,7 @@ import { taskAssetSourceLabel, taskAssetTypeLabel } from "@/lib/task-assets";
 import type {
   Activity,
   ChatAttachment,
+  GoalReview,
   IntentAsset,
   InterceptApprovalRow,
   Session,
@@ -147,6 +149,11 @@ function sessionKeyOf(a: Activity): string {
   if (a.worker === "system" || a.kind === "llm_switch" || a.kind === "llm_failover") return "system";
   if (a.worker === "mainagent") return `main:${a.main_seg ?? 0}`; // one key per conversation segment
   if (a.worker === "planner") return "plan";
+  // Goal-review activities (auditor steps + terminal verdict) form their own session.
+  // Must precede the intent_id fallback: the auditor loop emits inside the planner's
+  // prove_goal turn, so its frames can carry the proving intent's id. The terminal
+  // kind="goal_review" is not (yet) in the frozen ActivityKind union — widen to string.
+  if (a.worker === "goal_auditor" || (a.kind as string) === "goal_review") return "review";
   if (a.intent_id) return `intent:${a.intent_id}`;
   return "unknown";
 }
@@ -233,11 +240,26 @@ function fmtDuration(ms: number): string {
   return `${h}h${String(m % 60).padStart(2, "0")}m`;
 }
 
+// reviewVerdictBadge maps the latest goal-review verdict to a colored label shown
+// next to the session list header ("最近审核"). unverified = audit system could
+// not reach a conclusion — rendered as neutral gray, not an error color.
+function reviewVerdictBadge(verdict: GoalReview["verdict"]): { label: string; className: string } {
+  switch (verdict) {
+    case "approved":
+      return { label: "通过", className: "text-emerald-500" };
+    case "rejected":
+      return { label: "驳回", className: "text-red-500" };
+    default:
+      return { label: "未验证", className: "text-muted-foreground" };
+  }
+}
+
 const roleMeta = {
   mainagent: { label: "主 Agent", icon: UserIcon },
   planner: { label: "规划 Planner", icon: BrainIcon },
   worker: { label: "Workers", icon: RadioIcon },
   system: { label: "系统审计", icon: HistoryIcon },
+  review: { label: "目标审核", icon: ShieldCheckIcon },
 } as const;
 
 // The main-agent session is the interactive entry point of this tab and has no
@@ -288,11 +310,28 @@ const SYSTEM_SESSION: Session = {
   last_activity: "",
 };
 
+// The goal-review session is, like planner/system, a fixed UI affordance: its
+// transcript is every activity the independent goal auditor emits (worker
+// "goal_auditor" + the terminal kind="goal_review" verdict), served by the
+// backend's session=review filter. Unlike SYSTEM_SESSION it is only spliced into
+// the list once the task has review activity (see `reviewSeen`), so tasks that
+// never ran a goal review show no empty group.
+const REVIEW_ID = "s-review";
+const REVIEW_SESSION: Session = {
+  id: REVIEW_ID,
+  role: "review",
+  title: "目标审核 · 证明复核",
+  status: "running",
+  live: true,
+  last_activity: "",
+};
+
 // keyForSession maps a UI Session → its stable store key (main:<seg> | plan | intent:<id>).
 function keyForSession(s: Session): string {
   if (s.role === "mainagent") return `main:${s.seg ?? 0}`;
   if (s.role === "planner") return "plan";
   if (s.role === "system") return "system";
+  if (s.role === "review") return "review";
   return `intent:${s.intent_id}`;
 }
 
@@ -640,6 +679,8 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   const [llmResolutions, setLLMResolutions] = React.useState<TaskLLMResolutions | null>(null);
   // Pending intercept requests for this task — used to show warning icons on sessions.
   const [pendingIntercepts, setPendingIntercepts] = React.useState<InterceptApprovalRow[]>([]);
+  // Latest goal-review verdict (for the session-list header); null = no review yet.
+  const [latestReview, setLatestReview] = React.useState<GoalReview | null>(null);
 
   // Refs backing SSE/loading without re-render churn.
   const snapshotRef = React.useRef(0); // task-level snapshot cursor → SSE since=
@@ -856,6 +897,27 @@ export function SessionsTab({ taskId }: { taskId: string }) {
         });
     void load();
     const t = setInterval(load, 5000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, [taskId]);
+
+  // Latest goal-review verdict for the session-list header (best-effort poll; an
+  // empty items list means the task has no review yet and the badge stays hidden).
+  React.useEffect(() => {
+    let alive = true;
+    const load = () =>
+      api
+        .goalReviews(taskId, { limit: 1 })
+        .then((r) => {
+          if (alive) setLatestReview(r.items[0] ?? null);
+        })
+        .catch(() => {
+          // Polling is best-effort; the next interval retries automatically.
+        });
+    void load();
+    const t = setInterval(load, 10_000);
     return () => {
       alive = false;
       clearInterval(t);
@@ -1203,6 +1265,11 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   );
   const currentMainKey = mainSessionKey(currentSeg);
   const plannerLive = recentLive("plan");
+  // Review group appears only after the task has goal-review activity: SSE cold-session
+  // tails (unread accounting) or a loaded history page both establish the store entry.
+  const reviewState = store.review;
+  const reviewSeen = !!reviewState && (reviewState.lastTs !== "" || reviewState.items.length > 0);
+  const reviewLive = recentLive("review");
 
   // Which main segment is streaming RIGHT NOW. A main turn is serialized per task, so at
   // most one segment is live. Gate on the real running flag (sending / mainChatRunning)
@@ -1245,15 +1312,24 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   );
 
   const sessions = React.useMemo(() => {
-    const items = [...mainSessions, { ...PLANNER_SESSION, live: plannerLive }, ...workerSessions, SYSTEM_SESSION];
+    const items = [
+      ...mainSessions,
+      { ...PLANNER_SESSION, live: plannerLive },
+      // Spliced only once review activity exists, so the rendered `if (!items.length)
+      // return null` hides the group for tasks that never ran a goal review.
+      ...(reviewSeen ? [{ ...REVIEW_SESSION, live: reviewLive }] : []),
+      ...workerSessions,
+      SYSTEM_SESSION,
+    ];
     const located = focusSession ?? retainedSession;
     if (located && !items.some((s) => s.id === located.id)) items.push(located);
     return items;
-  }, [mainSessions, workerSessions, plannerLive, focusSession, retainedSession]);
+  }, [mainSessions, workerSessions, plannerLive, reviewSeen, reviewLive, focusSession, retainedSession]);
 
   const grouped = {
     mainagent: sessions.filter((s) => s.role === "mainagent"),
     planner: sessions.filter((s) => s.role === "planner"),
+    review: sessions.filter((s) => s.role === "review"),
     worker: sessions.filter((s) => s.role === "worker"),
     system: sessions.filter((s) => s.role === "system"),
   };
@@ -1269,6 +1345,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   const isMain = active.role === "mainagent";
   const isPlanner = active.role === "planner";
   const isSystem = active.role === "system";
+  const isReview = active.role === "review";
   const activeKey = keyForSession(active);
   const activeState = store[activeKey];
   // A main turn is serialized per task (chat lock), so "busy" is task-wide: while any
@@ -1337,7 +1414,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     // same SSE stream (worker="mainagent") as every agent step — no client-side
     // optimistic echo, hence no fabricated seq that could collide with real DB ids.
     if (isMain) return items;
-    if (isPlanner || isSystem) return items;
+    if (isPlanner || isSystem || isReview) return items;
     // Worker session: the intent leads the transcript as a right-aligned "user"-style
     // message (the task handed to this worker), followed by its execution steps.
     const intentTitle = sessionMeta.get(active.id)?.title ?? active.title;
@@ -1355,6 +1432,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     isMain,
     isPlanner,
     isSystem,
+    isReview,
     activeState,
     active.id,
     active.title,
@@ -1552,7 +1630,9 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   // What the transcript pane should show for the active session.
   const showLoader = !activeState || (activeState.loading && !activeState.loaded);
   const resolutionForSession = (session: Session): TaskLLMResolution | undefined => {
-    if (!llmResolutions || session.inherited || session.role === "system") return undefined;
+    // system/review fixed sessions have no model binding in llmResolutions.
+    if (!llmResolutions || session.inherited || session.role === "system" || session.role === "review")
+      return undefined;
     if (session.role === "mainagent") return llmResolutions.mainagent;
     if (session.role === "planner") return llmResolutions.planner;
     return llmResolutions.worker;
@@ -1560,6 +1640,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   const activeResolution = resolutionForSession(active);
   const activeAssets =
     active.role === "worker" && active.intent_id ? intentAssetsByID.get(active.intent_id) : undefined;
+  const latestReviewBadge = latestReview ? reviewVerdictBadge(latestReview.verdict) : null;
 
   return (
     <TooltipProvider delayDuration={300}>
@@ -1643,6 +1724,16 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                 </TooltipContent>
               </Tooltip>
             )}
+            {latestReview && latestReviewBadge && (
+              <div
+                className="mt-2 flex min-w-0 items-center gap-1 text-muted-foreground text-xs"
+                title={latestReview.reasons || latestReview.reason || "最近一次 prove_goal 审核结论"}
+              >
+                <ShieldCheckIcon className="size-3.5 shrink-0" />
+                <span className="shrink-0">最近审核</span>
+                <span className={cn("shrink-0 font-medium", latestReviewBadge.className)}>{latestReviewBadge.label}</span>
+              </div>
+            )}
           </div>
           <ScrollArea
             id="session-list-panel"
@@ -1653,7 +1744,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
             )}
           >
             <div className="flex w-full flex-col gap-3 p-2">
-              {(["mainagent", "planner", "system", "worker"] as const).map((role) => {
+              {(["mainagent", "planner", "review", "system", "worker"] as const).map((role) => {
                 const items = grouped[role];
                 if (!items.length) return null;
                 const Meta = roleMeta[role];
