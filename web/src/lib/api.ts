@@ -210,6 +210,11 @@ import type {
   WorkspaceListing,
   TaskConstraintInput,
   TaskInputParse,
+  StorageBucket,
+  StorageBucketInput,
+  StorageCategory,
+  StorageCategoryOverview,
+  StorageMigration,
 } from "@/lib/types";
 
 function getToken(): string | null {
@@ -2706,4 +2711,50 @@ export const api = {
   evolvePlaybookStatus: (id: number, status: EvolveStatus) =>
     post<{ updated: boolean }>(`/evolve/playbooks/${id}/status`, { status }),
   evolveDeletePlaybook: (id: number) => del<{ deleted: boolean }>(`/evolve/playbooks/${id}`),
+  // ---- 存储中心(契约 STORAGE_CONTRACTS.md) ----
+  storageBuckets: (input: { protocol?: string; status?: string; q?: string; limit?: number; offset?: number }) => {
+    const p = new URLSearchParams();
+    if (input.protocol) p.set("protocol", input.protocol);
+    if (input.status) p.set("status", input.status);
+    if (input.q) p.set("q", input.q);
+    p.set("limit", String(input.limit ?? 20));
+    p.set("offset", String(input.offset ?? 0));
+    return get<{
+      items: StorageBucket[];
+      total: number;
+      counts: Record<string, number>;
+      status_counts: Record<string, number>;
+    }>(`/storage/buckets?${p.toString()}`).then((r) => ({
+      items: arr(r.items),
+      total: r.total,
+      counts: r.counts ?? {},
+      status_counts: r.status_counts ?? {},
+    }));
+  },
+  storageBucketCreate: (input: StorageBucketInput) => post<{ id: number }>("/storage/buckets", input),
+  storageBucketUpdate: (id: number, input: StorageBucketInput) =>
+    put<{ updated: boolean }>(`/storage/buckets/${id}`, input),
+  storageBucketDelete: (id: number) => del<{ deleted: boolean }>(`/storage/buckets/${id}`),
+  // 立即对桶做连通性探测(s3=HEAD bucket,webdav=PROPFIND depth 0)。
+  storageBucketCheck: (id: number) =>
+    post<{ ok: boolean; error?: string; latency_ms: number }>(`/storage/buckets/${id}/check`, {}),
+  storageBucketActivate: (id: number) => post<{ active: boolean }>(`/storage/buckets/${id}/activate`, {}),
+  storageDeactivate: () => post<{ active: boolean }>("/storage/deactivate", {}),
+  // 各数据类别本地量 + 已上桶登记数;迁移页签的清单数据源。
+  storageOverview: () =>
+    get<{ categories: StorageCategoryOverview[]; active_bucket_id: number }>("/storage/overview").then((r) => ({
+      categories: arr(r.categories),
+      active_bucket_id: r.active_bucket_id,
+    })),
+  // 一键迁移:选类别(空 = 全部)后台跑,202 后用 storageMigrateStatus 轮询。
+  storageMigrate: (categories: StorageCategory[], bucketId?: number) =>
+    post<{ migration_id: number }>("/storage/migrate", { categories, bucket_id: bucketId }),
+  storageMigrateStatus: () =>
+    get<{ running: boolean; migration: StorageMigration | null; last: StorageMigration | null }>(
+      "/storage/migrate/status",
+    ),
+  storageMigrateCancel: () => post<{ canceled: boolean }>("/storage/migrate/cancel", {}),
+  // 清理本地已上桶文件(v1 仅 report-jobs/task-archives 开放)。
+  storagePurgeLocal: (categories: string[]) =>
+    post<{ purged: number; skipped: number }>("/storage/purge-local", { categories }),
 };
