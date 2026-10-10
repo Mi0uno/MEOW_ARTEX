@@ -309,6 +309,18 @@ func (s *Server) storageRunMigration(ctx context.Context, mig *pgdb.StorageMigra
 
 	var done, failed int64
 	cursor := storageLoadCursor(s)
+	// 起点预盘点:total 一次性落库,进度条才有分母(逐文件累加的旧算法起点恒 0)
+	preTotal := int64(0)
+	terminal0 := map[int64]bool{}
+	if migHasCategory(mig.Categories, "task-workdirs") {
+		if terminal0, err = s.m.pg.ListTerminalTaskWorkdirIDs(); err != nil {
+			terminal0 = nil
+		}
+	}
+	for _, cat := range mig.Categories {
+		preTotal += int64(len(storageEnumerate(s.m.dir, cat, terminal0)))
+	}
+	_ = s.m.pg.SetStorageMigrationProgress(mig.ID, 0, 0, preTotal)
 	terminal := map[int64]bool{}
 	if migHasCategory(mig.Categories, "task-workdirs") {
 		if terminal, err = s.m.pg.ListTerminalTaskWorkdirIDs(); err != nil {
@@ -346,8 +358,7 @@ func (s *Server) storageRunMigration(ctx context.Context, mig *pgdb.StorageMigra
 				done++
 				cursor[cat] = rel
 			}
-			total := mig.TotalFiles + done + failed
-			_ = s.m.pg.SetStorageMigrationProgress(mig.ID, done, failed, total)
+			_ = s.m.pg.SetStorageMigrationProgress(mig.ID, done, failed, preTotal)
 			// 游标每 20 个文件落一次盘(重启最多重做 20 个,不逐文件打 settings)
 			if done%20 == 0 {
 				storageSaveCursor(s, cursor)
@@ -401,7 +412,7 @@ func (s *Server) storageMigrateOne(ctx context.Context, backend interface {
 	if err != nil {
 		return err
 	}
-	key, err := objectKeyFor(bucket.PathPrefix, cat, rel)
+	key, err := objectKeyFor(bucket.PathPrefix, rel)
 	if err != nil {
 		return err
 	}
@@ -460,7 +471,7 @@ func storageEnumerate(dataDir, cat string, terminal map[int64]bool) []string {
 			if err != nil {
 				return nil
 			}
-			out = append(out, filepathFromSlash(rel))
+			out = append(out, filepath.ToSlash(rel)) // 恒 / 分隔(此前写反成 OS 分隔符,冒烟实锤)
 			return nil
 		})
 	}

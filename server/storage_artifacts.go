@@ -43,9 +43,17 @@ func filepathFromSlash(p string) string {
 	return strings.ReplaceAll(p, "/", string(os.PathSeparator))
 }
 
-// objectKeyFor 对象键构造(storagecenter.ObjectKey 的错误透传)。
-func objectKeyFor(prefix, category, relPath string) (string, error) {
-	return storagecenter.ObjectKey(prefix, category, relPath)
+// objectKeyFor 对象键构造:key = path_prefix + relPath。
+// relPath 是 dataDir 相对路径,本就自描述(report-jobs/x、tasks/12/uploads/f),
+// 不再叠 category——否则 report-jobs 类别会得到 prefix/report-jobs/report-jobs/x
+// 双重目录(冒烟实锤)。语义微调自契约:key = <prefix>/<rel_path>。
+func objectKeyFor(prefix, relPath string) (string, error) {
+	relPath = strings.ReplaceAll(relPath, "\\", "/")
+	prefix = strings.Trim(prefix, "/")
+	if prefix == "" {
+		return storagecenter.ObjectKey("", "_root", relPath)
+	}
+	return storagecenter.ObjectKey("", "", prefix+"/"+relPath)
 }
 
 // ---- 双写过渡:写路径 ----
@@ -76,7 +84,7 @@ func (s *Server) storageAsyncUpload(category, relPath, local string) {
 			_ = s.m.pg.SetStorageBucketStatus(bucket.ID, "degraded", err.Error())
 			return
 		}
-		key, err := objectKeyFor(bucket.PathPrefix, category, relPath)
+		key, err := objectKeyFor(bucket.PathPrefix, relPath)
 		if err != nil {
 			log.Printf("[storage] 对象键非法 %s/%s: %v", category, relPath, err)
 			return
@@ -145,7 +153,7 @@ func (s *Server) resolveArtifact(category, relPath string) (rc io.ReadCloser, lo
 	if err != nil {
 		return nil, "", err
 	}
-	key, err := objectKeyFor(bucket.PathPrefix, category, relPath)
+	key, err := objectKeyFor(bucket.PathPrefix, relPath)
 	if err != nil {
 		return nil, "", err
 	}

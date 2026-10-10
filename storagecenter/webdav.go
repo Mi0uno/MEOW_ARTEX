@@ -30,16 +30,21 @@ func newWebDAVBackend(cfg Config, client *http.Client) (Backend, error) {
 }
 
 // objectURL 对象地址:endpoint/bucket/key(key 按段转义,保留 /)。
+// 用 url.Parse 重组,避免字符串分段丢空段把 "http://" 塌缩成 "http:/"(冒烟实锤)。
 func (w *webdavBackend) objectURL(key string) string {
-	seg := make([]string, 0, 3)
-	for _, p := range []string{w.cfg.Endpoint, w.cfg.Bucket, key} {
-		for _, s := range strings.Split(p, "/") {
-			if s != "" {
-				seg = append(seg, url.PathEscape(s))
-			}
-		}
+	u, err := url.Parse(w.cfg.Endpoint)
+	if err != nil {
+		return ""
 	}
-	return strings.Join(seg, "/")
+	seg := strings.Trim(u.Path, "/")
+	if w.cfg.Bucket != "" {
+		seg = strings.Trim(seg+"/"+w.cfg.Bucket, "/")
+	}
+	if key != "" {
+		seg = seg + "/" + key // 不手工转义:u.String() 会按 URL 规则统一转义
+	}
+	u.Path = "/" + strings.Trim(seg, "/")
+	return u.String()
 }
 
 func (w *webdavBackend) auth(req *http.Request) {

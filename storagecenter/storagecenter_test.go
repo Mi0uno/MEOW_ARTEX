@@ -159,3 +159,19 @@ func TestParentDirs(t *testing.T) {
 		t.Fatalf("parentDirs = %v", got)
 	}
 }
+
+// objectURL:不得把 "http://" 塌缩成 "http:/"(冒烟抓到的回归)。
+func TestWebDAVObjectURL(t *testing.T) {
+	b, err := newWebDAVBackend(Config{
+		Protocol: "webdav", Endpoint: "http://127.0.0.1:8932", Bucket: "artex",
+		AccessKey: "u", Secret: "p",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := b.(*webdavBackend).objectURL("report-jobs/a b.txt")
+	want := "http://127.0.0.1:8932/artex/report-jobs/a%20b.txt"
+	if got != want {
+		t.Fatalf("objectURL = %q, want %q", got, want)
+	}
+}
