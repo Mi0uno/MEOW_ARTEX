@@ -19,6 +19,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -233,7 +234,18 @@ func (s *Server) downloadReportJob(w http.ResponseWriter, r *http.Request) {
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		writeErr(w, 404, "产物文件不存在或已被清理")
+		// 本地不在(已被迁移清理):尝试从默认存储桶回源(双写过渡读路径)
+		fbName := fmt.Sprintf("report-%d", job.ReportID)
+		if rep, e := s.m.PG().GetReport(job.ReportID); e == nil && rep != nil {
+			if t := strings.TrimSpace(rep.Title); t != "" {
+				fbName = t
+			}
+		}
+		rel := "report-jobs/" + filepath.ToSlash(filepath.Base(path))
+		if !s.serveArtifact(w, r, "report-jobs", rel, sanitizeReportFilename(fbName)) {
+			writeErr(w, 404, "产物文件不存在或已被清理")
+			return
+		}
 		return
 	}
 	name := fmt.Sprintf("report-%d", job.ReportID)

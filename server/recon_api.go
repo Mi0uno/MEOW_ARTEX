@@ -429,6 +429,13 @@ func (s *Server) reconWordbookContent(w http.ResponseWriter, r *http.Request) {
 	}
 	f, err := os.Open(wordbookFilePath(s.m.dir, id))
 	if err != nil {
+		// 本地不在(已迁移上桶):从默认存储桶回源(双写过渡读路径)
+		if rc, _, rerr := s.resolveArtifact("wordbooks", "wordbooks/"+strconv.FormatInt(id, 10)+".txt"); rerr == nil && rc != nil {
+			defer rc.Close()
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			_, _ = io.Copy(w, rc)
+			return
+		}
 		writeErr(w, 404, "字典文件不存在")
 		return
 	}
@@ -460,7 +467,9 @@ func (s *Server) reconWordbookSaveContent(w http.ResponseWriter, r *http.Request
 		writeErr(w, 500, "路径异常")
 		return
 	}
-	if err := os.WriteFile(path, body, 0o600); err != nil {
+	// 双写过渡:本地原子落盘 + active 桶异步上桶(失败只标 degraded)
+	if _, err := s.storeArtifact("wordbooks", "wordbooks/"+strconv.FormatInt(id, 10)+".txt",
+		func(p string) error { return os.WriteFile(p, body, 0o600) }); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
