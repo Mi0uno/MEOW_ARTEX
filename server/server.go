@@ -200,6 +200,8 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	s.initC2()
 	// report_finding 登记后的联动:漏洞库自动归类 + SRC 成果自动创建。
 	s.wireFindingHooks()
+	// 存储中心:在途迁移作业按游标续跑(契约 STORAGE_CONTRACTS.md)。
+	initStorageMigration(s)
 	// 任务进入终态时触发收尾副作用(异步,不阻塞状态写入)。回调链是组合的,不得
 	// 互相覆盖:先释放任务占用的 VPS 机器(快,幂等;契约 §6 task_end),再做报告
 	// 自动归档(重)。识别/信息搜集任务由 autoArchiveTaskReport 内部按 stage 跳过。
@@ -1021,6 +1023,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/report-templates/{id}/analyze", s.analyzeReportTemplate)
 	registerReportExportRoutes(mux) // 报告生成作业:AI 按模板导出 / 作业进度与产物下载
 	registerGoalReviewRoutes(mux)  // 目标审核:prove_goal 复核记录与配置(契约 GOAL_REVIEW_CONTRACTS.md)
+	s.registerStorageRoutes(mux)   // 存储中心:桶 CRUD/测活/迁移/本地清理(契约 STORAGE_CONTRACTS.md)
 	mux.HandleFunc("GET /api/chat/mentions", s.searchChatMentions)
 	mux.HandleFunc("POST /api/chat", s.chat)
 	mux.HandleFunc("POST /api/chat/upload", s.chatUpload) // 方式1 文件上传:落到会话/任务工作目录 uploads/

@@ -471,3 +471,21 @@ func (d *DB) GetLatestStorageMigration() (*StorageMigration, error) {
 	}
 	return m, nil
 }
+
+// ListTerminalTaskWorkdirIDs 终态任务 id 集合(task-workdirs 迁移只动终态任务)。
+func (d *DB) ListTerminalTaskWorkdirIDs() (map[int64]bool, error) {
+	out := map[int64]bool{}
+	rows, err := d.Query(`SELECT id FROM tasks WHERE status IN ('done','failed','timeout')`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
+}
