@@ -3182,3 +3182,75 @@ export interface MemoryOverview {
   insights: EvolveStatusCounts;
   playbooks: EvolveStatusCounts;
 }
+
+// ============ 存储中心(契约 STORAGE_CONTRACTS.md) ============
+
+// 存储协议:s3 = SigV4 path-style(MinIO/OSS/COS/R2/AWS 通吃),webdav = 纯 HTTP 客户端。
+export type StorageProtocol = "s3" | "webdav";
+
+// 桶健康状态:degraded = 最近一次异步上桶失败;unchecked = 尚未测活。
+export type StorageBucketStatus = "ok" | "degraded" | "unchecked";
+
+export interface StorageBucket {
+  id: number;
+  name: string;
+  protocol: StorageProtocol;
+  endpoint: string;
+  bucket: string;
+  region: string;
+  path_prefix: string;
+  active: boolean;
+  status: StorageBucketStatus;
+  has_secret: boolean; // 密钥永不回显,只回是否已设置
+  last_check_at: number | string | null;
+  last_check_error: string;
+  created_at: number | string;
+  updated_at: number | string;
+}
+
+// 明文提交(服务端 secretbox 加密落库);secret_key 留空 = 不改旧值。
+export interface StorageBucketInput {
+  name: string;
+  protocol: StorageProtocol;
+  endpoint: string;
+  bucket: string;
+  region?: string;
+  path_prefix?: string;
+  access_key?: string;
+  secret_key?: string;
+  activate?: boolean;
+}
+
+// 迁移/纳管数据类别(traffic 流量体不纳管,留注册口)。
+export type StorageCategory =
+  | "report-jobs"
+  | "report-templates"
+  | "uploads"
+  | "evidence"
+  | "task-archives"
+  | "c2"
+  | "vps"
+  | "wordbooks"
+  | "src-platform"
+  | "task-workdirs";
+
+export interface StorageCategoryOverview {
+  category: StorageCategory;
+  files: number; // 本地文件数
+  bytes: number; // 本地字节数
+  uploaded_files: number; // 已上桶登记数
+}
+
+// 迁移作业行;status: running | done | failed | canceled。
+export interface StorageMigration {
+  id: number;
+  bucket_id: number;
+  categories: string[];
+  status: "running" | "done" | "failed" | "canceled";
+  total_files: number;
+  done_files: number;
+  failed_files: number;
+  error: string;
+  started_at: number | string;
+  finished_at: number | string | null;
+}

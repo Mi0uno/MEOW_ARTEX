@@ -15,6 +15,7 @@ import {
   FolderSync,
   Gauge,
   Gem,
+  HardDrive,
   Layers,
   LayoutDashboard,
   LayoutTemplateIcon,
@@ -276,6 +277,8 @@ export const sidebarItems: NavGroup[] = [
         subItems: [
           { id: "tools", title: "工具", url: "/system/tools", icon: Wrench },
           { id: "functions", title: "系统功能", url: "/system/functions", icon: SlidersHorizontal },
+          // 存储设置:对象存储桶接入(S3/WebDAV)+历史数据一键迁移。
+          { id: "storage", title: "存储设置", url: "/system/storage", icon: HardDrive },
           { id: "settings", title: "系统设置", url: "/system/settings", icon: Settings2 },
         ],
       },
